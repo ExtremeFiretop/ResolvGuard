@@ -1,0 +1,205 @@
+name: Auto Tag and Release on PR Merge
+
+# Adapted from MerlinAU. Script-only ResolvGuard releases, one-line version.txt.
+on:
+  pull_request:
+    branches: [main]
+    types: [closed]
+  workflow_dispatch: # First public release (or retry) can be launched from main.
+
+permissions:
+  contents: read
+
+concurrency:
+  group: resolvguard-release-main
+  cancel-in-progress: false
+
+jobs:
+  tag-and-release:
+    # Never release an unmerged PR, fork, or non-dev branch.
+    # Manual releases must be explicitly launched on main.
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'pull_request' && github.event.pull_request.merged == true &&
+       github.event.pull_request.head.ref == 'dev' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out main branch (release source)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Verify merged PR is still the current main commit
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          MERGE_COMMIT_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$(git rev-parse HEAD)" != "$MERGE_COMMIT_SHA" ]]; then
+            echo 'main has advanced since this PR merged; release the latest main via workflow_dispatch instead.' >&2
+            exit 1
+          fi
+
+      - name: Validate one-line version.txt and ResolvGuard script
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          script='resolvguard.sh'
+          test -f "$script" || { echo "Missing $script" >&2; exit 1; }
+          test -f version.txt || { echo 'Missing version.txt' >&2; exit 1; }
+
+          # This deliberately accepts a final newline or no final newline.
+          # version.txt contains only the version, with no checksum or other fields.
+          mapfile -t lines < version.txt
+          [[ ${#lines[@]} -eq 1 ]] || {
+            echo 'version.txt must contain exactly one version line.' >&2; exit 1;
+          }
+          version="${lines[0]}"
+          [[ "$version" =~ ^[0-9]+(\.[0-9]+){1,3}$ ]] || {
+            echo "Invalid version.txt version: $version" >&2; exit 1;
+          }
+          [[ $(grep -c '^readonly SCRIPT_VERSION=' "$script") -eq 1 ]] || {
+            echo 'Expected one readonly SCRIPT_VERSION= assignment in script.' >&2; exit 1;
+          }
+          grep -Fxq "readonly SCRIPT_VERSION=$version" "$script" || {
+            echo "Script version doesn't match version.txt ($version)." >&2; exit 1;
+          }
+          [[ $(grep -c '^readonly SCRIPT_VERSTAG=' "$script") -eq 1 ]] &&
+            grep -Eq '^readonly SCRIPT_VERSTAG="[0-9]{8,14}"$' "$script" || {
+            echo 'Expected one numeric SCRIPT_VERSTAG in script.' >&2; exit 1;
+          }
+          grep -Fxq 'readonly SCRIPT_NAME="ResolvGuard"' "$script" || {
+            echo 'Unexpected SCRIPT_NAME.' >&2; exit 1;
+          }
+          [[ $(grep -c '^SCRIPT_BRANCH=' "$script") -eq 1 ]] &&
+            grep -Eq '^SCRIPT_BRANCH="(dev|master)"$' "$script" || {
+            echo 'Expected one SCRIPT_BRANCH="dev" or SCRIPT_BRANCH="master" assignment.' >&2; exit 1;
+          }
+          grep -Eq '^CONFIG_SCHEMA=[0-9]+$' "$script" || {
+            echo 'Missing configuration schema declaration.' >&2; exit 1;
+          }
+          grep -Fq 'amtmupdate)' "$script" || {
+            echo 'Updater entry point not found in script.' >&2; exit 1;
+          }
+          if git ls-files -- 'ResolvGuard.d/config' 'ResolvGuard.d/config/*' | grep -q .; then
+            echo 'Configuration must be generated locally by ResolvGuard, not packaged.' >&2
+            exit 1
+          fi
+          sh -n "$script"
+          bash -n "$script"
+          tag="v$version"
+          # Do not alter main if this version was already tagged elsewhere.
+          # Reruns are allowed only when main already contains the stable
+          # branch marker and the existing tag points to this exact commit.
+          if git rev-parse --verify -q "refs/tags/$tag^{commit}" >/dev/null; then
+            tagged_commit="$(git rev-parse "refs/tags/$tag^{commit}")"
+            if [[ "$tagged_commit" != "$(git rev-parse HEAD)" ]] ||
+               ! grep -Fxq 'SCRIPT_BRANCH="master"' "$script"; then
+              echo "Tag $tag already exists for a different release. Bump version.txt and SCRIPT_VERSION; refusing to rewrite published history." >&2
+              exit 1
+            fi
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Validated $script ($tag), schema, syntax and script-only layout."
+
+      - name: Stamp stable branch in main and push before tagging
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Mirror MerlinAU: the tracked source on main becomes stable.
+          # dev is not modified; future dev -> main merges re-stamp main.
+          sed -i 's/^SCRIPT_BRANCH="dev"$/SCRIPT_BRANCH="master"/' resolvguard.sh
+          grep -Fxq 'SCRIPT_BRANCH="master"' resolvguard.sh
+          sh -n resolvguard.sh
+          if ! git diff --quiet -- resolvguard.sh; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add resolvguard.sh
+            git commit -m "Mark ResolvGuard $RELEASE_TAG as stable on main"
+            # Requires permission to push to main. If protected, fail
+            # before tagging or publishing an inconsistent release.
+            git push origin HEAD:refs/heads/main
+          else
+            echo 'main/resolvguard.sh is already marked stable.'
+          fi
+
+      - name: Build and verify counted release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Both published scripts are byte-for-byte copies of stable
+          # main/resolvguard.sh. No config files are packaged.
+          grep -Fxq 'SCRIPT_BRANCH="master"' resolvguard.sh
+          cp resolvguard.sh ResolvGuard-install.sh
+          cp resolvguard.sh ResolvGuard-update.sh
+          chmod 755 ResolvGuard-install.sh ResolvGuard-update.sh
+          grep -Fxq 'SCRIPT_BRANCH="master"' ResolvGuard-install.sh
+          grep -Fxq 'SCRIPT_BRANCH="master"' ResolvGuard-update.sh
+          cmp -s ResolvGuard-install.sh ResolvGuard-update.sh
+          sh -n ResolvGuard-install.sh
+          sh -n ResolvGuard-update.sh
+          cmp -s resolvguard.sh ResolvGuard-install.sh
+          cmp -s resolvguard.sh ResolvGuard-update.sh
+          md5sum ResolvGuard-install.sh ResolvGuard-update.sh > MD5SUMS
+          md5sum -c MD5SUMS
+          echo 'Stable release assets verified against main; MD5SUMS generated.'
+
+      - name: Create or verify version tag
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if git rev-parse --verify -q "refs/tags/$RELEASE_TAG^{commit}" >/dev/null; then
+            tagged_commit="$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+            current_commit="$(git rev-parse HEAD)"
+            if [[ "$tagged_commit" != "$current_commit" ]]; then
+              echo "Tag $RELEASE_TAG already points to a different commit; refusing to overwrite it." >&2
+              exit 1
+            fi
+            echo "Tag $RELEASE_TAG already points to this commit; safe to rerun."
+          else
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git tag "$RELEASE_TAG" HEAD
+            git push origin "refs/tags/$RELEASE_TAG"
+          fi
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          name: ResolvGuard ${{ steps.release.outputs.tag }}
+          generate_release_notes: true
+          prerelease: false
+          draft: false
+          fail_on_unmatched_files: true
+          files: |
+            ResolvGuard-install.sh
+            ResolvGuard-update.sh
+            MD5SUMS
+
+      - name: Write summary
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          {
+            echo "### ResolvGuard $RELEASE_TAG"
+            echo '- Install asset: `ResolvGuard-install.sh`'
+            echo '- Update asset: `ResolvGuard-update.sh`'
+            echo '- Checksum asset: `MD5SUMS` (MerlinAU-compatible naming).'
+            echo '- Updater reads only the single version line from `main/version.txt`.'
+            echo '- main/resolvguard.sh and both release assets contain SCRIPT_BRANCH="master".'
+            echo '- The dev branch retains SCRIPT_BRANCH="dev" for development updates.'
+            echo '- No config files or DNS settings are included in release assets.'
+          } >> "$GITHUB_STEP_SUMMARY"

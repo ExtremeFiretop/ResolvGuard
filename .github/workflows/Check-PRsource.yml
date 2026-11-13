@@ -1,0 +1,29 @@
+name: Check pull request source branch
+on:
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - edited
+
+permissions: {}
+
+jobs:
+  check-branches:
+    if: github.event.pull_request.base.ref == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require same-repository dev branch for main
+        shell: bash
+        env:
+          SOURCE_BRANCH: ${{ github.event.pull_request.head.ref }}
+          SOURCE_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          TARGET_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [[ "$SOURCE_BRANCH" != 'dev' || "$SOURCE_REPOSITORY" != "$TARGET_REPOSITORY" ]]; then
+            echo 'Pull requests to main must come from dev in this repository.' >&2
+            exit 1
+          fi
+          echo 'Approved release path: same-repository dev -> main.'
