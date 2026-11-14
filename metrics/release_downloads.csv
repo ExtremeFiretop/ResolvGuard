@@ -1,0 +1,3 @@
+snapshot_date,snapshot_time_utc,tag,published_at,kind,asset_name,asset_id,download_count
+2026-11-14,2026-11-14T04:16:11Z,v0.1.9,2026-11-13T22:47:19Z,install,ResolvGuard-install.sh,745469331,5
+2026-11-14,2026-11-14T04:16:11Z,v0.1.9,2026-11-13T22:47:19Z,update,ResolvGuard-update.sh,745469334,0
