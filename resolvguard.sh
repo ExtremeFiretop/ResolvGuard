@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.0
-readonly SCRIPT_VERSTAG="26111409"
+readonly SCRIPT_VERSTAG="26111402"
 readonly SCRIPT_NAME="ResolvGuard"
 ## Set to "master" for Production Releases ##
 SCRIPT_BRANCH="dev"
@@ -69,13 +69,45 @@ STUBBY=/usr/sbin/stubby
 DNSMASQ_SERVERS=/tmp/resolv.dnsmasq
 DNSMASQ_MAIN=/etc/dnsmasq.conf
 
+# Choose the firmware's active production Stubby YAML when initializing a new
+# installation. 3006 may use stubby-0.yml, while 3004 commonly uses stubby.yml.
+# Do not change a saved Integration Settings override on subsequent launches.
+# Optional arguments only facilitate offline testing with harmless fixture paths.
+_DetectProductionStubbyConfig_() {
+  local primary legacy proc_root proc_file args binary
+  primary="${1:-/etc/stubby/stubby-0.yml}"
+  legacy="${2:-/etc/stubby/stubby.yml}"
+  proc_root="${3:-/proc}"
+
+  # If both files exist, trust the path specified by the running Stubby daemon.
+  if [ -r "$primary" ] && [ -r "$legacy" ]; then
+    for proc_file in "$proc_root"/[0-9]*/cmdline; do
+      [ -r "$proc_file" ] || continue
+      args="$(tr '\000' ' ' < "$proc_file" 2>/dev/null)" || continue
+      binary="${args%% *}"
+      case "$binary" in */stubby|stubby) : ;; *) continue ;; esac
+      case " $args " in
+        *" -C $primary "*) printf '%s\n' "$primary"; return 0 ;;
+        *" -C $legacy "*) printf '%s\n' "$legacy"; return 0 ;;
+      esac
+    done
+  fi
+
+  # Most firmware releases only expose their own active configuration path.
+  if [ -r "$primary" ]; then printf '%s\n' "$primary"; return 0; fi
+  if [ -r "$legacy" ]; then printf '%s\n' "$legacy"; return 0; fi
+  # Preserve historical fallback if firmware Stubby isn't installed yet;
+  # dependency validation will still refuse a missing production config.
+  printf '%s\n' "$primary"
+}
+
 # A fresh install needs only this script. Create missing config files here, not
 # in the package or updater. Existing files are never edited, truncated or
 # replaced; a dangerous path (symlink, directory, unreadable file) is refused.
 # Build every default as a private, complete temporary file and hardlink it
 # into place, so a concurrent invocation cannot overwrite an existing file.
 _CreateMissingConfigFile_() {
-  local name dest staged
+  local name dest staged default_stubby
   name="$1"
   dest="$ROOT/config/$name"
   if [ -e "$dest" ] || [ -L "$dest" ]; then
@@ -91,12 +123,14 @@ _CreateMissingConfigFile_() {
     return 1
   fi
   if ! (umask 077; set -C; case "$name" in
-    settings.conf) cat <<'RG_SETTINGS_DEFAULT'
+    settings.conf)
+      default_stubby="$(_DetectProductionStubbyConfig_)" || exit 1
+      cat <<RG_SETTINGS_DEFAULT
 FAIL_THRESHOLD=2
 RECOVERY_THRESHOLD=3
 TIMEOUT_SECONDS=5
 CA_FILE=/etc/ssl/certs/ca-certificates.crt
-WAN_STUBBY_CONFIG=/etc/stubby/stubby-0.yml
+WAN_STUBBY_CONFIG=$default_stubby
 
 SCHEDULE_INTERVAL_MINUTES=1
 FAST_CONFIRM_SECONDS=7
@@ -192,7 +226,7 @@ fi
 : "${FAIL_THRESHOLD:=2}" "${RECOVERY_THRESHOLD:=3}" \
   "${TIMEOUT_SECONDS:=5}" \
   "${CA_FILE:=/etc/ssl/certs/ca-certificates.crt}" \
-  "${WAN_STUBBY_CONFIG:=/etc/stubby/stubby-0.yml}" \
+  "${WAN_STUBBY_CONFIG:=$(_DetectProductionStubbyConfig_)}" \
   "${SCHEDULE_INTERVAL_MINUTES:=1}" "${FAST_CONFIRM_SECONDS:=7}" \
   "${BOOT_MIN_UPTIME_SECONDS:=120}" \
   "${SYSLOG_HEALTH_INTERVAL_MINUTES:=0}"
