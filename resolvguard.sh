@@ -3,7 +3,7 @@
 # ResolvGuard.sh
 #
 # Project Created: 2026-Oct-29 by @ExtremeFiretop
-# Last Modified: 2026-Nov-13
+# Last Modified: 2026-Nov-14
 #
 # ResolvGuard™
 # Official project: https://github.com/ExtremeFiretop/ResolvGuard
@@ -21,10 +21,10 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.0
-readonly SCRIPT_VERSTAG="26111401"
+readonly SCRIPT_VERSTAG="26111409"
 readonly SCRIPT_NAME="ResolvGuard"
 ## Set to "master" for Production Releases ##
-SCRIPT_BRANCH="master"
+SCRIPT_BRANCH="dev"
 
 # Run install from a staged download, or from the final script path. A normal
 # first launch uses the same installation path before opening the SSH menu.
