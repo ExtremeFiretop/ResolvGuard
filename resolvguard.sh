@@ -20,8 +20,8 @@ CONFIG_SCHEMA=5
 set -u
 
 ## Set version for each Production Release ##
-readonly SCRIPT_VERSION=0.1.9
-readonly SCRIPT_VERSTAG="26111318"
+readonly SCRIPT_VERSION=0.2.0
+readonly SCRIPT_VERSTAG="26111322"
 readonly SCRIPT_NAME="ResolvGuard"
 ## Set to "master" for Production Releases ##
 SCRIPT_BRANCH="master"
@@ -110,9 +110,10 @@ RG_CHECKS_DEFAULT
       ;;
     extra-providers.tsv) cat <<'RG_PROVIDERS_DEFAULT'
 # Optional independent backup resolvers (add using Quick Setup or Advanced Options).
-# resolver_id|IPv4|TLS_authentication_hostname|upstream_TLS_port
+# resolver_id|IPv4_or_IPv6|TLS_authentication_hostname|upstream_TLS_port
 # google1|8.8.8.8|dns.google|853
 # google2|8.8.4.4|dns.google|853
+# quad9v6|2620:fe::fe|dns.quad9.net|853
 RG_PROVIDERS_DEFAULT
       ;;
     *) exit 1 ;;
@@ -194,6 +195,14 @@ fi
   "${SCHEDULE_INTERVAL_MINUTES:=1}" "${FAST_CONFIRM_SECONDS:=7}" \
   "${BOOT_MIN_UPTIME_SECONDS:=120}" \
   "${SYSLOG_HEALTH_INTERVAL_MINUTES:=0}"
+
+# Older Merlin (e.g. 3004.388.x) uses stubby.yml. If the newer default
+# doesn't exist, use the older firmware path without creating any symlink or
+# editing firmware-managed files. Respect explicitly configured other paths.
+if [ "$WAN_STUBBY_CONFIG" = /etc/stubby/stubby-0.yml ] &&
+   [ ! -r "$WAN_STUBBY_CONFIG" ] && [ -r /etc/stubby/stubby.yml ]; then
+  WAN_STUBBY_CONFIG=/etc/stubby/stubby.yml
+fi
 
 # MerlinAU-style release channels. The repository's production branch is
 # named main; accept the familiar SCRIPT_BRANCH=master alias for stable builds.
@@ -280,6 +289,46 @@ _IsValidIPv4_() {
   case "$1" in ''|*[!0-9.]*|.*|*..*|*.) return 1;; esac
   echo "$1" | awk -F. 'NF!=4 {exit 1} {for(i=1;i<=4;i++) if($i=="" || $i !~ /^[0-9]+$/ || $i>255 || $i<0) exit 1; exit 0}'
 }
+# Validate IPv6 in POSIX awk (BusyBox ash/dash compatible; no Python,
+# ipcalc, external networking, or GNU awk extensions required).
+# Supports :: compression and an IPv4-embedded tail. Zone IDs and brackets
+# are deliberately not accepted in resolver identity fields: scoped link-local
+# addresses cannot be safely represented as firmware-wide DoT upstreams.
+_IsValidIPv6_() {
+  printf '%s\n' "$1" | LC_ALL=C awk '
+    function ipv4(s, a,n,i) {
+      n=split(s,a,"."); if (n!=4) return 0
+      for (i=1;i<=4;i++)
+        if (a[i]=="" || a[i] !~ /^[0-9]+$/ || length(a[i])>3 || a[i]+0>255) return 0
+      return 1
+    }
+    function valid(s, t,a,n,i,groups,compressed,embedded) {
+      if (s !~ /^[0-9a-fA-F:.]+$/ || index(s,":")==0 || s ~ /:::/) return 0
+      if (s ~ /^:[^:]/ || s ~ /[^:]:$/) return 0
+      t=s; compressed=gsub(/::/,"@",t)
+      if (compressed>1) return 0
+      gsub(/@/,":@:",t); sub(/^:/,"",t); sub(/:$/,"",t)
+      n=split(t,a,":"); groups=0
+      for (i=1;i<=n;i++) {
+        if (a[i]=="@") continue
+        if (a[i]=="") return 0
+        if (index(a[i],".")) {
+          if (i!=n || !ipv4(a[i])) return 0
+          embedded++ ; groups+=2
+        } else {
+          if (length(a[i])>4 || a[i] !~ /^[0-9a-fA-F]+$/) return 0
+          groups++
+        }
+      }
+      if (embedded>1) return 0
+      if (compressed) return groups<8
+      return groups==8
+    }
+    { if (!valid($0)) exit 1; ok=1 }
+    END { if (!ok) exit 1 }
+  '
+}
+_IsValidIP_() { _IsValidIPv4_ "$1" || _IsValidIPv6_ "$1"; }
 _IsValidPort_() {
   case "$1" in ''|*[!0-9]*) return 1;; esac
   [ "$1" -gt 1024 ] && [ "$1" -le 65535 ]
@@ -326,15 +375,19 @@ _PrepareProviders_() {
   raw="$RUNTIME/discovered-$$"
   : > "$tmp" || return 1
   if [ -r "$PREF_PROVIDERS" ]; then
+    _ValidatePreferredSnapshot_ || {
+      _Fail_ 'Saved preferred DNS snapshot is incomplete or invalid (possibly from an IPv4-only version); automatic switching is blocked. Restore/re-enroll with the complete dual-stack router configuration.'
+      rm -f "$tmp"; return 1
+    }
     cp "$PREF_PROVIDERS" "$tmp" || { rm -f "$tmp"; return 1; }
   else
     _ParseWANUpstreams_ > "$raw" || { rm -f "$tmp" "$raw"; return 1; }
     n=0
     while IFS='|' read -r ip host tlsport extra; do
       [ -n "$ip" ] || continue
-      if ! _IsValidIPv4_ "$ip"; then
-        case "$ip" in *:*) _Say_ "NOTICE: skipping unsupported IPv6 WAN upstream $ip" >&2; continue;; esac
-        _Fail_ "Invalid WAN IP: $ip"; rm -f "$tmp" "$raw"; return 1
+      if ! _IsValidIP_ "$ip"; then
+        _Fail_ "Invalid WAN IPv4/IPv6 upstream address: $ip; refusing incomplete preferred DNS enrollment";
+        rm -f "$tmp" "$raw"; return 1
       fi
       _IsValidDomain_ "$host" || { _Fail_ "Invalid WAN TLS identity for $ip"; rm -f "$tmp" "$raw"; return 1; }
       _IsValidTLSPort_ "$tlsport" || { _Fail_ "Invalid WAN TLS port for $ip"; rm -f "$tmp" "$raw"; return 1; }
@@ -396,7 +449,7 @@ _ValidateConfiguration_() {
     _Fail_ 'Missing DNS health checks or backup resolver configuration'; return 1;
   }
   awk -F'|' '$1 !~ /^#/ && $1 != "" && NF!=4 {exit 1}' "$EXTRA_PROVIDERS" || {
-    _Fail_ 'Invalid backup provider format (expected ID|IPv4|TLS-name|TLS-port)'; return 1;
+    _Fail_ 'Invalid backup provider format (expected ID|IPv4-or-IPv6|TLS-name|TLS-port)'; return 1;
   }
   _IsValidAnswerCount_ "$FAIL_THRESHOLD" && [ "$FAIL_THRESHOLD" -ge 1 ] || { _Fail_ 'FAIL_THRESHOLD must be positive'; return 1; }
   _IsValidAnswerCount_ "$RECOVERY_THRESHOLD" && [ "$RECOVERY_THRESHOLD" -ge 1 ] || { _Fail_ 'RECOVERY_THRESHOLD must be positive'; return 1; }
@@ -416,7 +469,7 @@ _ValidateConfiguration_() {
   count=0
   while IFS='|' read -r id ip hostname port tlsport extra; do
     case "$id" in ''|\#*) continue;; esac
-    _IsValidID_ "$id" && _IsValidIPv4_ "$ip" && _IsValidDomain_ "$hostname" &&
+    _IsValidID_ "$id" && _IsValidIP_ "$ip" && _IsValidDomain_ "$hostname" &&
       _IsValidPort_ "$port" && _IsValidTLSPort_ "$tlsport" && [ -z "${extra:-}" ] || {
       _Fail_ "Invalid resolver: $id"; return 1;
     }
@@ -891,26 +944,71 @@ _InspectDNS_() (
 )
 
 
+# Parse *every* resolver, then validate every address before emitting any
+# result. Avoid accepting a valid IPv4 prefix when a later IPv6 entry is bad.
+# Preserve the exact serialized NVRAM list for snapshots, filters and rollback.
 _ParseDNSRulelist_() {
-  awk '
+  local parsed ip port host pin format rest
+  # Capture the complete parsed list in this invocation's shell-local
+  # variable. No external temp-file utility or shared $$-named file: nested
+  # pipes/subshells can safely parse at the same time on BusyBox ash.
+  parsed="$(awk '
     BEGIN {FS="<"; OFS="|"; err=0}
     {
+      if ($1!="") err=1
       for (i=2; i<=NF; i++) {
-        if ($i=="") continue
+        if ($i=="") {err=1; break}
         n=split($i,p,">")
         if (n!=3 && n!=4) {err=1; break}
         if (expected==0) expected=n
-        # The ASUS GUI permits an empty TLS port; production Stubby uses 853.
-        # Normalize it for comparison without rewriting the raw WAN rulelist.
+        # An empty GUI TLS port means 853. Only normalized comparisons change;
+        # the raw source (including pins and original port spelling) stays intact.
         if (p[2]=="") p[2]="853"
         if (n!=expected || p[1]=="" || p[3]=="") {err=1; break}
-        if (p[1] !~ /^[0-9.]+$/ || p[2] !~ /^[0-9]+$/ || p[3] !~ /^[A-Za-z0-9.-]+$/) {err=1; break}
+        if (p[1] !~ /^[0-9A-Fa-f:.]+$/ || p[2] !~ /^[0-9]+$/ ||
+            p[3] !~ /^[A-Za-z0-9.-]+$/) {err=1; break}
         print p[1],p[2],p[3],(n==4?p[4]:""),n
         count++
       }
     }
     END {if (err || count==0) exit 1}
-  '
+  ')" || return 1
+  [ -n "$parsed" ] || return 1
+  # A here-document feeds the shell-local parse to read without a file or
+  # subshell that would mask validation failures. Emit only after every
+  # upstream address/port/TLS name has passed validation.
+  while IFS='|' read -r ip port host pin format rest; do
+    if ! _IsValidIP_ "$ip" || ! _IsValidTLSPort_ "$port" ||
+       ! _IsValidDomain_ "$host" || [ -n "${rest:-}" ]; then
+      return 1
+    fi
+  done <<RG_PARSED_RULELIST
+$parsed
+RG_PARSED_RULELIST
+  printf '%s\n' "$parsed"
+}
+
+# Prevent accidental reuse of an old, partial preferred snapshot on a
+# previously IPv4-only build. Refuse all managed switching until the saved
+# provider roster exactly represents the entire original NVRAM serialization.
+_ValidatePreferredSnapshot_() {
+  local parsed expected
+  [ -s "$PREF_RULELIST" ] && [ -s "$PREF_PROVIDERS" ] &&
+    [ ! -L "$PREF_RULELIST" ] && [ ! -L "$PREF_PROVIDERS" ] || return 1
+  parsed="$RUNTIME/validate-preferred-$$"
+  [ ! -e "$parsed" ] && [ ! -L "$parsed" ] || return 1
+  _ParseDNSRulelist_ < "$PREF_RULELIST" > "$parsed" || { rm -f "$parsed"; return 1; }
+  if ! awk -F'|' 'NR==FNR {a[++m]=$1 "|" $2 "|" $3; next}
+       {
+         if ($1 !~ /^wan[0-9]+$/ || NF!=5) bad=1
+         else {
+           n++; if ($1!="wan" n || tolower(a[n]) != tolower($2 "|" $5 "|" $3)) bad=1
+         }
+       }
+       END {exit (bad || n==0 || n!=m)?1:0}' "$parsed" "$PREF_PROVIDERS"; then
+    rm -f "$parsed"; return 1
+  fi
+  rm -f "$parsed"
 }
 
 _IsStrictProductionDoT_() {
@@ -961,6 +1059,9 @@ _EnrollPreferredDNS_() {
   local raw parsed expected count
   if [ -e "$PREF_RULELIST" ] || [ -e "$PREF_PROVIDERS" ]; then
     if [ -r "$PREF_RULELIST" ] && [ -r "$PREF_PROVIDERS" ]; then
+      _ValidatePreferredSnapshot_ || {
+        _Fail_ 'Existing preferred DNS snapshot does not represent a complete IPv4/IPv6 resolver list; re-enrollment required'; return 1;
+      }
       _Say_ 'Preferred WAN snapshot already enrolled; not overwriting it.'
       return 0
     fi
@@ -977,7 +1078,7 @@ _EnrollPreferredDNS_() {
   expected="$(awk -F'|' '$1 ~ /^wan[0-9]+$/ {n++} END{print n+0}' "$PROVIDERS")"
   [ "$count" = "$expected" ] || { rm -f "$parsed"; _Fail_ 'WAN NVRAM and generated Stubby provider counts disagree'; return 1; }
   if ! awk -F'|' 'NR==FNR {a[FNR]=$2"|"$5"|"$3; next}
-      {if (a[FNR] != $1"|"$2"|"$3) bad=1; n++}
+      {if (tolower(a[FNR]) != tolower($1"|"$2"|"$3)) bad=1; n++}
       END {exit bad?1:0}' "$PROVIDERS" "$parsed"; then
     rm -f "$parsed"; _Fail_ 'WAN NVRAM and Stubby provider order differ'; return 1
   fi
@@ -1005,9 +1106,9 @@ _BuildLivePreferredProviders_() {
     rm -f "$parsed" "$live"; return 1; }
   [ -s "$live" ] && [ -s "$parsed" ] || {
     rm -f "$parsed" "$live"; return 1; }
-  # Order and exact IPv4 endpoint, TLS port and hostname must all agree.
+  # Every IPv4/IPv6 endpoint, TLS port, and hostname must agree in order.
   if ! awk -F'|' 'NR==FNR {a[FNR]=$1"|"$2"|"$3; m++; next}
-      {n++; if (a[FNR]!=$1"|"$3"|"$2) bad=1}
+      {n++; if (tolower(a[FNR])!=tolower($1"|"$3"|"$2)) bad=1}
       END {exit (bad || n!=m || n==0)?1:0}' "$parsed" "$live"; then
     rm -f "$parsed" "$live"
     _Fail_ 'WAN NVRAM and production Stubby resolver identity/order do not agree'
@@ -1016,10 +1117,10 @@ _BuildLivePreferredProviders_() {
   : > "$output" || { rm -f "$parsed" "$live"; return 1; }
   n=0
   while IFS='|' read -r ip port name extra format; do
-    _IsValidIPv4_ "$ip" && _IsValidTLSPort_ "$port" &&
+    _IsValidIP_ "$ip" && _IsValidTLSPort_ "$port" &&
       _IsValidDomain_ "$name" && [ -n "$format" ] || {
         rm -f "$parsed" "$live" "$output"
-        _Fail_ 'Only validated IPv4 Strict DoT resolver identities can be adopted'
+        _Fail_ 'Only complete, validated IPv4/IPv6 Strict DoT resolver identities can be adopted'
         return 1
       }
     n=$((n+1)); localport=$((WAN_PORT_START+n-1))
@@ -1396,9 +1497,9 @@ _GetPoolMembers_() {
       filtered="$(_GetFilteredRulelist_ "$pool")" || return 1
       parsed="$RUNTIME/filtered-members-$$"
       printf '%s\n' "$filtered" | _ParseDNSRulelist_ > "$parsed" || return 1
-      awk -F'|' 'NR==FNR {wanted[$1 "|" $3 "|" $2]++; next}
+      awk -F'|' 'NR==FNR {wanted[tolower($1 "|" $3 "|" $2)]++; next}
         $1 ~ /^wan[0-9]+$/ {
-          k=$2 "|" $3 "|" $5
+          k=tolower($2 "|" $3 "|" $5)
           if (wanted[k]>0) {print; wanted[k]--}
         }' "$parsed" "$PROVIDERS"
       rm -f "$parsed"
@@ -1460,7 +1561,7 @@ _BuildBackupRulelist_() {
   _GetPoolMembers_ "$pool" > "$members" || return 1
   [ -s "$members" ] || { rm -f "$members"; return 1; }
   while IFS='|' read -r id ip name localport tport extra; do
-    _IsValidIPv4_ "$ip" && _IsValidTLSPort_ "$tport" && _IsValidDomain_ "$name" || return 1
+    _IsValidIP_ "$ip" && _IsValidTLSPort_ "$tport" && _IsValidDomain_ "$name" || return 1
     if [ "$n" = 4 ]; then printf '<%s>%s>%s>' "$ip" "$tport" "$name"
     else printf '<%s>%s>%s' "$ip" "$tport" "$name"; fi
   done < "$members"
@@ -1494,8 +1595,8 @@ _VerifyLiveEndpoints_() {
   else
     _BuildBackupRulelist_ "$pool" | _ParseDNSRulelist_ > "$parsed" || return 1
   fi
-  awk -F'|' '{print $1"|"$2"|"$3}' "$parsed" > "$desired"
-  _ParseWANUpstreams_ | awk -F'|' '{print $1"|"$3"|"$2}' > "$live" || return 1
+  awk -F'|' '{print tolower($1)"|"$2"|"tolower($3)}' "$parsed" > "$desired"
+  _ParseWANUpstreams_ | awk -F'|' '{print tolower($1)"|"$3"|"tolower($2)}' > "$live" || return 1
   if ! cmp -s "$desired" "$live"; then
     rm -f "$parsed" "$desired" "$live"; return 1
   fi
@@ -1590,6 +1691,7 @@ _MarkDNSRecoveryHold_() {
 _CheckLiveSwitchSafety_() {
   [ "$(_ReadNVRAM_ dnspriv_enable)" = 1 ] || { _Fail_ 'DNS Privacy disabled; refusing WAN switch'; return 1; }
   [ -r "$PREF_RULELIST" ] && [ -r "$PREF_PROVIDERS" ] || { _Fail_ 'No preferred snapshot; run enroll first'; return 1; }
+  _ValidatePreferredSnapshot_ || { _Fail_ 'Preferred IPv4/IPv6 snapshot is incomplete; refusing WAN switch'; return 1; }
   _IsStrictProductionDoT_ || { _Fail_ 'Production Stubby is not authenticated TLS-only'; return 1; }
   [ ! -e "$PREFERRED_SYNC" ] && [ ! -L "$PREFERRED_SYNC" ] || return 1
   _GetActiveWANPool_ >/dev/null || { _Fail_ 'WAN configuration changed outside ResolvGuard; refusing to overwrite'; return 1; }
@@ -3752,7 +3854,7 @@ _ShowBackupResolversMenu_() {
   local choice id ip tls tport oldrow
   while :; do
     _ShowHeader_ 'Backup DoT Resolvers'
-    _Say_ '  ID | IPv4 | TLS authentication hostname | TLS port'
+    _Say_ '  ID | IPv4/IPv6 | TLS authentication hostname | TLS port'
     awk -F'|' '$1 !~ /^#/ && NF==4 {printf "  %s | %s | %s | %s\n",$1,$2,$3,$4}' "$EXTRA_PROVIDERS"
     _PrintMenuItem_ ad 'Add backup resolver (presets or custom)'
     _PrintMenuItem_ ch 'Change backup resolver'
@@ -3789,11 +3891,11 @@ EOF_RG_PROVIDER
           ip=''; tls=''; tport='853'
         fi
         _Say_ 'Enter e or exit at any prompt to cancel.'
-        _AskBackupField_ 'Resolver IPv4' "$ip" || continue; ip="$RG_ANSWER"
+        _AskBackupField_ 'Resolver IPv4/IPv6' "$ip" || continue; ip="$RG_ANSWER"
         _AskBackupField_ 'Certificate TLS authentication hostname' "$tls" || continue; tls="$RG_ANSWER"
         _AskBackupField_ 'Upstream TLS port' "${tport:-853}" || continue; tport="$RG_ANSWER"
-        if ! _IsValidID_ "$id" || ! _IsValidIPv4_ "$ip" || ! _IsValidDomain_ "$tls" || ! _IsValidTLSPort_ "$tport"; then
-          _Fail_ 'Invalid provider ID, IPv4, TLS name or port'; _PromptEnter_; continue
+        if ! _IsValidID_ "$id" || ! _IsValidIP_ "$ip" || ! _IsValidDomain_ "$tls" || ! _IsValidTLSPort_ "$tport"; then
+          _Fail_ 'Invalid provider ID, IPv4/IPv6, TLS name or port'; _PromptEnter_; continue
         fi
         case "$id" in wan[0-9]*) _Fail_ 'Resolver IDs beginning wan + number are reserved'; _PromptEnter_; continue;; esac
         if [ "$choice" = AD ]; then
@@ -3869,12 +3971,13 @@ _IsNewerVersion_() {
 # Development's version.txt stays a single line. Read the build tag from
 # the development script itself instead of adding a second manifest field.
 _ReadDevBuildTag_() {
-  local candidate buildtag
+  local candidate buildtag dev_script_url
+  dev_script_url="${1:-$UPDATE_DEV_SCRIPT_URL}"
   candidate="$RUNTIME/dev-script-check.$$"
   [ ! -e "$candidate" ] && [ ! -L "$candidate" ] || {
     _Fail_ 'Development script staging path already exists'; return 1;
   }
-  if ! _FetchHTTPS_ "$UPDATE_DEV_SCRIPT_URL" "$candidate"; then
+  if ! _FetchHTTPS_ "$dev_script_url" "$candidate"; then
     rm -f "$candidate"; return 1
   fi
   if [ "$(wc -c < "$candidate")" -gt 1048576 ] || ! sh -n "$candidate" ||
@@ -3902,12 +4005,24 @@ _IsNewerBuildTag_() {
 }
 
 _ReadReleaseManifest_() {
-  local manifest records
+  local manifest records requested_channel requested_manifest_url requested_dev_url
+  requested_channel="${1:-$UPDATE_CHANNEL}"
+  case "$requested_channel" in
+    development)
+      requested_manifest_url="$SCRIPT_URL_BASE/refs/heads/dev/version.txt"
+      requested_dev_url="$SCRIPT_URL_BASE/refs/heads/dev/resolvguard.sh"
+      ;;
+    stable)
+      requested_manifest_url="$SCRIPT_URL_BASE/refs/heads/main/version.txt"
+      requested_dev_url=''
+      ;;
+    *) _Fail_ "Unsupported update channel: $requested_channel"; return 1 ;;
+  esac
   manifest="$RUNTIME/release-version.$$"
   [ ! -e "$manifest" ] && [ ! -L "$manifest" ] || {
     _Fail_ 'Update version staging path already exists'; return 1;
   }
-  if ! _FetchHTTPS_ "$UPDATE_MANIFEST_URL" "$manifest"; then
+  if ! _FetchHTTPS_ "$requested_manifest_url" "$manifest"; then
     rm -f "$manifest"; return 1
   fi
   records="$(awk 'END { print NR }' "$manifest")"
@@ -3920,9 +4035,10 @@ _ReadReleaseManifest_() {
   # Channel and asset URL are locally pinned: version.txt cannot redirect
   # downloads to an arbitrary host or asset name.
   RELEASE_VERSTAG=''
-  if [ "$UPDATE_CHANNEL" = development ]; then
-    RELEASE_SCRIPT_URL="$UPDATE_DEV_SCRIPT_URL"
-    _ReadDevBuildTag_ || return 1
+  RELEASE_CHANNEL="$requested_channel"
+  if [ "$requested_channel" = development ]; then
+    RELEASE_SCRIPT_URL="$requested_dev_url"
+    _ReadDevBuildTag_ "$requested_dev_url" || return 1
   else
     RELEASE_SCRIPT_URL="$RELEASE_URL_BASE/v$RELEASE_VERSION/$RELEASE_UPDATE_ASSET"
   fi
@@ -3987,7 +4103,7 @@ _ApplyVerifiedUpdate_() (
     grep -F 'amtmupdate)' "$newscript" >/dev/null 2>&1 || {
     rm -rf "$stage"; _Fail_ 'Incompatible script name, version, schema or updater interface'; exit 1;
   }
-  if [ "$UPDATE_CHANNEL" = development ]; then
+  if [ "$RELEASE_CHANNEL" = development ]; then
     grep -Fx 'SCRIPT_BRANCH="dev"' "$newscript" >/dev/null 2>&1 &&
       grep -Fx "readonly SCRIPT_VERSTAG=\"$RELEASE_VERSTAG\"" "$newscript" >/dev/null 2>&1 || {
       rm -rf "$stage"; _Fail_ 'Development update branch or build tag mismatch'; exit 1;
@@ -4032,7 +4148,7 @@ _ApplyVerifiedUpdate_() (
     rm -rf "$stage"; _Fail_ 'Update verification failed; previous script restored'; exit 1
   fi
   rm -rf "$stage" || :
-  if [ "$UPDATE_CHANNEL" = development ]; then
+  if [ "$RELEASE_CHANNEL" = development ]; then
     _Say_ "ResolvGuard development update: ${SCRIPT_VERSION}_${SCRIPT_VERSTAG} -> ${RELEASE_VERSION}_${RELEASE_VERSTAG}"
   else
     _Say_ "ResolvGuard updated: $SCRIPT_VERSION -> $RELEASE_VERSION"
@@ -4040,6 +4156,38 @@ _ApplyVerifiedUpdate_() (
   _Say_ "Previous version saved: $backup"
   exit 0
 )
+
+# MerlinAU-style CLI: "develop" installs the newest development script;
+# "stable" installs the current stable Release asset (even if that is an
+# older version). The installed script's SCRIPT_BRANCH marker persists the
+# selected channel; subsequent amtmupdate operations follow that channel.
+# The normal verified updater lock/rollback path is reused for both commands.
+_SwitchReleaseChannel_() {
+  local target_channel
+  case "${1:-}" in
+    develop) target_channel=development ;;
+    stable) target_channel=stable ;;
+    *) _Fail_ 'Usage: resolvguard [develop|stable]'; return 1 ;;
+  esac
+  _UpdateSafetyPreflight_ || return 1
+  if [ "$UPDATE_CHANNEL" = "$target_channel" ]; then
+    _Say_ "Already using the $target_channel channel; checking for updates."
+    _ManageOnlineUpdate_ update
+    return $?
+  fi
+  _ReadReleaseManifest_ "$target_channel" || return 1
+  # A newer dev build may have a higher version number than the latest stable.
+  # Never silently downgrade just because the operator selected "stable".
+  if _IsNewerVersion_ "$SCRIPT_VERSION" "$RELEASE_VERSION"; then
+    _Say_ "NOTICE: $target_channel currently offers v$RELEASE_VERSION, older than installed v$SCRIPT_VERSION."
+    _ConfirmYesNo_ 'Install the older release to switch channels?' || {
+      _Say_ 'Channel switch cancelled; installed script unchanged.'
+      return 1
+    }
+  fi
+  _Say_ "Switching ResolvGuard from $UPDATE_CHANNEL to $target_channel."
+  _ApplyVerifiedUpdate_
+}
 
 _ManageOnlineUpdate_() {
   local mode
@@ -4605,10 +4753,24 @@ _RunQuickSetupWizard_() {
       _Fail_ 'Enable Strict DNS Privacy in ASUSWRT-Merlin before setup'; return 1; }
   _PrepareProviders_ || return 1
   if [ ! -r "$PREF_RULELIST" ] || [ ! -r "$PREF_PROVIDERS" ]; then
+    # Never offer a partial preferred/restore point: match the entire live
+    # NVRAM resolver list to the active firmware-generated Stubby identities.
+    local verified configured
+    verified="$RUNTIME/quicksetup-verified-$$"
+    configured="$RUNTIME/quicksetup-configured-$$"
+    if ! _BuildLivePreferredProviders_ "$(_ReadWANRulelist_)" "$verified"; then
+      rm -f "$verified"; _Fail_ 'Complete IPv4/IPv6 preferred DNS could not be verified; enrollment refused'; return 1
+    fi
+    awk -F'|' '$1 ~ /^wan[0-9]+$/ {print}' "$PROVIDERS" > "$configured"
+    if ! cmp -s "$verified" "$configured"; then
+      rm -f "$verified" "$configured"
+      _Fail_ 'Configured Stubby and WAN preferred resolver lists differ; enrollment refused'; return 1
+    fi
+    rm -f "$verified" "$configured"
     printf '  %sCurrent router DNS (Strict DoT):%s\n' "$RG_BOLD" "$RG_RESET"
     awk -F'|' -v col="$RG_CYAN" -v reset="$RG_RESET" \
-      '$1 ~ /^wan[0-9]+$/ {printf "    %s%-15s%s %s\n",col,$2,reset,$3}' "$PROVIDERS"
-    _ConfirmYesNo_ 'Use these as preferred DNS (and restore point)?' || return 1
+      '$1 ~ /^wan[0-9]+$/ {printf "    %s%-39s%s %s\n",col,$2,reset,$3}' "$PROVIDERS"
+    _ConfirmYesNo_ 'Use ALL these as preferred DNS (and restore point)?' || return 1
     _EnrollPreferredDNS_ >/dev/null || return 1
     printf '  %sPreferred DNS saved.%s\n' "$RG_GREEN" "$RG_RESET"
   else
@@ -4819,7 +4981,7 @@ _MainMenu_() {
 # Direct CLI operations on the installed path must not bypass the installer.
 # Boot and scheduled jobs must never prompt for dependencies or install Entware.
 case "${1:-menu}" in
-  install|menu|uninstall|amtmupdate|help|-h|--help) : ;;
+  install|menu|uninstall|amtmupdate|develop|stable|help|-h|--help) : ;;
   startup|scheduled-check)
     _IsInstallationComplete_ || { _Fail_ 'Install ResolvGuard before enabling unattended operation'; exit 1; } ;;
   *) if [ "$ROOT" = "$INSTALL_ROOT" ]; then
@@ -4843,6 +5005,7 @@ case "${1:-menu}" in
   dependencies|deps) _EnsureDigDependency_ ;;
   uninstall) _DoUnInstallation_ ;;
   amtmupdate) _ManageOnlineUpdate_ "${2:-update}" ;;
+  develop|stable) _SwitchReleaseChannel_ "$1" ;;
   schedule) _ManageScheduledMonitoring_ "${2:-status}" ;;
   policy) _ManagePolicy_ "${2:-status}" ;;
   startup) _ScheduleStartup_ ;;
@@ -4858,7 +5021,7 @@ case "${1:-menu}" in
   help|-h|--help)
     cat <<HELP
 ResolvGuard v$SCRIPT_VERSION (WAN DNS-over-TLS monitoring and failover)
-Usage: sh $ROOT/resolvguard.sh [install|menu|quick-setup|dependencies|configure|uninstall|discover|validate|enroll|pools|check|status|restore|probe <hostname-or-URL> [BOTH|TYPE] [provider-id|all] [summary|full]|schedule [status|enable|disable|logs]|startup|policy [status|approve|revoke]|amtmupdate [check|status|update]]
+Usage: sh $ROOT/resolvguard.sh [install|menu|quick-setup|dependencies|configure|uninstall|discover|validate|enroll|pools|check|status|restore|probe <hostname-or-URL> [BOTH|TYPE] [provider-id|all] [summary|full]|schedule [status|enable|disable|logs]|startup|policy [status|approve|revoke]|amtmupdate [check|status|update]|develop|stable]
 
 No arguments: if installation is needed, install and offer Quick Setup once; otherwise open the SSH menu. An incomplete setup remains selectable from the menu. e or exit leaves the current menu.
 install verifies prerequisites (including optional bind-dig installation), initializes missing config, and publishes the main script only after preparation succeeds.
@@ -4880,6 +5043,8 @@ On boot, startup re-registers cron and reconciles known WAN state without WAN wr
 Confirmed failed WAN endpoints may be temporarily excluded; known healthy original endpoints return after sustained successful checks.
 Stable updates read GitHub main/version.txt and use version-pinned GitHub Release assets.
 Development builds read dev/version.txt and use the raw dev script; SCRIPT_VERSTAG identifies same-version revisions.
+Run develop or stable to fetch, validate, and switch to the corresponding channel. A switch to an older stable version asks for confirmation.
+The chosen channel persists in the downloaded script's SCRIPT_BRANCH marker; subsequent updates stay on that channel.
 Run amtmupdate status to check for a newer release; run amtmupdate update to install it.
 amtmupdate check is the offline amtm capability probe; amtmupdate defaults to update.
 Updates preserve configuration, enrollment, DNS, and recovery state; unsafe WAN ownership blocks updating.
