@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.0
-readonly SCRIPT_VERSTAG="26111322"
+readonly SCRIPT_VERSTAG="26111401"
 readonly SCRIPT_NAME="ResolvGuard"
 ## Set to "master" for Production Releases ##
 SCRIPT_BRANCH="master"
@@ -54,6 +54,7 @@ POOLS="$RUNTIME/pools.tsv"
 MEMBER_HISTORY="$RUNTIME/member-health-history"
 POLICY_APPROVAL="$STATE_DIR/policy-approval"
 WAN_LOCK="$RUNTIME/rg-wan-lock"
+CONFIG_LOCK="$RUNTIME/rg-config-lock"
 SCHEDULE_MARKER="$STATE_DIR/monitoring-enabled"
 AUTO_FAILOVER_MARKER="$STATE_DIR/automatic-failover-enabled"
 SCHEDULE_JOB=ResolvGuardHealth
@@ -496,7 +497,7 @@ _ValidateConfiguration_() {
 _MakeStubbyConfig_() {
   local id ip tls port tlsport cfg
   id="$1"; ip="$2"; tls="$3"; port="$4"; tlsport="$5"
-  cfg="${6:-$RUNTIME/configs/$id.yml}"
+  cfg="${6:-${RG_PROBE_DIR:-$RUNTIME}/configs/$id.yml}"
   cat > "$cfg" <<YAML
 resolution_type: GETDNS_RESOLUTION_STUB
 dns_transport_list:
@@ -529,12 +530,12 @@ _StartProbeInstances_() {
   while IFS='|' read -r id ip tls port tlsport extra; do
     case "$id" in ''|\#*) continue;; esac
     [ -z "$selected" ] || [ "$selected" = "$id" ] || continue
-    cfg="$RUNTIME/configs/$id.yml"
+    cfg="${RG_PROBE_DIR:-$RUNTIME}/configs/$id.yml"
     desired="$cfg.desired.$$"
-    pidfile="$RUNTIME/pids/$id.pid"
+    pidfile="${RG_PROBE_DIR:-$RUNTIME}/pids/$id.pid"
     _MakeStubbyConfig_ "$id" "$ip" "$tls" "$port" "$tlsport" "$desired"
-    "$STUBBY" -C "$desired" -i > "$RUNTIME/$id.validate.log" 2>&1 || {
-      rm -f "$desired"; _Fail_ "Invalid Stubby config for $id; see $RUNTIME/$id.validate.log"; return 1;
+    "$STUBBY" -C "$desired" -i > "${RG_PROBE_DIR:-$RUNTIME}/$id.validate.log" 2>&1 || {
+      rm -f "$desired"; _Fail_ "Invalid Stubby config for $id; see ${RG_PROBE_DIR:-$RUNTIME}/$id.validate.log"; return 1;
     }
     if [ -f "$pidfile" ] && _IsOwnedProcess_ "$(cat "$pidfile")" "$cfg"; then
       if cmp -s "$desired" "$cfg"; then
@@ -547,12 +548,12 @@ _StartProbeInstances_() {
       rm -f "$pidfile"
     fi
     mv "$desired" "$cfg"
-    "$STUBBY" -C "$cfg" > "$RUNTIME/$id.log" 2>&1 &
+    "$STUBBY" -C "$cfg" > "${RG_PROBE_DIR:-$RUNTIME}/$id.log" 2>&1 &
     pid=$!
     echo "$pid" > "$pidfile"
     sleep 1
     if ! _IsOwnedProcess_ "$pid" "$cfg"; then
-      _Fail_ "Stubby failed to start: $id (local port $port); see $RUNTIME/$id.log"
+      _Fail_ "Stubby failed to start: $id (local port $port); see ${RG_PROBE_DIR:-$RUNTIME}/$id.log"
       return 1
     fi
     _Say_ "Started strict DoT instance $id on localhost:$port (upstream $ip:$tlsport)"
@@ -560,10 +561,10 @@ _StartProbeInstances_() {
 }
 _StopProbeInstances_() {
   local pf id cfg pid
-  for pf in "$RUNTIME"/pids/*.pid; do
+  for pf in "${RG_PROBE_DIR:-$RUNTIME}"/pids/*.pid; do
     [ -f "$pf" ] || continue
     id="${pf##*/}"; id="${id%.pid}"
-    cfg="$RUNTIME/configs/$id.yml"
+    cfg="${RG_PROBE_DIR:-$RUNTIME}/configs/$id.yml"
     pid="$(cat "$pf")"
     if _IsOwnedProcess_ "$pid" "$cfg"; then
       kill "$pid" 2>/dev/null && _Say_ "Stopped $id"
@@ -572,40 +573,43 @@ _StopProbeInstances_() {
   done
 }
 
-# Exclusive WAN-operation lock for checks, switching, rollback and uninstall.
-_AcquireWANLock_() {
-  local owner previous acquire_guard outcome reclaimed
-  # Guard lock reclamation to avoid two processes claiming the same WAN lock.
-  acquire_guard="$WAN_LOCK.reclaim"
+# Short configuration commits and actual WAN mutations share the config lock.
+# Probe cycles retain the WAN lock for their existing dedicated listeners, but
+# never hold the configuration lock while waiting for DNS or user input.
+# Reuse the same conservative stale-owner/reclaim safeguards for both locks.
+_AcquireNamedLock_() {
+  local lockpath owner previous acquire_guard outcome reclaimed
+  lockpath="$1"
+  acquire_guard="$lockpath.reclaim"
   if ! mkdir "$acquire_guard" 2>/dev/null; then return 1; fi
   outcome=1
   reclaimed=0
-  if mkdir "$WAN_LOCK" 2>/dev/null; then
-    if (umask 077; printf '%s\n' "$$" > "$WAN_LOCK/owner"); then
+  if mkdir "$lockpath" 2>/dev/null; then
+    if (umask 077; printf '%s\n' "$$" > "$lockpath/owner"); then
       outcome=0
     else
-      rmdir "$WAN_LOCK" 2>/dev/null || :
+      rmdir "$lockpath" 2>/dev/null || :
     fi
-  elif [ -d "$WAN_LOCK" ] && [ ! -L "$WAN_LOCK" ] &&
-       [ -f "$WAN_LOCK/owner" ] && [ ! -L "$WAN_LOCK/owner" ]; then
-    owner="$(cat "$WAN_LOCK/owner" 2>/dev/null || :)"
+  elif [ -d "$lockpath" ] && [ ! -L "$lockpath" ] &&
+       [ -f "$lockpath/owner" ] && [ ! -L "$lockpath/owner" ]; then
+    owner="$(cat "$lockpath/owner" 2>/dev/null || :)"
     case "$owner" in ''|*[!0-9]*) owner='';; esac
     if [ -n "$owner" ] && [ "$owner" != "$$" ] &&
        [ -d /proc ] && [ ! -e "/proc/$owner" ] &&
        ! kill -0 "$owner" 2>/dev/null; then
-      previous="$WAN_LOCK.dead.$$"
+      previous="$lockpath.dead.$$"
       if [ ! -e "$previous" ] && [ ! -L "$previous" ] &&
-         [ "$(cat "$WAN_LOCK/owner" 2>/dev/null || :)" = "$owner" ] &&
-         mv "$WAN_LOCK" "$previous"; then
+         [ "$(cat "$lockpath/owner" 2>/dev/null || :)" = "$owner" ] &&
+         mv "$lockpath" "$previous"; then
         if [ -f "$previous/owner" ] && [ ! -L "$previous/owner" ] &&
            [ "$(cat "$previous/owner" 2>/dev/null || :)" = "$owner" ] &&
            rm -f "$previous/owner" && rmdir "$previous"; then
-          if mkdir "$WAN_LOCK" 2>/dev/null; then
-            if (umask 077; printf '%s\n' "$$" > "$WAN_LOCK/owner"); then
+          if mkdir "$lockpath" 2>/dev/null; then
+            if (umask 077; printf '%s\n' "$$" > "$lockpath/owner"); then
               outcome=0
               reclaimed=1
             else
-              rmdir "$WAN_LOCK" 2>/dev/null || :
+              rmdir "$lockpath" 2>/dev/null || :
             fi
           fi
         else
@@ -625,11 +629,30 @@ _AcquireWANLock_() {
   return 0
 }
 
-_ReleaseWANLock_() {
-  [ -d "$WAN_LOCK" ] && [ ! -L "$WAN_LOCK" ] &&
-    [ -f "$WAN_LOCK/owner" ] && [ ! -L "$WAN_LOCK/owner" ] || return 1
-  [ "$(cat "$WAN_LOCK/owner")" = "$$" ] || return 1
-  rm -f "$WAN_LOCK/owner" && rmdir "$WAN_LOCK"
+_ReleaseNamedLock_() {
+  local lockpath
+  lockpath="$1"
+  [ -d "$lockpath" ] && [ ! -L "$lockpath" ] &&
+    [ -f "$lockpath/owner" ] && [ ! -L "$lockpath/owner" ] || return 1
+  [ "$(cat "$lockpath/owner")" = "$$" ] || return 1
+  rm -f "$lockpath/owner" && rmdir "$lockpath"
+}
+
+_AcquireWANLock_() { _AcquireNamedLock_ "$WAN_LOCK"; }
+_ReleaseWANLock_() { _ReleaseNamedLock_ "$WAN_LOCK"; }
+_AcquireConfigLock_() { _AcquireNamedLock_ "$CONFIG_LOCK"; }
+_ReleaseConfigLock_() { _ReleaseNamedLock_ "$CONFIG_LOCK"; }
+
+# Called only while holding CONFIG_LOCK by maintenance operations.
+# Inspector admission takes CONFIG_LOCK briefly before reserving its slot, so
+# no new inspector can start between this check and uninstalling files.
+_ActiveInspectorSessions_() {
+  local slot
+  for slot in "$RUNTIME"/inspector-slots/slot-*; do
+    [ -e "$slot" ] || [ -L "$slot" ] || continue
+    return 0
+  done
+  return 1
 }
 
 # Read-only lock classification for interactive status. Never reclaim a lock just
@@ -880,20 +903,65 @@ _InspectDNS_() (
   esac
   case "$requested" in ALL|all|'') requested=all ;; esac
   _RequireProbeDependencies_ || return 1
+  # Admission is brief; two inspectors starting simultaneously may contend
+  # for milliseconds. Bounded retries avoid rejecting a normal menu action.
+  inspect_try=1
+  while ! _AcquireConfigLock_; do
+    [ "$inspect_try" -lt 6 ] || {
+      _Fail_ 'Configuration commit or maintenance in progress; inspector start deferred'; return 1;
+    }
+    sleep 1
+    inspect_try=$((inspect_try+1))
+  done
+  RG_INSPECT_CONFIG_HELD=1
+  RG_PROBE_DIR=''; RG_INSPECT_SLOT=''
+  trap '_StopProbeInstances_ >/dev/null 2>&1 || :; rm -f "$RUNTIME/inspection-$$.txt"; [ -z "$RG_PROBE_DIR" ] || rm -rf "$RG_PROBE_DIR"; [ -z "$RG_INSPECT_SLOT" ] || _ReleaseNamedLock_ "$RG_INSPECT_SLOT" >/dev/null 2>&1 || :; if [ "${RG_INSPECT_CONFIG_HELD:-0}" = 1 ]; then _ReleaseConfigLock_ >/dev/null 2>&1 || :; fi' EXIT HUP INT TERM
+  # Give each inspector its own probe instances and nonoverlapping localhost
+  # ports. This avoids sharing scheduler Stubby processes, PIDs or provider
+  # lists, and needs no WAN lock for a read-only DNS query.
+  [ ! -L "$RUNTIME/inspector-slots" ] && [ ! -L "$RUNTIME/inspectors" ] || return 1
+  mkdir -p "$RUNTIME/inspector-slots" "$RUNTIME/inspectors" || return 1
+  RG_PROBE_DIR="$RUNTIME/inspectors/$$"
+  [ ! -e "$RG_PROBE_DIR" ] && [ ! -L "$RG_PROBE_DIR" ] || return 1
+  mkdir "$RG_PROBE_DIR" && mkdir "$RG_PROBE_DIR/configs" "$RG_PROBE_DIR/pids" || return 1
+  slot=0
+  while [ "$slot" -lt 32 ]; do
+    candidate="$RUNTIME/inspector-slots/slot-$slot"
+    if _AcquireNamedLock_ "$candidate"; then
+      RG_INSPECT_SLOT="$candidate"
+      break
+    fi
+    slot=$((slot+1))
+  done
+  [ -n "$RG_INSPECT_SLOT" ] || { _Fail_ 'All inspector probe port blocks are busy'; return 1; }
+  _ReleaseConfigLock_ || { _Fail_ 'Inspector could not release short admission lock'; return 1; }
+  RG_INSPECT_CONFIG_HELD=0
+  WAN_PORT_START=$((58000 + 64 * slot))
+  PROVIDERS="$RG_PROBE_DIR/providers.tsv"
   _PrepareProviders_ || return 1
+  [ "$(wc -l < "$PROVIDERS" | tr -d ' ')" -le 64 ] || {
+    _Fail_ 'Too many configured resolvers for independent inspector port block'; return 1;
+  }
+  # Saved preferred providers already contain the scheduler's localhost ports.
+  # Rebase ALL inspector ports, including preferred entries, to this session's
+  # reserved block; changing WAN_PORT_START alone would be insufficient.
+  if ! awk -F'|' -v base="$WAN_PORT_START" '
+    BEGIN {OFS="|"}
+    NF==5 && $1!="" {$4=base+NR-1; print; next}
+    {exit 1}
+  ' "$PROVIDERS" > "$RG_PROBE_DIR/providers-rebased.tsv"; then
+    _Fail_ 'Cannot allocate isolated inspector probe ports'; return 1
+  fi
+  mv "$RG_PROBE_DIR/providers-rebased.tsv" "$PROVIDERS" || return 1
   if [ "$requested" != all ]; then
     _IsValidID_ "$requested" && _GetProviderInfo_ "$requested" >/dev/null || {
       _Fail_ "Unknown configured provider: $requested (run discover)"; return 2;
     }
   fi
-  if ! _AcquireWANLock_; then
-    _Fail_ 'Another WAN watchdog/drill/probe owns the DNS test lock'; return 1
-  fi
   if [ -n "$capturefile" ]; then
     [ -f "$capturefile" ] && [ ! -L "$capturefile" ] || {
-      _ReleaseWANLock_; _Fail_ 'Unsafe inspector result file'; return 1; }
+      _Fail_ 'Unsafe inspector result file'; return 1; }
   fi
-  trap '_StopProbeInstances_ >/dev/null 2>&1 || :; rm -f "$RUNTIME/inspection-$$.txt"; _ReleaseWANLock_ >/dev/null 2>&1 || :' EXIT HUP INT TERM
   _Say_ ''
   _Say_ '================ DNS RESPONSE INSPECTOR ================'
   printf 'DNS inspection: %s%s%s | types=%s%s%s | provider=%s%s%s\n' \
@@ -1315,7 +1383,7 @@ _ProbeWANMemberStatuses_() {
         elif [ "$state" = PASS ]; then state=FAIL
         fi
       fi
-    done < "$CHECKS"
+    done < "${RG_MONITOR_CHECKS:-$CHECKS}"
     printf '%s|%s\n' "$id" "$state" >> "$destination" || { rm -f "$members"; return 1; }
     if [ "$state" = INCONCLUSIVE ]; then overall=2
     elif [ "$state" = FAIL ] && [ "$overall" -eq 0 ]; then overall=1
@@ -1336,7 +1404,7 @@ _UpdateWANHistory_() {
   case "$now" in ''|*[!0-9]*) return 1;; esac
   ttl=$((SCHEDULE_INTERVAL_MINUTES * 60 * 9))
   [ "$ttl" -ge 600 ] || ttl=600
-  fingerprint="$({ _ReadWANRulelist_; cat "$CHECKS"; printf '%s\n' "$pool"; } | _SHA256Digest_ 2>/dev/null)" || return 1
+  fingerprint="$({ _ReadWANRulelist_; cat "${RG_MONITOR_CHECKS:-$CHECKS}"; printf '%s\n' "$pool"; } | _SHA256Digest_ 2>/dev/null)" || return 1
   case "$fingerprint" in ''|*[!0-9a-f]*) return 1;; esac
   previous="$RUNTIME/member-history-old-$$"
   : > "$previous" || return 1
@@ -1531,7 +1599,7 @@ _ProbeResolverPool_() {
         elif [ "$outcome" -eq 0 ]; then outcome=1
         fi
       fi
-    done < "$CHECKS"
+    done < "${RG_MONITOR_CHECKS:-$CHECKS}"
   done < "$members"
   rm -f "$members"
   return "$outcome"
@@ -1903,6 +1971,33 @@ _SHA256Digest_() {
   printf '%s\n' "$digest" | LC_ALL=C tr 'A-F' 'a-f'
 }
 
+# Epoch detects a policy/config edit during a long DNS probe cycle. A changed
+# policy must never authorize a WAN switch using pre-edit observations, even
+# when the administrator approves the new policy before this cycle ends.
+_GetMonitorPolicyEpoch_() {
+  local file staged digest
+  staged="$RUNTIME/monitor-policy-epoch-$$"
+  [ ! -e "$staged" ] && [ ! -L "$staged" ] || return 1
+  if ! (
+    umask 077
+    for file in "$CHECKS" "$EXTRA_PROVIDERS" "$SETTINGS" \
+                "$PREF_RULELIST" "$PREF_PROVIDERS" "$POLICY_APPROVAL"; do
+      printf 'policy-file:%s\n' "$file" || exit 1
+      if [ -f "$file" ] && [ ! -L "$file" ]; then
+        cat "$file" || exit 1
+      else
+        printf '%s\n' '(missing-or-unsafe)' || exit 1
+      fi
+    done
+  ) > "$staged"; then
+    rm -f "$staged"
+    return 1
+  fi
+  digest="$(_SHA256Digest_ "$staged")" || { rm -f "$staged"; return 1; }
+  rm -f "$staged" || return 1
+  printf '%s\n' "$digest"
+}
+
 _GetPolicyFingerprint_() {
   local digest
   [ -r "$CHECKS" ] || { _Fail_ 'Cannot read DNS health checks for policy fingerprint'; return 1; }
@@ -2084,8 +2179,29 @@ _ManagePolicy_() {
   esac
 }
 
-_SwitchDNSPool_() {
-  local old new reason prev desired actual verified
+_SwitchDNSPool_() (
+  local old new reason prev desired actual verified release_config
+  # Config commits may run during read-only probes, but not during WAN writes.
+  # A maintenance caller can already own CONFIG_LOCK while holding WAN_LOCK.
+  release_config=0
+  if [ "${RG_CONFIG_LOCK_ALREADY_HELD:-0}" = 1 ]; then
+    [ -d "$CONFIG_LOCK" ] && [ ! -L "$CONFIG_LOCK" ] &&
+      [ -f "$CONFIG_LOCK/owner" ] && [ ! -L "$CONFIG_LOCK/owner" ] &&
+      [ "$(cat "$CONFIG_LOCK/owner")" = "$$" ] || {
+        _Fail_ 'Maintenance configuration lock ownership cannot be verified'; return 1;
+      }
+  else
+    _AcquireConfigLock_ || {
+      _Fail_ 'Configuration commit in progress; WAN switch deferred'; return 1;
+    }
+    release_config=1
+  fi
+  trap 'if [ "$release_config" = 1 ]; then _ReleaseConfigLock_ >/dev/null 2>&1 || :; fi' EXIT HUP INT TERM
+  if [ -n "${RG_MONITOR_POLICY_EPOCH:-}" ] &&
+     [ "$(_GetMonitorPolicyEpoch_)" != "$RG_MONITOR_POLICY_EPOCH" ]; then
+    _Say_ 'WAN SWITCH SAFETY HOLD: configuration changed during DNS probing.'
+    return 1
+  fi
   old="$1"; new="$2"; reason="$3"
   case "$new" in
     filtered1|filtered2)
@@ -2165,7 +2281,7 @@ _SwitchDNSPool_() {
     _LogEvent_ warning "DNS POOL CHANGE: $old -> $new; Strict DoT verified ($reason)"
   fi
   return 0
-}
+)
 
 _ReadMonitoringState_() {
   local f
@@ -2196,10 +2312,26 @@ _RunDNSHealthCheck_() (
   survivors="$RUNTIME/member-survivors-$$"
   # EXIT traps can run after local variables leave scope on router BusyBox ash.
   # Reconstruct exact per-process temp paths instead of referring to locals.
-  trap '_StopProbeInstances_ >/dev/null 2>&1 || :; rm -f "$RUNTIME/member-first-$$" "$RUNTIME/member-confirm-$$" "$RUNTIME/member-survivors-$$"; _ReleaseWANLock_ >/dev/null 2>&1 || :' EXIT HUP INT TERM
+  trap '_StopProbeInstances_ >/dev/null 2>&1 || :; rm -f "$RUNTIME/member-first-$$" "$RUNTIME/member-confirm-$$" "$RUNTIME/member-survivors-$$" "$RUNTIME/monitor-checks-$$"; if [ "${RG_CONFIG_HELD:-0}" = 1 ]; then _ReleaseConfigLock_ >/dev/null 2>&1 || :; fi; _ReleaseWANLock_ >/dev/null 2>&1 || :' EXIT HUP INT TERM
+  RG_CONFIG_HELD=0
+  if ! _AcquireConfigLock_; then
+    if [ "$mode" = scheduled ]; then
+      _Say_ 'SKIP: configuration commit in progress; next scheduled cycle will retry.'
+      return 0
+    fi
+    _Fail_ 'Configuration commit in progress; retry the manual health check'
+    return 1
+  fi
+  RG_CONFIG_HELD=1
   _SyncPreferredWANLocked_ || return 1
   _ValidateConfiguration_ >/dev/null || return 1
   _PrepareResolverPools_ || return 1
+  RG_MONITOR_CHECKS="$RUNTIME/monitor-checks-$$"
+  [ ! -e "$RG_MONITOR_CHECKS" ] && [ ! -L "$RG_MONITOR_CHECKS" ] || return 1
+  cp "$CHECKS" "$RG_MONITOR_CHECKS" || return 1
+  RG_MONITOR_POLICY_EPOCH="$(_GetMonitorPolicyEpoch_)" || return 1
+  _ReleaseConfigLock_ || { _Fail_ 'Unable to release config lock'; return 1; }
+  RG_CONFIG_HELD=0
   current="$(_GetActiveWANPool_)" || { _Fail_ 'Active WAN NVRAM list differs from enrolled state; refusing'; return 1; }
   _StartProbeInstances_ || return 1
   _ReadMonitoringState_
@@ -2385,6 +2517,14 @@ _RunDNSHealthCheck_() (
         fi
       fi
     fi
+  fi
+  # Discard observations/counters collected under an obsolete config.
+  # Any actual WAN write is independently guarded by _SwitchDNSPool_.
+  if [ "$(_GetMonitorPolicyEpoch_)" != "$RG_MONITOR_POLICY_EPOCH" ]; then
+    failures=0; recoveries=0
+    rm -f "$MEMBER_HISTORY" || :
+    _Say_ 'MONITOR SAFETY HOLD: configuration changed during health check; counters reset.'
+    switch_failure=0
   fi
   # Surface an attempted-but-failed DNS switch to cron/CLI even when
   # rollback was successful. 0 means no switch failed (including monitor-only
@@ -2725,7 +2865,9 @@ _RestorePreferredDNS_() (
   [ -s "$PREF_RULELIST" ] || { _Fail_ 'Enroll preferred WAN DNS first'; return 1; }
   _ConfirmYesNo_ 'Restore preferred WAN DNS? (May restart Stubby)' || return 1
   if ! _AcquireWANLock_; then _Fail_ 'Another DNS operation holds the WAN lock'; return 1; fi
-  trap '_ReleaseWANLock_ >/dev/null 2>&1 || :' EXIT HUP INT TERM
+  trap 'if [ "${RG_CONFIG_LOCK_ALREADY_HELD:-0}" = 1 ]; then _ReleaseConfigLock_ >/dev/null 2>&1 || :; fi; _ReleaseWANLock_ >/dev/null 2>&1 || :' EXIT HUP INT TERM
+  _AcquireConfigLock_ || { _Fail_ 'Configuration commit in progress; restore deferred'; return 1; }
+  RG_CONFIG_LOCK_ALREADY_HELD=1
   _RestorePreferredDNSLocked_
 )
 
@@ -3209,11 +3351,8 @@ _RunScheduledCheck_() {
   [ ! -e "$PENDING_TRANSACTION" ] && [ ! -e "$RECOVERY_HOLD" ] || {
     _Say_ 'SKIP: unresolved WAN transaction or recovery hold; no WAN switching'; return 0;
   }
-  if _SyncPreferredWAN_ && _ValidateConfiguration_ >/dev/null; then
-    _RunDNSHealthCheck_ scheduled
-    outcome=$?
-  else
-    outcome=$?
+  if _RunDNSHealthCheck_ scheduled; then outcome=0
+  else outcome=$?
   fi
   _Say_ "SCHEDULE UTC END: $(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || _Say_ 'clock-unavailable') result=$outcome"
   return "$outcome"
@@ -3596,8 +3735,8 @@ _StageTSVFile_() {
 _ChangeTSVFile_() (
   local file kind mode key value staged
   file="$1"; kind="$2"; mode="$3"; key="$4"; value="${5:-}"
-  _AcquireWANLock_ || { _Fail_ 'Another WAN operation is running'; return 1; }
-  trap '_ReleaseWANLock_ >/dev/null 2>&1 || :' EXIT HUP INT TERM
+  _AcquireConfigLock_ || { _Fail_ 'Another configuration commit is running'; return 1; }
+  trap '_ReleaseConfigLock_ >/dev/null 2>&1 || :' EXIT HUP INT TERM
   _CheckConfigurationSafety_ || return 1
   staged="$file.rg-stage.$$"
   [ ! -e "$staged" ] && [ ! -L "$staged" ] || return 1
@@ -3625,8 +3764,8 @@ _SetSetting_() {
     *) _Fail_ 'Unknown setting'; return 1 ;;
   esac
   (
-    _AcquireWANLock_ || { _Fail_ 'Another WAN operation is running'; return 1; }
-    trap '_ReleaseWANLock_ >/dev/null 2>&1 || :' EXIT HUP INT TERM
+    _AcquireConfigLock_ || { _Fail_ 'Another configuration commit is running'; return 1; }
+    trap '_ReleaseConfigLock_ >/dev/null 2>&1 || :' EXIT HUP INT TERM
     _CheckConfigurationSafety_ || return 1
     staged="$SETTINGS.rg-stage.$$"
     [ ! -e "$staged" ] && [ ! -L "$staged" ] || return 1
@@ -3815,8 +3954,8 @@ _InstallBackupPreset_() (
   _SetBackupPreset_ "$choice" || return 1
   id1="${RG_PRESET_IDPREFIX}1"
   id2="${RG_PRESET_IDPREFIX}2"
-  _AcquireWANLock_ || { _Fail_ 'Another WAN operation is running'; return 1; }
-  trap '_ReleaseWANLock_ >/dev/null 2>&1 || :' EXIT HUP INT TERM
+  _AcquireConfigLock_ || { _Fail_ 'Another configuration commit is running'; return 1; }
+  trap '_ReleaseConfigLock_ >/dev/null 2>&1 || :' EXIT HUP INT TERM
   _CheckConfigurationSafety_ || return 1
   _PrepareProviders_ || return 1
   if awk -F'|' -v h="$RG_PRESET_HOST" -v port=853 -v a="$RG_PRESET_IP1" -v b="$RG_PRESET_IP2" \
@@ -4076,8 +4215,9 @@ _ApplyVerifiedUpdate_() (
     _Fail_ 'Another DNS operation is active; update deferred'
     exit 1
   fi
-  # Protect against cron/manual operations during final script replacement.
-  trap '_ReleaseWANLock_ >/dev/null 2>&1 || :' EXIT
+  # Protect against cron/manual operations and synchronize the short script
+  # replacement with interactive configuration commits.
+  trap 'if [ "${RG_CONFIG_LOCK_ALREADY_HELD:-0}" = 1 ]; then _ReleaseConfigLock_ >/dev/null 2>&1 || :; fi; _ReleaseWANLock_ >/dev/null 2>&1 || :' EXIT
   trap 'exit 130' INT
   trap 'exit 143' HUP TERM
   _UpdateSafetyPreflight_ || exit 1
@@ -4113,6 +4253,13 @@ _ApplyVerifiedUpdate_() (
       rm -rf "$stage"; _Fail_ 'Release asset is not marked as stable'; exit 1;
     }
   fi
+  _AcquireConfigLock_ || {
+    rm -rf "$stage"
+    _Fail_ 'Configuration commit in progress; script replacement deferred'
+    exit 1
+  }
+  RG_CONFIG_LOCK_ALREADY_HELD=1
+  _UpdateSafetyPreflight_ || exit 1
   installed="$ROOT/resolvguard.sh"
   staged="$ROOT/.resolvguard.sh.update.$$"
   tempbackup="$STATE_DIR/.updater-previous.sh.$$"
@@ -4318,6 +4465,12 @@ _UninstallNeverEnrolled_() {
 
 _UninstallLocked_() {
   local never_enrolled
+  # Admission is closed by the configuration lock held by _DoUnInstallation_.
+  # Refuse deleting the add-on while an independent read-only inspector lives.
+  if _ActiveInspectorSessions_; then
+    _Fail_ 'An independent DNS inspector is still active; finish inspection before uninstall'
+    return 1
+  fi
   # Recovery of an already journaled managed switch takes precedence over
   # external synchronization. Do not strand an otherwise recoverable uninstall.
   if [ -e "$PENDING_TRANSACTION" ] || [ -L "$PENDING_TRANSACTION" ] ||
@@ -4387,14 +4540,28 @@ _DoUnInstallation_() {
     _Fail_ 'Another WAN DNS operation holds the lock; uninstall aborted'
     return 1
   fi
-  trap '_ReleaseWANLock_ >/dev/null 2>&1 || :' EXIT
+  trap 'if [ "${RG_CONFIG_LOCK_ALREADY_HELD:-0}" = 1 ]; then _ReleaseConfigLock_ >/dev/null 2>&1 || :; fi; _ReleaseWANLock_ >/dev/null 2>&1 || :' EXIT
   trap 'exit 130' INT
   trap 'exit 143' HUP TERM
-  if ! _UninstallLocked_; then
+  if ! _AcquireConfigLock_; then
+    _Fail_ 'Configuration commit in progress; uninstall deferred'
     _ReleaseWANLock_ >/dev/null 2>&1 || :
     trap - EXIT HUP INT TERM
     return 1
   fi
+  RG_CONFIG_LOCK_ALREADY_HELD=1
+  if ! _UninstallLocked_; then
+    _ReleaseConfigLock_ >/dev/null 2>&1 || :
+    RG_CONFIG_LOCK_ALREADY_HELD=0
+    _ReleaseWANLock_ >/dev/null 2>&1 || :
+    trap - EXIT HUP INT TERM
+    return 1
+  fi
+  if ! _ReleaseConfigLock_; then
+    _Fail_ 'Uninstall completed, but configuration lock release failed; inspect runtime state'
+    exit 1
+  fi
+  RG_CONFIG_LOCK_ALREADY_HELD=0
   if ! _ReleaseWANLock_; then
     _Fail_ 'Add-on removed but WAN lock release failed; inspect runtime lock manually'
     exit 1
@@ -5010,13 +5177,17 @@ case "${1:-menu}" in
   policy) _ManagePolicy_ "${2:-status}" ;;
   startup) _ScheduleStartup_ ;;
   scheduled-check) _RunScheduledCheck_ ;;
-  validate) _ValidateConfiguration_ ;;
+  validate) (
+    PROVIDERS="$RUNTIME/providers-validation-$$.tsv"
+    trap 'rm -f "$RUNTIME/providers-validation-$$.tsv"' EXIT HUP INT TERM
+    _ValidateConfiguration_
+  ) ;;
   enroll) _EnrollPreferredDNS_ ;;
   restore) _RestorePreferredDNS_ ;;
   pools) _SyncPreferredWAN_ && _PrepareProviders_ && _PrepareResolverPools_ && cat "$POOLS" ;;
   discover) _DiscoverResolvers_ ;;
-  check) _SyncPreferredWAN_ && _ValidateConfiguration_ >/dev/null && _RunDNSHealthCheck_ ;;
-  probe) _SyncPreferredWAN_ && _InspectDNS_ "${2:-}" "${3:-BOTH}" "${4:-all}" "${5:-summary}" ;;
+  check) _RunDNSHealthCheck_ ;;
+  probe) _InspectDNS_ "${2:-}" "${3:-BOTH}" "${4:-all}" "${5:-summary}" ;;
   status) _ShowStatus_ ;;
   help|-h|--help)
     cat <<HELP
