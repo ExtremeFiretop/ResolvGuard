@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.0
-readonly SCRIPT_VERSTAG="26111406"
+readonly SCRIPT_VERSTAG="26111501"
 readonly SCRIPT_NAME="ResolvGuard"
 ## Set to "master" for Production Releases ##
 SCRIPT_BRANCH="dev"
@@ -55,6 +55,7 @@ MEMBER_HISTORY="$RUNTIME/member-health-history"
 POLICY_APPROVAL="$STATE_DIR/policy-approval"
 WAN_LOCK="$RUNTIME/rg-wan-lock"
 CONFIG_LOCK="$RUNTIME/rg-config-lock"
+MAINTENANCE_LOCK="$RUNTIME/rg-maintenance-priority"
 SCHEDULE_MARKER="$STATE_DIR/monitoring-enabled"
 AUTO_FAILOVER_MARKER="$STATE_DIR/automatic-failover-enabled"
 SCHEDULE_JOB=ResolvGuardHealth
@@ -813,6 +814,75 @@ _AcquireWANLock_() { _AcquireNamedLock_ "$WAN_LOCK"; }
 _ReleaseWANLock_() { _ReleaseNamedLock_ "$WAN_LOCK"; }
 _AcquireConfigLock_() { _AcquireNamedLock_ "$CONFIG_LOCK"; }
 _ReleaseConfigLock_() { _ReleaseNamedLock_ "$CONFIG_LOCK"; }
+
+# Interactive maintenance has priority over recurring scheduled monitoring.
+# This is an admission gate, not a replacement for the WAN transaction lock:
+# never take a live WAN lock away from an active scheduler or writer.
+_MaintenancePriorityPending_() {
+  if [ -e "$MAINTENANCE_LOCK" ] || [ -L "$MAINTENANCE_LOCK" ]; then
+    return 0
+  fi
+
+  if [ -e "$MAINTENANCE_LOCK.reclaim" ] || [ -L "$MAINTENANCE_LOCK.reclaim" ]; then
+    return 0
+  fi
+
+  return 1
+}
+
+_AcquireMaintenancePriority_() {
+  if ! _AcquireNamedLock_ "$MAINTENANCE_LOCK"; then
+    _Fail_ 'Another interactive maintenance operation is pending or active'
+    return 1
+  fi
+
+  RG_MAINTENANCE_PRIORITY_HELD=1
+  return 0
+}
+
+_ReleaseMaintenancePriority_() {
+  if [ "${RG_MAINTENANCE_PRIORITY_HELD:-0}" != 1 ]; then
+    return 0
+  fi
+
+  if ! _ReleaseNamedLock_ "$MAINTENANCE_LOCK"; then
+    return 1
+  fi
+
+  RG_MAINTENANCE_PRIORITY_HELD=0
+  return 0
+}
+
+_AcquireWANLockForMaintenance_() {
+  local attempt
+
+  # Announce intent before waiting, so new scheduled checks stand aside.
+  if ! _AcquireMaintenancePriority_; then
+    return 1
+  fi
+
+  attempt=1
+  while [ "$attempt" -le 90 ]; do
+    if _AcquireWANLock_; then
+      return 0
+    fi
+
+    if [ "$attempt" -eq 1 ]; then
+      _Say_ 'DNS maintenance has priority; waiting for the current WAN operation to finish...'
+    fi
+
+    if [ "$attempt" -eq 90 ]; then
+      break
+    fi
+
+    sleep 1
+    attempt=$((attempt + 1))
+  done
+
+  _Fail_ 'WAN lock still unavailable; maintenance aborted without stealing a live lock'
+  _ReleaseMaintenancePriority_ >/dev/null 2>&1 || :
+  return 1
+}
 
 # Called only while holding CONFIG_LOCK by maintenance operations.
 # Inspector admission takes CONFIG_LOCK briefly before reserving its slot, so
@@ -2822,6 +2892,13 @@ _SwitchDNSPool_() (
   trap '_CleanupSwitchConfigLock_' EXIT HUP INT TERM
   # Probes may run concurrently with a menu edit. A switch is allowed only
   # when the recorded policy epoch still matches the current configuration.
+  # A maintenance request made during probing must stop any new scheduled
+  # switch decision. A transaction already in progress still completes safely.
+  if [ -n "${RG_MONITOR_POLICY_EPOCH:-}" ] && _MaintenancePriorityPending_; then
+    _Say_ 'WAN SWITCH SAFETY HOLD: interactive maintenance has priority.'
+    return 1
+  fi
+
   if [ -n "${RG_MONITOR_POLICY_EPOCH:-}" ]; then
     if [ "$(_GetMonitorPolicyEpoch_)" != "$RG_MONITOR_POLICY_EPOCH" ]; then
       _Say_ 'WAN SWITCH SAFETY HOLD: configuration changed during DNS probing.'
@@ -2951,12 +3028,22 @@ _RunDNSHealthCheck_() (
   [ -r "$PREF_RULELIST" ] || { _Fail_ 'Run enroll before monitoring or switching WAN DoT'; return 1; }
   [ ! -e "$PENDING_TRANSACTION" ] && [ ! -e "$RECOVERY_HOLD" ] || {
     _Fail_ 'Unresolved WAN transaction; use Maintenance & Recovery to inspect preferred-DNS restoration'; return 1; }
+  if [ "$mode" = scheduled ] && _MaintenancePriorityPending_; then
+    _Say_ 'SKIP: interactive maintenance has priority over scheduled DNS checks.'
+    return 0
+  fi
   if ! _AcquireWANLock_; then _Fail_ 'Another WAN watchdog or drill holds the lock'; return 1; fi
   status1="$RUNTIME/member-first-$$"; status2="$RUNTIME/member-confirm-$$"
   survivors="$RUNTIME/member-survivors-$$"
   # EXIT traps can run after local variables leave scope on router BusyBox ash.
   # Reconstruct exact per-process temp paths instead of referring to locals.
   trap '_CleanupMonitorCycle_' EXIT HUP INT TERM
+  # Close the admission race if maintenance requested priority while the
+  # scheduler was waiting for its WAN lock.
+  if [ "$mode" = scheduled ] && _MaintenancePriorityPending_; then
+    _Say_ 'SKIP: maintenance requested while scheduler was acquiring the WAN lock.'
+    return 0
+  fi
   RG_CONFIG_HELD=0
   if ! _AcquireConfigLock_; then
     if [ "$mode" = scheduled ]; then
@@ -3520,7 +3607,10 @@ _RestorePreferredDNSLocked_() {
 _RestorePreferredDNS_() (
   [ -s "$PREF_RULELIST" ] || { _Fail_ 'Enroll preferred WAN DNS first'; return 1; }
   _ConfirmYesNo_ 'Restore preferred WAN DNS? (May restart Stubby)' || return 1
-  if ! _AcquireWANLock_; then _Fail_ 'Another DNS operation holds the WAN lock'; return 1; fi
+  if ! _AcquireWANLockForMaintenance_; then
+    _Fail_ 'Unable to reserve WAN access for restore'
+    return 1
+  fi
   trap '_CleanupMaintenanceLocks_' EXIT HUP INT TERM
   _AcquireConfigLock_ || { _Fail_ 'Configuration commit in progress; restore deferred'; return 1; }
   RG_CONFIG_LOCK_ALREADY_HELD=1
@@ -4022,6 +4112,10 @@ _RotateScheduleLog_() {
 _RunScheduledCheck_() {
   local outcome
   [ -r "$SCHEDULE_MARKER" ] || { _Say_ 'SKIP: monitoring schedule not enabled'; return 0; }
+  if _MaintenancePriorityPending_; then
+    _Say_ 'SKIP: interactive DNS maintenance has priority; scheduled check deferred.'
+    return 0
+  fi
   _RotateScheduleLog_ || :
   _Say_ "SCHEDULE UTC: $(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || _Say_ 'clock-unavailable')"
   _CheckBootReadiness_ || return 0
@@ -4892,17 +4986,19 @@ _UpdateSafetyPreflight_() {
 _CleanupMaintenanceLocks_() {
   if [ "${RG_CONFIG_LOCK_ALREADY_HELD:-0}" = 1 ]; then
     _ReleaseConfigLock_ >/dev/null 2>&1 || :
+    RG_CONFIG_LOCK_ALREADY_HELD=0
   fi
 
   _ReleaseWANLock_ >/dev/null 2>&1 || :
+  _ReleaseMaintenancePriority_ >/dev/null 2>&1 || :
 }
 
 _ApplyVerifiedUpdate_() (
   local stage newscript staged installed backup tempbackup
   umask 077
   _UpdateSafetyPreflight_ || exit 1
-  if ! _AcquireWANLock_; then
-    _Fail_ 'Another DNS operation is active; update deferred'
+  if ! _AcquireWANLockForMaintenance_; then
+    _Fail_ 'Unable to reserve WAN access for update'
     exit 1
   fi
   # Protect against cron/manual operations and synchronize the short script
@@ -5244,8 +5340,8 @@ _DoUnInstallation_() {
     _ConfirmYesNo_ 'Uninstall ResolvGuard? (restore managed DNS if needed)' || return 1
   fi
 
-  if ! _AcquireWANLock_; then
-    _Fail_ 'Another WAN DNS operation holds the lock; uninstall aborted'
+  if ! _AcquireWANLockForMaintenance_; then
+    _Fail_ 'Unable to reserve WAN access for uninstall'
     return 1
   fi
   trap '_CleanupMaintenanceLocks_' EXIT
@@ -5255,15 +5351,13 @@ _DoUnInstallation_() {
   # locks before removing any shared installation or state files.
   if ! _AcquireConfigLock_; then
     _Fail_ 'Configuration commit in progress; uninstall deferred'
-    _ReleaseWANLock_ >/dev/null 2>&1 || :
+    _CleanupMaintenanceLocks_
     trap - EXIT HUP INT TERM
     return 1
   fi
   RG_CONFIG_LOCK_ALREADY_HELD=1
   if ! _UninstallLocked_; then
-    _ReleaseConfigLock_ >/dev/null 2>&1 || :
-    RG_CONFIG_LOCK_ALREADY_HELD=0
-    _ReleaseWANLock_ >/dev/null 2>&1 || :
+    _CleanupMaintenanceLocks_
     trap - EXIT HUP INT TERM
     return 1
   fi
@@ -5274,6 +5368,10 @@ _DoUnInstallation_() {
   RG_CONFIG_LOCK_ALREADY_HELD=0
   if ! _ReleaseWANLock_; then
     _Fail_ 'Add-on removed but WAN lock release failed; inspect runtime lock manually'
+    exit 1
+  fi
+  if ! _ReleaseMaintenancePriority_; then
+    _Fail_ 'Add-on removed but maintenance priority release failed; inspect runtime state'
     exit 1
   fi
   trap - EXIT HUP INT TERM
