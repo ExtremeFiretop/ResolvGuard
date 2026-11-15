@@ -3,7 +3,7 @@
 # ResolvGuard.sh
 #
 # Project Created: 2026-Oct-29 by @ExtremeFiretop
-# Last Modified: 2026-Nov-14
+# Last Modified: 2026-Nov-15
 #
 # ResolvGuard™
 # Official project: https://github.com/ExtremeFiretop/ResolvGuard
@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.0
-readonly SCRIPT_VERSTAG="26111501"
+readonly SCRIPT_VERSTAG="26111502"
 readonly SCRIPT_NAME="ResolvGuard"
 ## Set to "master" for Production Releases ##
 SCRIPT_BRANCH="dev"
@@ -964,41 +964,71 @@ _AcquireWANLockForPolicy_() {
   return 1
 }
 
+# Highlight health-check outcomes in an interactive terminal without changing
+# the plain output used by cron, redirected commands or diagnostic logs.
+# Color is enabled only by the manual health-check entry point.
+_PrintHealthCheckResult_() {
+  local result details
+
+  result="$1"
+  shift
+  details="$*"
+
+  if [ "${RG_HEALTH_COLOR_ENABLED:-0}" != 1 ]; then
+    _Say_ "    $result $details"
+    return 0
+  fi
+
+  case "$result" in
+    PASS)
+      # Keep successful detail lines neutral so a red failure stands out.
+      printf '    %sPASS%s %s\n' "$RG_GREEN" "$RG_RESET" "$details"
+      ;;
+    FAIL)
+      # Emphasize the entire failed check, including its reason.
+      printf '    %sFAIL %s%s\n' "$RG_RED" "$details" "$RG_RESET"
+      ;;
+    *)
+      _Say_ "    $result $details"
+      ;;
+  esac
+}
+
 _ProbeDNSRecord_() {
   local id qname qtype want_rcode want_count want_value port output actual_rcode actual_count
   id="$1"; qname="$2"; qtype="$3"; want_rcode="$4"; want_count="$5"; want_value="$6"
   port="$(_GetProviderPort_ "$id")" || return 1
   if ! output="$("$DIG" @127.0.0.1 -p "$port" "$qname" "$qtype" \
       +time="$TIMEOUT_SECONDS" +tries=1 +noall +comments +answer 2>&1)"; then
-    _Say_ "    FAIL $id $qname $qtype: dig timeout/error"
+    _PrintHealthCheckResult_ FAIL "$id $qname $qtype: dig timeout/error"
     return 1
   fi
   actual_rcode="$(printf '%s\n' "$output" | sed -n 's/.*status: \([A-Z][A-Z0-9_]*\),.*/\1/p' | head -n 1)"
   actual_count="$(printf '%s\n' "$output" | awk '/^;; flags:/ { for(i=1;i<=NF;i++) if($i=="ANSWER:") {gsub(/,/,"",$(i+1)); print $(i+1); exit} }')"
   case "$actual_rcode:$actual_count" in
-    :*|*:) _Say_ "    FAIL $id $qname $qtype: missing DNS header"; return 1 ;;
+    :*|*:) _PrintHealthCheckResult_ FAIL "$id $qname $qtype: missing DNS header"; return 1 ;;
   esac
-  case "$actual_count" in *[!0-9]*|'') _Say_ "    FAIL $id $qname $qtype: malformed answer count"; return 1;; esac
+  case "$actual_count" in *[!0-9]*|'') _PrintHealthCheckResult_ FAIL "$id $qname $qtype: malformed answer count"; return 1;; esac
   # Policy mismatches are resolver-health evidence, not infrastructure faults.
   # Wrong Plex A/AAAA records must NOT enter a blanket INCONCLUSIVE veto.
   # Switching still requires corroboration and independently healthy alternatives.
   if [ "$want_rcode" != ANY ] && [ "$actual_rcode" != "$want_rcode" ]; then
-    _Say_ "    FAIL $id $qname $qtype: RCODE $actual_rcode expected $want_rcode (policy mismatch)"
+    _PrintHealthCheckResult_ FAIL "$id $qname $qtype: RCODE $actual_rcode expected $want_rcode (policy mismatch)"
     return 1
   fi
   if [ "$want_count" != ANY ] && [ "$actual_count" != "$want_count" ]; then
-    _Say_ "    FAIL $id $qname $qtype: ANSWER count $actual_count expected $want_count (policy mismatch)"
+    _PrintHealthCheckResult_ FAIL "$id $qname $qtype: ANSWER count $actual_count expected $want_count (policy mismatch)"
     return 1
   fi
   if [ "$want_value" != '-' ]; then
     if ! printf '%s\n' "$output" | awk -v qt="$qtype" -v expected="$want_value" '
       $1 !~ /^;/ && $4 == qt && $5 == expected {found=1}
       END {exit found ? 0 : 1}'; then
-      _Say_ "    FAIL $id $qname $qtype: expected answer $want_value absent (policy mismatch)"
+      _PrintHealthCheckResult_ FAIL "$id $qname $qtype: expected answer $want_value absent (policy mismatch)"
       return 1
     fi
   fi
-  _Say_ "    PASS $id $qname $qtype: $actual_rcode answers=$actual_count"
+  _PrintHealthCheckResult_ PASS "$id $qname $qtype: $actual_rcode answers=$actual_count"
   return 0
 }
 
@@ -3025,6 +3055,17 @@ _RunDNSHealthCheck_() (
   local status1 status2 survivors proposed target eligible confirm_needed switch_failure
   mode="${1:-manual}"
   switch_failure=0
+
+  # Never emit terminal escape codes into scheduled logs or captured output.
+  # A direct manual CLI check and the menu's CH action share this path.
+  RG_HEALTH_COLOR_ENABLED=0
+  if [ "$mode" != scheduled ] && [ -t 1 ]; then
+    _SetMenuPalette_
+
+    if [ -n "$RG_GREEN" ] && [ -n "$RG_RED" ]; then
+      RG_HEALTH_COLOR_ENABLED=1
+    fi
+  fi
   [ -r "$PREF_RULELIST" ] || { _Fail_ 'Run enroll before monitoring or switching WAN DoT'; return 1; }
   [ ! -e "$PENDING_TRANSACTION" ] && [ ! -e "$RECOVERY_HOLD" ] || {
     _Fail_ 'Unresolved WAN transaction; use Maintenance & Recovery to inspect preferred-DNS restoration'; return 1; }
