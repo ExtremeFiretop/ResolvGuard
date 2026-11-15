@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.0
-readonly SCRIPT_VERSTAG="26111504"
+readonly SCRIPT_VERSTAG="26111505"
 readonly SCRIPT_NAME="ResolvGuard"
 ## Set to "master" for Production Releases ##
 SCRIPT_BRANCH="dev"
@@ -1038,34 +1038,161 @@ _CleanupPolicyLocks_() {
   _ReleaseMaintenancePriority_ >/dev/null 2>&1 || :
 }
 
+# Resolve the human-readable identity of a checked resolver. The provider
+# inventory already associates each temporary wanN/backupN ID with its actual
+# address, TLS port and authentication hostname. Never expose SPKI pins.
+_GetHealthResolverIdentity_() {
+  local requested_id id address hostname local_port tls_port extra
+
+  requested_id="$1"
+  RG_HEALTH_RESOLVER_ADDRESS=''
+  RG_HEALTH_RESOLVER_TLS_PORT=''
+  RG_HEALTH_RESOLVER_HOSTNAME=''
+
+  if [ -z "${PROVIDERS:-}" ] || [ ! -r "$PROVIDERS" ] || [ -L "$PROVIDERS" ]; then
+    return 1
+  fi
+
+  while IFS='|' read -r id address hostname local_port tls_port extra; do
+    if [ "$id" != "$requested_id" ]; then
+      continue
+    fi
+
+    RG_HEALTH_RESOLVER_ADDRESS="$address"
+    RG_HEALTH_RESOLVER_TLS_PORT="$tls_port"
+    RG_HEALTH_RESOLVER_HOSTNAME="$hostname"
+    return 0
+  done < "$PROVIDERS"
+
+  return 1
+}
+
 # Highlight health-check outcomes in an interactive terminal without changing
 # the plain output used by cron, redirected commands or diagnostic logs.
-# Color is enabled only by the manual health-check entry point.
+# Include the resolver IP directly in manual results so wanN IDs do not require
+# scrolling back to the Stubby startup messages.
 _PrintHealthCheckResult_() {
-  local result details
+  local result details displayed_details resolver_id
 
   result="$1"
   shift
   details="$*"
+  displayed_details="$details"
+
+  if [ "${RG_HEALTH_SHOW_RESOLVERS:-0}" = 1 ]; then
+    resolver_id="${details%% *}"
+
+    if _GetHealthResolverIdentity_ "$resolver_id"; then
+      displayed_details="$resolver_id [$RG_HEALTH_RESOLVER_ADDRESS:$RG_HEALTH_RESOLVER_TLS_PORT]${details#"$resolver_id"}"
+    fi
+
+    if [ "$result" = FAIL ]; then
+      RG_HEALTH_FAILED_RECORDS=$((RG_HEALTH_FAILED_RECORDS + 1))
+
+      case " ${RG_HEALTH_FAILED_IDS:-} " in
+        *" $resolver_id "*)
+          ;;
+        *)
+          RG_HEALTH_FAILED_IDS="${RG_HEALTH_FAILED_IDS:+$RG_HEALTH_FAILED_IDS }$resolver_id"
+          ;;
+      esac
+
+      # A resolver can fail during a preferred-pool recovery probe without
+      # belonging to the active filtered pool. Preserve that distinction.
+      RG_HEALTH_FAILURE_PHASES="${RG_HEALTH_FAILURE_PHASES:-}|$resolver_id:${RG_HEALTH_PROBE_PHASE:-active}|"
+    fi
+  fi
 
   if [ "${RG_HEALTH_COLOR_ENABLED:-0}" != 1 ]; then
-    _Say_ "    $result $details"
+    _Say_ "    $result $displayed_details"
     return 0
   fi
 
   case "$result" in
     PASS)
       # Keep successful detail lines neutral so a red failure stands out.
-      printf '    %sPASS%s %s\n' "$RG_GREEN" "$RG_RESET" "$details"
+      printf '    %sPASS%s %s\n' "$RG_GREEN" "$RG_RESET" "$displayed_details"
       ;;
     FAIL)
       # Emphasize the entire failed check, including its reason.
-      printf '    %sFAIL %s%s\n' "$RG_RED" "$details" "$RG_RESET"
+      printf '    %sFAIL %s%s\n' "$RG_RED" "$displayed_details" "$RG_RESET"
       ;;
     *)
-      _Say_ "    $result $details"
+      _Say_ "    $result $displayed_details"
       ;;
   esac
+}
+
+# A short end-of-check summary keeps failed resolver identities on screen just
+# before returning to the menu. This is presentation only: the probe result,
+# failover decisions and monitoring counters are not derived from these lists.
+_PrintManualHealthSummary_() {
+  local resolver_id source phase_text failed_resolvers
+
+  if [ "${RG_HEALTH_SHOW_RESOLVERS:-0}" != 1 ]; then
+    return 0
+  fi
+
+  _Say_ ''
+  _Say_ '----------------------------------------------------------------'
+  _Say_ '  DNS HEALTH CHECK SUMMARY'
+  _Say_ '----------------------------------------------------------------'
+
+  if [ "${RG_HEALTH_FAILED_RECORDS:-0}" -eq 0 ]; then
+    printf '  %sNo failed DNS record checks observed.%s\n' "$RG_GREEN" "$RG_RESET"
+    return 0
+  fi
+
+  failed_resolvers=0
+  for resolver_id in ${RG_HEALTH_FAILED_IDS:-}; do
+    failed_resolvers=$((failed_resolvers + 1))
+  done
+
+  printf '  %sFAILED: %s resolver(s), %s DNS record check(s)%s\n' \
+    "$RG_RED" "$failed_resolvers" "$RG_HEALTH_FAILED_RECORDS" "$RG_RESET"
+
+  for resolver_id in ${RG_HEALTH_FAILED_IDS:-}; do
+    source='address unavailable'
+    if _GetHealthResolverIdentity_ "$resolver_id"; then
+      source="$RG_HEALTH_RESOLVER_ADDRESS:$RG_HEALTH_RESOLVER_TLS_PORT"
+    fi
+
+    phase_text=''
+    case "${RG_HEALTH_FAILURE_PHASES:-}" in
+      *"|$resolver_id:active|"*)
+        phase_text='active pool'
+        ;;
+    esac
+    case "${RG_HEALTH_FAILURE_PHASES:-}" in
+      *"|$resolver_id:preferred|"*)
+        if [ -n "$phase_text" ]; then
+          phase_text="$phase_text + preferred recovery"
+        else
+          phase_text='preferred recovery (not active)'
+        fi
+        ;;
+    esac
+    case "${RG_HEALTH_FAILURE_PHASES:-}" in
+      *"|$resolver_id:alternate|"*)
+        if [ -n "$phase_text" ]; then
+          phase_text="$phase_text + alternate"
+        else
+          phase_text='alternate pool'
+        fi
+        ;;
+    esac
+
+    printf '  %s%-7s %s%s' "$RG_RED" "$resolver_id" "$source" "$RG_RESET"
+    if [ -n "${RG_HEALTH_RESOLVER_HOSTNAME:-}" ]; then
+      printf '  TLS: %s' "$RG_HEALTH_RESOLVER_HOSTNAME"
+    fi
+    if [ -n "$phase_text" ]; then
+      printf '  [%s]' "$phase_text"
+    fi
+    printf '\n'
+  done
+
+  _Say_ '  See the red FAIL lines above for individual DNS response errors.'
 }
 
 _ProbeDNSRecord_() {
@@ -3163,7 +3290,14 @@ _RunDNSHealthCheck_() (
   # Never emit terminal escape codes into scheduled logs or captured output.
   # A direct manual CLI check and the menu's CH action share this path.
   RG_HEALTH_COLOR_ENABLED=0
+  RG_HEALTH_SHOW_RESOLVERS=0
+  RG_HEALTH_FAILED_RECORDS=0
+  RG_HEALTH_FAILED_IDS=''
+  RG_HEALTH_FAILURE_PHASES=''
+  RG_HEALTH_PROBE_PHASE=active
+
   if [ "$mode" != scheduled ] && [ -t 1 ]; then
+    RG_HEALTH_SHOW_RESOLVERS=1
     _SetMenuPalette_
 
     if [ -n "$RG_GREEN" ] && [ -n "$RG_RED" ]; then
@@ -3223,6 +3357,7 @@ _RunDNSHealthCheck_() (
   _StartProbeInstances_ || return 1
   _ReadMonitoringState_
   _Say_ "ROUTER WAN DoT pool=$current preferred=preferred failures=$failures recoveries=$recoveries"
+  RG_HEALTH_PROBE_PHASE=active
   case "$current" in
     preferred|filtered1|filtered2)
       if _ProbeWANMemberStatuses_ "$current" "$status1"; then result=0
@@ -3243,6 +3378,11 @@ _RunDNSHealthCheck_() (
     fi
     failures=0
     if [ "$current" != preferred ]; then
+      RG_HEALTH_PROBE_PHASE=preferred
+      if [ "${RG_HEALTH_SHOW_RESOLVERS:-0}" = 1 ]; then
+        printf '\n  %sChecking preferred pool for possible recovery (not the active pool):%s\n' \
+          "$RG_CYAN" "$RG_RESET"
+      fi
       if _ProbeResolverPool_ preferred; then
         recoveries=$((recoveries+1))
         if [ "$recoveries" -ge "$RECOVERY_THRESHOLD" ]; then
@@ -3384,6 +3524,7 @@ _RunDNSHealthCheck_() (
           esac
           [ "$pool" != "$current" ] || continue
           _Say_ "  Checking alternate DNS pool $pool ($backup)"
+          RG_HEALTH_PROBE_PHASE=alternate
           if _ProbeResolverPool_ "$pool" && _ProbeResolverPool_ "$pool"; then
             selected="$pool"; break
           fi
@@ -3423,6 +3564,7 @@ _RunDNSHealthCheck_() (
       [ "$switch_failure" -ne 0 ] || return 1
     fi
   fi
+  _PrintManualHealthSummary_
   return "$switch_failure"
 )
 
