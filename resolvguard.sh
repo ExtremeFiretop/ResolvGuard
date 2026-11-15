@@ -5868,7 +5868,6 @@ _ShowQuickStatus_() {
   fi
 
   _Say_ ''
-  printf '  %sAdvanced Options:%s logs, policy, recovery.\n' "$RG_CYAN" "$RG_RESET"
 }
 
 _ConfigureQuickBackup_() {
