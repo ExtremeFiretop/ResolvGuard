@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.0
-readonly SCRIPT_VERSTAG="26111512"
+readonly SCRIPT_VERSTAG="26111513"
 readonly SCRIPT_NAME="ResolvGuard"
 ## Set to "master" for Production Releases ##
 SCRIPT_BRANCH="dev"
@@ -5962,10 +5962,25 @@ _ShowAdvancedSettingsMenu_() {
     case "$choice" in
       RE) _RestorePreferredDNS_; _PromptEnter_ ;;
       DP) _EnsureDigDependency_; _PromptEnter_ ;;
-      UP) if _ManageOnlineUpdate_ status && [ "${UPDATE_AVAILABLE:-0}" = 1 ]; then
-           _ConfirmYesNo_ 'Install available update?' && _ManageOnlineUpdate_ update || :
-         fi
-         _PromptEnter_ ;;
+      UP)
+        if _ManageOnlineUpdate_ status && [ "${UPDATE_AVAILABLE:-0}" = 1 ]; then
+          if _ConfirmYesNo_ 'Install available update?'; then
+            if _ManageOnlineUpdate_ update; then
+              # The verified updater runs in a subshell. Its WAN/configuration
+              # locks and cleanup traps finish before control returns here.
+              # Replace this running menu rather than displaying the old
+              # SCRIPT_VERSTAG after installing a newer script on disk.
+              _Say_ 'Restarting ResolvGuard...'
+              exec /bin/sh "$ROOT/resolvguard.sh" menu
+
+              # exec does not return on success. This is only a fallback if
+              # the shell cannot start the installed script.
+              _Fail_ 'Unable to restart the updated ResolvGuard script'
+            fi
+          fi
+        fi
+        _PromptEnter_
+        ;;
       UN) _DoUnInstallation_; _PromptEnter_ ;;
       E|EXIT) return 0 ;;
       *) _ShowInvalidSelection_ ;;
