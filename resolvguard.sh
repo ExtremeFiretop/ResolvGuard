@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.0
-readonly SCRIPT_VERSTAG="26111403"
+readonly SCRIPT_VERSTAG="26111405"
 readonly SCRIPT_NAME="ResolvGuard"
 ## Set to "master" for Production Releases ##
 SCRIPT_BRANCH="dev"
@@ -2232,37 +2232,153 @@ _VerifyStubbyListenerResponse_() {
   _VerifyLocalDNSResponse_ 127.0.1.1 stubby
 }
 
+# Validate the complete upstream file before trusting the router's LAN DNS path.
+# An unqualified server= line MUST point at the local production Stubby
+# listener. Domain-scoped exceptions can coexist, but are not a plaintext
+# fallback for ordinary DNS queries: DNSMasq uses them for matching names only.
+#
+# Return the explicit domain exceptions as "domain|server" records so the
+# caller can validate their IP addresses and disclose the bypass to the user.
+_ScanDNSMasqUpstreamFile_() {
+  awk '
+    function trim_whitespace(value) {
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+      return value
+    }
+
+    /^[[:space:]]*#/ || /^[[:space:]]*$/ {
+      next
+    }
+
+    {
+      line = trim_whitespace($0)
+
+      # A DNSMasq #port is not a comment. Only strip # preceded by space.
+      sub(/[[:space:]]+#.*$/, "", line)
+      line = trim_whitespace(line)
+
+      if (line == "server=127.0.1.1" ||
+          line == "server=127.0.1.1#53") {
+        default_servers++
+        next
+      }
+
+      # BusyBox awk treats a slash inside a bracket expression in a regex
+      # literal as the end of the regex on some firmware builds. Parse the
+      # DNSMasq domain delimiter as plain text instead of matching [^/].
+      if (substr(line, 1, 8) == "server=/") {
+        scoped_entry = substr(line, 9)
+        separator = index(scoped_entry, "/")
+
+        if (separator <= 1) {
+          invalid = 1
+          next
+        }
+
+        domain = substr(scoped_entry, 1, separator - 1)
+        destination = substr(scoped_entry, separator + 1)
+
+        if (destination == "" || index(destination, "/") != 0) {
+          invalid = 1
+          next
+        }
+
+        sub(/\.$/, "", domain)
+
+        # Reject root, wildcard, single-label and other overly broad scopes.
+        if (domain !~ /^[A-Za-z0-9-]+([.][A-Za-z0-9-]+)+$/ ||
+            domain ~ /[.][.]/) {
+          invalid = 1
+          next
+        }
+
+        printf "%s|%s\n", domain, destination
+        next
+      }
+
+      # Reject all other directives, particularly generic plaintext servers.
+      invalid = 1
+    }
+
+    END {
+      if (default_servers < 1 || invalid) {
+        exit 1
+      }
+    }
+  ' "$DNSMASQ_SERVERS"
+}
+
+_ValidateDNSMasqUpstreamFile_() {
+  local domain_exceptions domain server
+
+  if ! domain_exceptions="$(_ScanDNSMasqUpstreamFile_)"; then
+    _Say_ 'LAN DNS NOT READY: invalid DNSMasq upstream or missing Stubby default'
+    return 1
+  fi
+
+  # A split-DNS exception has a domain scope, but routes that domain outside
+  # production DoT. Accept only literal IP endpoints and disclose the scope.
+  if [ -n "$domain_exceptions" ]; then
+    while IFS='|' read -r domain server; do
+      if ! _IsValidIPv4_ "$server" && ! _IsValidIPv6_ "$server"; then
+        _Say_ "LAN DNS NOT READY: invalid domain-scoped DNS upstream for $domain"
+        return 1
+      fi
+    done <<EOF_DNSMASQ_SCOPED_SERVERS
+$domain_exceptions
+EOF_DNSMASQ_SCOPED_SERVERS
+
+    # Cron jobs are noninteractive; don't flood the minute-by-minute log.
+    # Interactive installation/readiness checks disclose plaintext exceptions.
+    if [ -t 1 ]; then
+      _Say_ 'LAN DNS NOTICE: default DNS uses Strict DoT; explicit domain-scoped upstreams bypass it:'
+      while IFS='|' read -r domain server; do
+        _Say_ "  domain=$domain upstream=$server"
+      done <<EOF_DNSMASQ_SCOPED_NOTICE
+$domain_exceptions
+EOF_DNSMASQ_SCOPED_NOTICE
+    fi
+  fi
+
+  return 0
+}
+
 _VerifyLANForwardingConfig_() {
   local lan
-  [ "$(_ReadNVRAM_ dnspriv_enable)" = 1 ] &&
-    [ "$(_ReadNVRAM_ dnspriv_profile)" = 1 ] || {
-      _Say_ 'LAN DNS NOT READY: ASUS Strict DNS Privacy is not enabled'; return 1;
-    }
-  [ -r "$DNSMASQ_MAIN" ] || {
-    _Say_ "LAN DNS NOT READY: DNSMasq main configuration not readable: $DNSMASQ_MAIN"; return 1;
-  }
-  [ -r "$DNSMASQ_SERVERS" ] || {
-    _Say_ "LAN DNS NOT READY: DNSMasq upstream servers file not readable: $DNSMASQ_SERVERS"; return 1;
-  }
-  awk '
-    /^[[:space:]]*#/ || /^[[:space:]]*$/ {next}
-    /^[[:space:]]*server=/ {
-      line=$0; sub(/^[[:space:]]*/, "", line); sub(/[[:space:]]*#.*/, "", line)
-      sub(/[[:space:]]*$/, "", line)
-      if (line!="server=127.0.1.1" && line!="server=127.0.1.1#53") bad=1
-      count++; next
-    }
-    {bad=1}
-    END {exit(count>0 && !bad)?0:1}
-  ' "$DNSMASQ_SERVERS" || {
-    _Say_ 'LAN DNS NOT READY: DNSMasq has missing/unexpected upstream (no plaintext fallback permitted)'; return 1;
-  }
-  grep -Eq '^[[:space:]]*no-resolv[[:space:]]*$' "$DNSMASQ_MAIN" &&
-    grep -Eq '^[[:space:]]*servers-file=/tmp/resolv\.dnsmasq[[:space:]]*$' "$DNSMASQ_MAIN" || {
-      _Say_ 'LAN DNS NOT READY: DNSMasq does not declare its strict forwarding file'; return 1;
-    }
+
+  if [ "$(_ReadNVRAM_ dnspriv_enable)" != 1 ] ||
+     [ "$(_ReadNVRAM_ dnspriv_profile)" != 1 ]; then
+    _Say_ 'LAN DNS NOT READY: ASUS Strict DNS Privacy is not enabled'
+    return 1
+  fi
+
+  if [ ! -r "$DNSMASQ_MAIN" ]; then
+    _Say_ "LAN DNS NOT READY: DNSMasq main configuration not readable: $DNSMASQ_MAIN"
+    return 1
+  fi
+
+  if [ ! -r "$DNSMASQ_SERVERS" ]; then
+    _Say_ "LAN DNS NOT READY: DNSMasq upstream servers file not readable: $DNSMASQ_SERVERS"
+    return 1
+  fi
+
+  if ! _ValidateDNSMasqUpstreamFile_; then
+    return 1
+  fi
+
+  if ! grep -Eq '^[[:space:]]*no-resolv[[:space:]]*$' "$DNSMASQ_MAIN" ||
+     ! grep -Eq '^[[:space:]]*servers-file=/tmp/resolv\.dnsmasq[[:space:]]*$' "$DNSMASQ_MAIN"; then
+    _Say_ 'LAN DNS NOT READY: DNSMasq does not declare its strict forwarding file'
+    return 1
+  fi
+
   lan="$(_ReadNVRAM_ lan_ipaddr)"
-  _IsValidIPv4_ "$lan" || { _Say_ 'LAN DNS NOT READY: LAN address invalid'; return 1; }
+  if ! _IsValidIPv4_ "$lan"; then
+    _Say_ 'LAN DNS NOT READY: LAN address invalid'
+    return 1
+  fi
+
   return 0
 }
 
@@ -2604,11 +2720,21 @@ _ManagePolicy_() {
   esac
 }
 
+# A WAN-switch subprocess must release only a configuration lock that it
+# acquired itself. The EXIT trap executes after function-local variables may
+# have gone out of scope on BusyBox ash, so this ownership marker is NOT local.
+# The switching function runs in a subshell, keeping the marker private to it.
+_CleanupSwitchConfigLock_() {
+  if [ "${RG_SWITCH_CONFIG_LOCK_OWNED:-0}" = 1 ]; then
+    _ReleaseConfigLock_ >/dev/null 2>&1 || :
+  fi
+}
+
 _SwitchDNSPool_() (
-  local old new reason prev desired actual verified release_config
+  local old new reason prev desired actual verified
   # Config commits may run during read-only probes, but not during WAN writes.
   # A maintenance caller can already own CONFIG_LOCK while holding WAN_LOCK.
-  release_config=0
+  RG_SWITCH_CONFIG_LOCK_OWNED=0
   if [ "${RG_CONFIG_LOCK_ALREADY_HELD:-0}" = 1 ]; then
     if [ ! -d "$CONFIG_LOCK" ] || [ -L "$CONFIG_LOCK" ] ||
        [ ! -f "$CONFIG_LOCK/owner" ] || [ -L "$CONFIG_LOCK/owner" ] ||
@@ -2621,10 +2747,10 @@ _SwitchDNSPool_() (
       _Fail_ 'Configuration commit in progress; WAN switch deferred'
       return 1
     fi
-    release_config=1
+    RG_SWITCH_CONFIG_LOCK_OWNED=1
   fi
 
-  trap 'if [ "$release_config" = 1 ]; then _ReleaseConfigLock_ >/dev/null 2>&1 || :; fi' EXIT HUP INT TERM
+  trap '_CleanupSwitchConfigLock_' EXIT HUP INT TERM
   # Probes may run concurrently with a menu edit. A switch is allowed only
   # when the recorded policy epoch still matches the current configuration.
   if [ -n "${RG_MONITOR_POLICY_EPOCH:-}" ]; then
