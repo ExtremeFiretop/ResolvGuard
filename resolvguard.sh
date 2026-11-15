@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.0
-readonly SCRIPT_VERSTAG="26111506"
+readonly SCRIPT_VERSTAG="26111512"
 readonly SCRIPT_NAME="ResolvGuard"
 ## Set to "master" for Production Releases ##
 SCRIPT_BRANCH="dev"
@@ -5171,8 +5171,9 @@ _ShowConfigurationMenu_() {
 
 
 # Online update: GitHub-hosted version.txt and version-pinned single-script Release asset.
-# Only the installed script may change. Router NVRAM, policy, runtime services,
-# config, enrollment and transaction files are not overwritten by an update.
+# An update replaces the installed script and removes its temporary rollback
+# files. Router NVRAM, DNS policy, enrollment, and transaction state are not
+# modified by the update process.
 _FetchHTTPS_() {
   local url dest
   url="$1"; dest="$2"
@@ -5370,43 +5371,100 @@ _ApplyVerifiedUpdate_() (
   staged="$ROOT/.resolvguard.sh.update.$$"
   tempbackup="$STATE_DIR/.updater-previous.sh.$$"
   backup="$STATE_DIR/updater-previous.sh"
+
+  # The replacement is staged beside the installed script so the final move
+  # stays on the same filesystem. The old script is retained only until the
+  # new installation has been verified (or a failed installation restored).
   for path in "$staged" "$tempbackup"; do
-    [ ! -e "$path" ] && [ ! -L "$path" ] || {
-      rm -rf "$stage"; _Fail_ 'Update destination staging path occupied'; exit 1;
-    }
+    if [ -e "$path" ] || [ -L "$path" ]; then
+      rm -rf "$stage"
+      _Fail_ 'Update destination staging path occupied'
+      exit 1
+    fi
   done
-  [ ! -L "$backup" ] || {
-    rm -rf "$stage"; _Fail_ 'Existing updater backup is unsafe'; exit 1;
-  }
-  cp "$newscript" "$staged" && chmod 755 "$staged" &&
-    cp "$installed" "$tempbackup" && chmod 600 "$tempbackup" || {
-    rm -f "$staged" "$tempbackup"; rm -rf "$stage"
-    _Fail_ 'Cannot stage new script or preserve old script'; exit 1;
-  }
-  mv -f "$tempbackup" "$backup" || {
-    rm -f "$staged" "$tempbackup"; rm -rf "$stage"
-    _Fail_ 'Cannot save prior version'; exit 1;
-  }
-  if ! mv -f "$staged" "$installed"; then
-    rm -f "$staged"; rm -rf "$stage"
-    _Fail_ 'Atomic script replacement failed; original installation retained'
+
+  # Previous builds saved a persistent updater-previous.sh. Accept an ordinary
+  # legacy file so that a successful update can retire it, but refuse unsafe
+  # state entries rather than deleting unknown files or following symlinks.
+  if [ -L "$backup" ]; then
+    rm -rf "$stage"
+    _Fail_ 'Existing updater backup is a symbolic link'
     exit 1
   fi
-  # Post-replacement byte comparison; restore the previous script on mismatch.
-  if ! cmp -s "$installed" "$newscript"; then
-    cp "$backup" "$staged" && chmod 755 "$staged" && mv -f "$staged" "$installed" || {
-      _Fail_ 'CRITICAL: update verification and rollback failed; prior script retained at updater-previous.sh'
-      rm -rf "$stage"; exit 1;
-    }
-    rm -rf "$stage"; _Fail_ 'Update verification failed; previous script restored'; exit 1
+
+  if [ -e "$backup" ] && [ ! -f "$backup" ]; then
+    rm -rf "$stage"
+    _Fail_ 'Existing updater backup is not a regular file'
+    exit 1
   fi
-  rm -rf "$stage" || :
+
+  if ! cp "$newscript" "$staged" || ! chmod 755 "$staged" ||
+     ! cp "$installed" "$tempbackup" || ! chmod 600 "$tempbackup"; then
+    rm -f "$staged" "$tempbackup"
+    rm -rf "$stage"
+    _Fail_ 'Cannot stage new script or temporarily preserve old script'
+    exit 1
+  fi
+
+  if ! mv -f "$staged" "$installed"; then
+    rm -f "$staged"
+    rm -rf "$stage"
+
+    # Preserve the temporary copy when replacement fails unexpectedly: the
+    # installed script may no longer be identical to the previous version.
+    if cmp -s "$installed" "$tempbackup"; then
+      rm -f "$tempbackup" || :
+      _Fail_ 'Atomic script replacement failed; original installation retained'
+    else
+      _Fail_ "CRITICAL: script replacement failed; previous script retained at $tempbackup"
+    fi
+    exit 1
+  fi
+
+  # A mismatch after replacement must restore the previous script before any
+  # rollback file is deleted. Keep that file if restoration cannot be proven.
+  if ! cmp -s "$installed" "$newscript"; then
+    if cp "$tempbackup" "$staged" && chmod 755 "$staged" &&
+       mv -f "$staged" "$installed" && cmp -s "$installed" "$tempbackup"; then
+      rm -f "$tempbackup" || _Fail_ "Temporary rollback cleanup failed: $tempbackup"
+      rm -rf "$stage"
+      _Fail_ 'Update verification failed; previous script restored and verified'
+    else
+      rm -f "$staged"
+      rm -rf "$stage"
+      _Fail_ "CRITICAL: update verification and rollback failed; prior script retained at $tempbackup"
+    fi
+    exit 1
+  fi
+
+  # No permanent previous-version backup is retained after success. Clean up
+  # the temporary rollback file and the legacy persistent file (if any).
+  # A failed removal is reported as incomplete maintenance, never as a clean
+  # success, even though the newly installed script already passed verification.
+  if ! rm -f "$tempbackup"; then
+    rm -rf "$stage"
+    _Fail_ "Update installed and verified, but temporary rollback cleanup failed: $tempbackup"
+    exit 1
+  fi
+
+  if [ -f "$backup" ] && ! rm -f "$backup"; then
+    rm -rf "$stage"
+    _Fail_ "Update installed and verified, but legacy backup cleanup failed: $backup"
+    exit 1
+  fi
+
+  if ! rm -rf "$stage"; then
+    _Fail_ "Update installed and verified, but download staging cleanup failed: $stage"
+    exit 1
+  fi
+
   if [ "$RELEASE_CHANNEL" = development ]; then
     _Say_ "ResolvGuard development update: ${SCRIPT_VERSION}_${SCRIPT_VERSTAG} -> ${RELEASE_VERSION}_${RELEASE_VERSTAG}"
   else
     _Say_ "ResolvGuard updated: $SCRIPT_VERSION -> $RELEASE_VERSION"
   fi
-  _Say_ "Previous version saved: $backup"
+  _Say_ 'Update installed and verified successfully.'
+  _Say_ 'Temporary update files cleaned up.'
   exit 0
 )
 
