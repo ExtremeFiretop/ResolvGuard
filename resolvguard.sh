@@ -3,7 +3,7 @@
 # ResolvGuard.sh
 #
 # Project Created: 2026-Oct-29 by @ExtremeFiretop
-# Last Modified: 2026-Nov-13
+# Last Modified: 2026-Nov-15
 #
 # ResolvGuard™
 # Official project: https://github.com/ExtremeFiretop/ResolvGuard
@@ -20,11 +20,11 @@ CONFIG_SCHEMA=5
 set -u
 
 ## Set version for each Production Release ##
-readonly SCRIPT_VERSION=0.1.9
-readonly SCRIPT_VERSTAG="26111318"
+readonly SCRIPT_VERSION=0.2.0
+readonly SCRIPT_VERSTAG="26111513"
 readonly SCRIPT_NAME="ResolvGuard"
 ## Set to "master" for Production Releases ##
-SCRIPT_BRANCH="master"
+SCRIPT_BRANCH="dev"
 
 # Run install from a staged download, or from the final script path. A normal
 # first launch uses the same installation path before opening the SSH menu.
@@ -54,6 +54,8 @@ POOLS="$RUNTIME/pools.tsv"
 MEMBER_HISTORY="$RUNTIME/member-health-history"
 POLICY_APPROVAL="$STATE_DIR/policy-approval"
 WAN_LOCK="$RUNTIME/rg-wan-lock"
+CONFIG_LOCK="$RUNTIME/rg-config-lock"
+MAINTENANCE_LOCK="$RUNTIME/rg-maintenance-priority"
 SCHEDULE_MARKER="$STATE_DIR/monitoring-enabled"
 AUTO_FAILOVER_MARKER="$STATE_DIR/automatic-failover-enabled"
 SCHEDULE_JOB=ResolvGuardHealth
@@ -68,13 +70,75 @@ STUBBY=/usr/sbin/stubby
 DNSMASQ_SERVERS=/tmp/resolv.dnsmasq
 DNSMASQ_MAIN=/etc/dnsmasq.conf
 
+# Choose the firmware's active production Stubby YAML when initializing a new
+# installation. 3006 may use stubby-0.yml, while 3004 commonly uses stubby.yml.
+# Do not change a saved Integration Settings override on subsequent launches.
+# Optional arguments only facilitate offline testing with harmless fixture paths.
+_DetectProductionStubbyConfig_() {
+  local primary legacy proc_root proc_file args binary
+
+  primary="${1:-/etc/stubby/stubby-0.yml}"
+  legacy="${2:-/etc/stubby/stubby.yml}"
+  proc_root="${3:-/proc}"
+
+  # Only consult the running process when both firmware layouts are present.
+  # The daemon's -C argument is more reliable than the firmware generation.
+  if [ -r "$primary" ] && [ -r "$legacy" ]; then
+    for proc_file in "$proc_root"/[0-9]*/cmdline; do
+      if [ ! -r "$proc_file" ]; then
+        continue
+      fi
+
+      if ! args="$(tr '\000' ' ' < "$proc_file" 2>/dev/null)"; then
+        continue
+      fi
+
+      binary="${args%% *}"
+      case "$binary" in
+        */stubby|stubby)
+          # This is the running Stubby process; inspect its active YAML path.
+          ;;
+        *)
+          continue
+          ;;
+      esac
+
+      case " $args " in
+        *" -C $primary "*)
+          printf '%s\n' "$primary"
+          return 0
+          ;;
+        *" -C $legacy "*)
+          printf '%s\n' "$legacy"
+          return 0
+          ;;
+      esac
+    done
+  fi
+
+  # Normally only one of these two files exists on the router.
+  if [ -r "$primary" ]; then
+    printf '%s\n' "$primary"
+    return 0
+  fi
+
+  if [ -r "$legacy" ]; then
+    printf '%s\n' "$legacy"
+    return 0
+  fi
+
+  # Preserve the historical default when neither file is available.
+  # Normal prerequisite validation still rejects a missing production YAML.
+  printf '%s\n' "$primary"
+}
+
 # A fresh install needs only this script. Create missing config files here, not
 # in the package or updater. Existing files are never edited, truncated or
 # replaced; a dangerous path (symlink, directory, unreadable file) is refused.
 # Build every default as a private, complete temporary file and hardlink it
 # into place, so a concurrent invocation cannot overwrite an existing file.
 _CreateMissingConfigFile_() {
-  local name dest staged
+  local name dest staged default_stubby
   name="$1"
   dest="$ROOT/config/$name"
   if [ -e "$dest" ] || [ -L "$dest" ]; then
@@ -90,12 +154,14 @@ _CreateMissingConfigFile_() {
     return 1
   fi
   if ! (umask 077; set -C; case "$name" in
-    settings.conf) cat <<'RG_SETTINGS_DEFAULT'
+    settings.conf)
+      default_stubby="$(_DetectProductionStubbyConfig_)" || exit 1
+      cat <<RG_SETTINGS_DEFAULT
 FAIL_THRESHOLD=2
 RECOVERY_THRESHOLD=3
 TIMEOUT_SECONDS=5
 CA_FILE=/etc/ssl/certs/ca-certificates.crt
-WAN_STUBBY_CONFIG=/etc/stubby/stubby-0.yml
+WAN_STUBBY_CONFIG=$default_stubby
 
 SCHEDULE_INTERVAL_MINUTES=1
 FAST_CONFIRM_SECONDS=7
@@ -105,14 +171,15 @@ RG_SETTINGS_DEFAULT
       ;;
     checks.tsv) cat <<'RG_CHECKS_DEFAULT'
 # hostname|record_type|expected_rcode|expected_answer_count|expected_record_data_or_dash
-example.com|A|NOERROR|ANY|-
+a.root-servers.net|A|NOERROR|AT_LEAST_1|-
 RG_CHECKS_DEFAULT
       ;;
     extra-providers.tsv) cat <<'RG_PROVIDERS_DEFAULT'
 # Optional independent backup resolvers (add using Quick Setup or Advanced Options).
-# resolver_id|IPv4|TLS_authentication_hostname|upstream_TLS_port
+# resolver_id|IPv4_or_IPv6|TLS_authentication_hostname|upstream_TLS_port
 # google1|8.8.8.8|dns.google|853
 # google2|8.8.4.4|dns.google|853
+# quad9v6|2620:fe::fe|dns.quad9.net|853
 RG_PROVIDERS_DEFAULT
       ;;
     *) exit 1 ;;
@@ -190,10 +257,18 @@ fi
 : "${FAIL_THRESHOLD:=2}" "${RECOVERY_THRESHOLD:=3}" \
   "${TIMEOUT_SECONDS:=5}" \
   "${CA_FILE:=/etc/ssl/certs/ca-certificates.crt}" \
-  "${WAN_STUBBY_CONFIG:=/etc/stubby/stubby-0.yml}" \
+  "${WAN_STUBBY_CONFIG:=$(_DetectProductionStubbyConfig_)}" \
   "${SCHEDULE_INTERVAL_MINUTES:=1}" "${FAST_CONFIRM_SECONDS:=7}" \
   "${BOOT_MIN_UPTIME_SECONDS:=120}" \
   "${SYSLOG_HEALTH_INTERVAL_MINUTES:=0}"
+
+# Older Merlin (e.g. 3004.388.x) uses stubby.yml. If the newer default
+# doesn't exist, use the older firmware path without creating any symlink or
+# editing firmware-managed files. Respect explicitly configured other paths.
+if [ "$WAN_STUBBY_CONFIG" = /etc/stubby/stubby-0.yml ] &&
+   [ ! -r "$WAN_STUBBY_CONFIG" ] && [ -r /etc/stubby/stubby.yml ]; then
+  WAN_STUBBY_CONFIG=/etc/stubby/stubby.yml
+fi
 
 # MerlinAU-style release channels. The repository's production branch is
 # named main; accept the familiar SCRIPT_BRANCH=master alias for stable builds.
@@ -204,9 +279,18 @@ readonly RELEASE_URL_BASE='https://github.com/ExtremeFiretop/ResolvGuard/release
 readonly RELEASE_INSTALL_ASSET="${SCRIPT_NAME}-install.sh"
 readonly RELEASE_UPDATE_ASSET="${SCRIPT_NAME}-update.sh"
 case "$SCRIPT_BRANCH" in
-  dev) UPDATE_CHANNEL=development; SCRIPT_URL_REPO="${SCRIPT_URL_BASE}/refs/heads/dev" ;;
-  master|main) UPDATE_CHANNEL=stable; SCRIPT_URL_REPO="${SCRIPT_URL_BASE}/refs/heads/main" ;;
-  *) printf 'ERROR: Unsupported SCRIPT_BRANCH: %s\n' "$SCRIPT_BRANCH" >&2; exit 2 ;;
+  dev)
+    UPDATE_CHANNEL=development
+    SCRIPT_URL_REPO="${SCRIPT_URL_BASE}/refs/heads/dev"
+    ;;
+  master|main)
+    UPDATE_CHANNEL=stable
+    SCRIPT_URL_REPO="${SCRIPT_URL_BASE}/refs/heads/main"
+    ;;
+  *)
+    printf 'ERROR: Unsupported SCRIPT_BRANCH: %s\n' "$SCRIPT_BRANCH" >&2
+    exit 2
+    ;;
 esac
 readonly SCRIPT_URL_REPO
 readonly UPDATE_CHANNEL
@@ -280,6 +364,109 @@ _IsValidIPv4_() {
   case "$1" in ''|*[!0-9.]*|.*|*..*|*.) return 1;; esac
   echo "$1" | awk -F. 'NF!=4 {exit 1} {for(i=1;i<=4;i++) if($i=="" || $i !~ /^[0-9]+$/ || $i>255 || $i<0) exit 1; exit 0}'
 }
+# Validate IPv6 in POSIX awk (BusyBox ash/dash compatible; no Python,
+# ipcalc, external networking, or GNU awk extensions required).
+# Supports :: compression and an IPv4-embedded tail. Zone IDs and brackets
+# are deliberately not accepted in resolver identity fields: scoped link-local
+# addresses cannot be safely represented as firmware-wide DoT upstreams.
+_IsValidIPv6_() {
+  printf '%s\n' "$1" | LC_ALL=C awk '
+    # A dotted-decimal tail occupies two IPv6 groups.
+    function valid_ipv4_tail(address, octets, count, i) {
+      count = split(address, octets, ".")
+      if (count != 4) {
+        return 0
+      }
+
+      for (i = 1; i <= 4; i++) {
+        if (octets[i] == "" || octets[i] !~ /^[0-9]+$/) {
+          return 0
+        }
+        if (length(octets[i]) > 3 || octets[i] + 0 > 255) {
+          return 0
+        }
+      }
+
+      return 1
+    }
+
+    function valid_ipv6(address, normalized, parts, count, i,
+                        groups, compressed, embedded) {
+      if (address !~ /^[0-9a-fA-F:.]+$/) {
+        return 0
+      }
+      if (index(address, ":") == 0 || address ~ /:::/) {
+        return 0
+      }
+      if (address ~ /^:[^:]/ || address ~ /[^:]:$/) {
+        return 0
+      }
+
+      # Represent the single allowed :: compression marker as one field.
+      normalized = address
+      compressed = gsub(/::/, "@", normalized)
+      if (compressed > 1) {
+        return 0
+      }
+      gsub(/@/, ":@:", normalized)
+      sub(/^:/, "", normalized)
+      sub(/:$/, "", normalized)
+
+      count = split(normalized, parts, ":")
+      groups = 0
+      embedded = 0
+      for (i = 1; i <= count; i++) {
+        if (parts[i] == "@") {
+          continue
+        }
+        if (parts[i] == "") {
+          return 0
+        }
+
+        if (index(parts[i], ".")) {
+          if (i != count || !valid_ipv4_tail(parts[i])) {
+            return 0
+          }
+          embedded++
+          groups += 2
+        } else {
+          if (length(parts[i]) > 4 || parts[i] !~ /^[0-9a-fA-F]+$/) {
+            return 0
+          }
+          groups++
+        }
+      }
+
+      if (embedded > 1) {
+        return 0
+      }
+      if (compressed) {
+        return groups < 8
+      }
+      return groups == 8
+    }
+
+    {
+      if (!valid_ipv6($0)) {
+        exit 1
+      }
+      valid = 1
+    }
+
+    END {
+      if (!valid) {
+        exit 1
+      }
+    }
+  '
+}
+_IsValidIP_() {
+  if _IsValidIPv4_ "$1"; then
+    return 0
+  fi
+
+  _IsValidIPv6_ "$1"
+}
 _IsValidPort_() {
   case "$1" in ''|*[!0-9]*) return 1;; esac
   [ "$1" -gt 1024 ] && [ "$1" -le 65535 ]
@@ -292,6 +479,20 @@ _IsValidRCODE_() {
 }
 _IsValidAnswerCount_() {
   case "$1" in ANY) return 0;; ''|*[!0-9]*) return 1;; *) return 0;; esac
+}
+
+# DNS-check answer constraints are distinct from numeric monitoring thresholds.
+# AT_LEAST_1 requires a real answer record of the requested DNS type; the
+# packet's total ANSWER count alone can also include CNAME records.
+_IsValidDNSAnswerCount_() {
+  case "$1" in
+    AT_LEAST_1)
+      return 0
+      ;;
+    *)
+      _IsValidAnswerCount_ "$1"
+      ;;
+  esac
 }
 
 _ParseWANUpstreams_() {
@@ -326,15 +527,21 @@ _PrepareProviders_() {
   raw="$RUNTIME/discovered-$$"
   : > "$tmp" || return 1
   if [ -r "$PREF_PROVIDERS" ]; then
+    if ! _ValidatePreferredSnapshot_; then
+      _Fail_ 'Saved preferred DNS snapshot is incomplete or invalid (possibly from an IPv4-only version); automatic switching is blocked. Restore/re-enroll with the complete dual-stack router configuration.'
+      rm -f "$tmp"
+      return 1
+    fi
     cp "$PREF_PROVIDERS" "$tmp" || { rm -f "$tmp"; return 1; }
   else
     _ParseWANUpstreams_ > "$raw" || { rm -f "$tmp" "$raw"; return 1; }
     n=0
     while IFS='|' read -r ip host tlsport extra; do
       [ -n "$ip" ] || continue
-      if ! _IsValidIPv4_ "$ip"; then
-        case "$ip" in *:*) _Say_ "NOTICE: skipping unsupported IPv6 WAN upstream $ip" >&2; continue;; esac
-        _Fail_ "Invalid WAN IP: $ip"; rm -f "$tmp" "$raw"; return 1
+      if ! _IsValidIP_ "$ip"; then
+        _Fail_ "Invalid WAN IPv4/IPv6 upstream address: $ip; refusing incomplete preferred DNS enrollment"
+        rm -f "$tmp" "$raw"
+        return 1
       fi
       _IsValidDomain_ "$host" || { _Fail_ "Invalid WAN TLS identity for $ip"; rm -f "$tmp" "$raw"; return 1; }
       _IsValidTLSPort_ "$tlsport" || { _Fail_ "Invalid WAN TLS port for $ip"; rm -f "$tmp" "$raw"; return 1; }
@@ -396,7 +603,7 @@ _ValidateConfiguration_() {
     _Fail_ 'Missing DNS health checks or backup resolver configuration'; return 1;
   }
   awk -F'|' '$1 !~ /^#/ && $1 != "" && NF!=4 {exit 1}' "$EXTRA_PROVIDERS" || {
-    _Fail_ 'Invalid backup provider format (expected ID|IPv4|TLS-name|TLS-port)'; return 1;
+    _Fail_ 'Invalid backup provider format (expected ID|IPv4-or-IPv6|TLS-name|TLS-port)'; return 1;
   }
   _IsValidAnswerCount_ "$FAIL_THRESHOLD" && [ "$FAIL_THRESHOLD" -ge 1 ] || { _Fail_ 'FAIL_THRESHOLD must be positive'; return 1; }
   _IsValidAnswerCount_ "$RECOVERY_THRESHOLD" && [ "$RECOVERY_THRESHOLD" -ge 1 ] || { _Fail_ 'RECOVERY_THRESHOLD must be positive'; return 1; }
@@ -416,7 +623,7 @@ _ValidateConfiguration_() {
   count=0
   while IFS='|' read -r id ip hostname port tlsport extra; do
     case "$id" in ''|\#*) continue;; esac
-    _IsValidID_ "$id" && _IsValidIPv4_ "$ip" && _IsValidDomain_ "$hostname" &&
+    _IsValidID_ "$id" && _IsValidIP_ "$ip" && _IsValidDomain_ "$hostname" &&
       _IsValidPort_ "$port" && _IsValidTLSPort_ "$tlsport" && [ -z "${extra:-}" ] || {
       _Fail_ "Invalid resolver: $id"; return 1;
     }
@@ -433,7 +640,7 @@ _ValidateConfiguration_() {
   while IFS='|' read -r qname qtype rcode answers expected extra; do
     case "$qname" in ''|\#*) continue;; esac
     [ -z "${extra:-}" ] && _IsValidDomain_ "$qname" && _IsValidRecordType_ "$qtype" &&
-      _IsValidRCODE_ "$rcode" && _IsValidAnswerCount_ "$answers" && _IsSafeToken_ "$expected" || {
+      _IsValidRCODE_ "$rcode" && _IsValidDNSAnswerCount_ "$answers" && _IsSafeToken_ "$expected" || {
       _Fail_ "Invalid DNS health check: $qname $qtype"; return 1;
     }
   done < "$CHECKS"
@@ -443,7 +650,7 @@ _ValidateConfiguration_() {
 _MakeStubbyConfig_() {
   local id ip tls port tlsport cfg
   id="$1"; ip="$2"; tls="$3"; port="$4"; tlsport="$5"
-  cfg="${6:-$RUNTIME/configs/$id.yml}"
+  cfg="${6:-${RG_PROBE_DIR:-$RUNTIME}/configs/$id.yml}"
   cat > "$cfg" <<YAML
 resolution_type: GETDNS_RESOLUTION_STUB
 dns_transport_list:
@@ -476,12 +683,12 @@ _StartProbeInstances_() {
   while IFS='|' read -r id ip tls port tlsport extra; do
     case "$id" in ''|\#*) continue;; esac
     [ -z "$selected" ] || [ "$selected" = "$id" ] || continue
-    cfg="$RUNTIME/configs/$id.yml"
+    cfg="${RG_PROBE_DIR:-$RUNTIME}/configs/$id.yml"
     desired="$cfg.desired.$$"
-    pidfile="$RUNTIME/pids/$id.pid"
+    pidfile="${RG_PROBE_DIR:-$RUNTIME}/pids/$id.pid"
     _MakeStubbyConfig_ "$id" "$ip" "$tls" "$port" "$tlsport" "$desired"
-    "$STUBBY" -C "$desired" -i > "$RUNTIME/$id.validate.log" 2>&1 || {
-      rm -f "$desired"; _Fail_ "Invalid Stubby config for $id; see $RUNTIME/$id.validate.log"; return 1;
+    "$STUBBY" -C "$desired" -i > "${RG_PROBE_DIR:-$RUNTIME}/$id.validate.log" 2>&1 || {
+      rm -f "$desired"; _Fail_ "Invalid Stubby config for $id; see ${RG_PROBE_DIR:-$RUNTIME}/$id.validate.log"; return 1;
     }
     if [ -f "$pidfile" ] && _IsOwnedProcess_ "$(cat "$pidfile")" "$cfg"; then
       if cmp -s "$desired" "$cfg"; then
@@ -494,12 +701,12 @@ _StartProbeInstances_() {
       rm -f "$pidfile"
     fi
     mv "$desired" "$cfg"
-    "$STUBBY" -C "$cfg" > "$RUNTIME/$id.log" 2>&1 &
+    "$STUBBY" -C "$cfg" > "${RG_PROBE_DIR:-$RUNTIME}/$id.log" 2>&1 &
     pid=$!
     echo "$pid" > "$pidfile"
     sleep 1
     if ! _IsOwnedProcess_ "$pid" "$cfg"; then
-      _Fail_ "Stubby failed to start: $id (local port $port); see $RUNTIME/$id.log"
+      _Fail_ "Stubby failed to start: $id (local port $port); see ${RG_PROBE_DIR:-$RUNTIME}/$id.log"
       return 1
     fi
     _Say_ "Started strict DoT instance $id on localhost:$port (upstream $ip:$tlsport)"
@@ -507,10 +714,10 @@ _StartProbeInstances_() {
 }
 _StopProbeInstances_() {
   local pf id cfg pid
-  for pf in "$RUNTIME"/pids/*.pid; do
+  for pf in "${RG_PROBE_DIR:-$RUNTIME}"/pids/*.pid; do
     [ -f "$pf" ] || continue
     id="${pf##*/}"; id="${id%.pid}"
-    cfg="$RUNTIME/configs/$id.yml"
+    cfg="${RG_PROBE_DIR:-$RUNTIME}/configs/$id.yml"
     pid="$(cat "$pf")"
     if _IsOwnedProcess_ "$pid" "$cfg"; then
       kill "$pid" 2>/dev/null && _Say_ "Stopped $id"
@@ -519,40 +726,60 @@ _StopProbeInstances_() {
   done
 }
 
-# Exclusive WAN-operation lock for checks, switching, rollback and uninstall.
-_AcquireWANLock_() {
-  local owner previous acquire_guard outcome reclaimed
-  # Guard lock reclamation to avoid two processes claiming the same WAN lock.
-  acquire_guard="$WAN_LOCK.reclaim"
-  if ! mkdir "$acquire_guard" 2>/dev/null; then return 1; fi
+# Short configuration commits and actual WAN mutations share the config lock.
+# Probe cycles retain the WAN lock for their existing dedicated listeners, but
+# never hold the configuration lock while waiting for DNS or user input.
+# Reuse the same conservative stale-owner/reclaim safeguards for both locks.
+_AcquireNamedLock_() {
+  local lockpath owner previous acquire_guard outcome reclaimed
+
+  lockpath="$1"
+  acquire_guard="$lockpath.reclaim"
+
+  # The short-lived reclaim guard serializes competing lock acquisitions.
+  if ! mkdir "$acquire_guard" 2>/dev/null; then
+    return 1
+  fi
+
   outcome=1
   reclaimed=0
-  if mkdir "$WAN_LOCK" 2>/dev/null; then
-    if (umask 077; printf '%s\n' "$$" > "$WAN_LOCK/owner"); then
+
+  if mkdir "$lockpath" 2>/dev/null; then
+    # A new lock belongs only to this process, not to its parent shell.
+    if (umask 077; printf '%s\n' "$$" > "$lockpath/owner"); then
       outcome=0
     else
-      rmdir "$WAN_LOCK" 2>/dev/null || :
+      rmdir "$lockpath" 2>/dev/null || :
     fi
-  elif [ -d "$WAN_LOCK" ] && [ ! -L "$WAN_LOCK" ] &&
-       [ -f "$WAN_LOCK/owner" ] && [ ! -L "$WAN_LOCK/owner" ]; then
-    owner="$(cat "$WAN_LOCK/owner" 2>/dev/null || :)"
-    case "$owner" in ''|*[!0-9]*) owner='';; esac
+  elif [ -d "$lockpath" ] && [ ! -L "$lockpath" ] &&
+       [ -f "$lockpath/owner" ] && [ ! -L "$lockpath/owner" ]; then
+    owner="$(cat "$lockpath/owner" 2>/dev/null || :)"
+
+    case "$owner" in
+      ''|*[!0-9]*)
+        owner=''
+        ;;
+    esac
+
+    # Only reclaim an unambiguously dead owner's lock. Never steal a live
+    # monitor or WAN writer's lock simply because it is taking too long.
     if [ -n "$owner" ] && [ "$owner" != "$$" ] &&
        [ -d /proc ] && [ ! -e "/proc/$owner" ] &&
        ! kill -0 "$owner" 2>/dev/null; then
-      previous="$WAN_LOCK.dead.$$"
+      previous="$lockpath.dead.$$"
+
       if [ ! -e "$previous" ] && [ ! -L "$previous" ] &&
-         [ "$(cat "$WAN_LOCK/owner" 2>/dev/null || :)" = "$owner" ] &&
-         mv "$WAN_LOCK" "$previous"; then
+         [ "$(cat "$lockpath/owner" 2>/dev/null || :)" = "$owner" ] &&
+         mv "$lockpath" "$previous"; then
         if [ -f "$previous/owner" ] && [ ! -L "$previous/owner" ] &&
            [ "$(cat "$previous/owner" 2>/dev/null || :)" = "$owner" ] &&
            rm -f "$previous/owner" && rmdir "$previous"; then
-          if mkdir "$WAN_LOCK" 2>/dev/null; then
-            if (umask 077; printf '%s\n' "$$" > "$WAN_LOCK/owner"); then
+          if mkdir "$lockpath" 2>/dev/null; then
+            if (umask 077; printf '%s\n' "$$" > "$lockpath/owner"); then
               outcome=0
               reclaimed=1
             else
-              rmdir "$WAN_LOCK" 2>/dev/null || :
+              rmdir "$lockpath" 2>/dev/null || :
             fi
           fi
         else
@@ -561,22 +788,168 @@ _AcquireWANLock_() {
       fi
     fi
   fi
+
   if ! rmdir "$acquire_guard" 2>/dev/null; then
     _Fail_ "Lock acquisition guard needs manual inspection: $acquire_guard"
     return 1
   fi
-  [ "$outcome" -eq 0 ] || return 1
+
+  if [ "$outcome" -ne 0 ]; then
+    return 1
+  fi
+
   if [ "$reclaimed" -eq 1 ]; then
     _Say_ 'NOTICE: reclaimed lock held by a terminated ResolvGuard process.'
   fi
+
   return 0
 }
 
-_ReleaseWANLock_() {
-  [ -d "$WAN_LOCK" ] && [ ! -L "$WAN_LOCK" ] &&
-    [ -f "$WAN_LOCK/owner" ] && [ ! -L "$WAN_LOCK/owner" ] || return 1
-  [ "$(cat "$WAN_LOCK/owner")" = "$$" ] || return 1
-  rm -f "$WAN_LOCK/owner" && rmdir "$WAN_LOCK"
+_ReleaseNamedLock_() {
+  local lockpath owner
+  lockpath="$1"
+
+  if [ ! -d "$lockpath" ] || [ -L "$lockpath" ]; then
+    return 1
+  fi
+  if [ ! -f "$lockpath/owner" ] || [ -L "$lockpath/owner" ]; then
+    return 1
+  fi
+
+  owner="$(cat "$lockpath/owner")"
+  if [ "$owner" != "$$" ]; then
+    return 1
+  fi
+
+  rm -f "$lockpath/owner" && rmdir "$lockpath"
+}
+
+_AcquireWANLock_() { _AcquireNamedLock_ "$WAN_LOCK"; }
+_ReleaseWANLock_() { _ReleaseNamedLock_ "$WAN_LOCK"; }
+_AcquireConfigLock_() { _AcquireNamedLock_ "$CONFIG_LOCK"; }
+_ReleaseConfigLock_() { _ReleaseNamedLock_ "$CONFIG_LOCK"; }
+
+# Interactive maintenance has priority over recurring scheduled monitoring.
+# This is an admission gate, not a replacement for the WAN transaction lock:
+# never take a live WAN lock away from an active scheduler or writer.
+_MaintenancePriorityPending_() {
+  if [ -e "$MAINTENANCE_LOCK" ] || [ -L "$MAINTENANCE_LOCK" ]; then
+    return 0
+  fi
+
+  if [ -e "$MAINTENANCE_LOCK.reclaim" ] || [ -L "$MAINTENANCE_LOCK.reclaim" ]; then
+    return 0
+  fi
+
+  return 1
+}
+
+_AcquireMaintenancePriority_() {
+  if ! _AcquireNamedLock_ "$MAINTENANCE_LOCK"; then
+    _Fail_ 'Another interactive maintenance operation is pending or active'
+    return 1
+  fi
+
+  RG_MAINTENANCE_PRIORITY_HELD=1
+  return 0
+}
+
+_ReleaseMaintenancePriority_() {
+  if [ "${RG_MAINTENANCE_PRIORITY_HELD:-0}" != 1 ]; then
+    return 0
+  fi
+
+  if ! _ReleaseNamedLock_ "$MAINTENANCE_LOCK"; then
+    return 1
+  fi
+
+  RG_MAINTENANCE_PRIORITY_HELD=0
+  return 0
+}
+
+# The maintenance reservation is also used for interactive policy actions.
+# Keeping one priority gate prevents cron from racing either kind of operation.
+# The active WAN lock remains exclusive: this function never steals it.
+_AcquireWANLockWithInteractivePriority_() {
+  local operation attempt
+
+  operation="$1"
+
+  # Reserve admission before waiting for an existing DNS operation to finish.
+  if ! _AcquireMaintenancePriority_; then
+    return 1
+  fi
+
+  attempt=1
+  while [ "$attempt" -le 90 ]; do
+    if _AcquireWANLock_; then
+      return 0
+    fi
+
+    if [ "$attempt" -eq 1 ]; then
+      if [ "$operation" = policy ]; then
+        _Say_ 'DNS policy administration has priority; waiting for the current WAN operation to finish...'
+      else
+        _Say_ 'DNS maintenance has priority; waiting for the current WAN operation to finish...'
+      fi
+    fi
+
+    if [ "$attempt" -eq 90 ]; then
+      break
+    fi
+
+    sleep 1
+    attempt=$((attempt + 1))
+  done
+
+  if [ "$operation" = policy ]; then
+    _Fail_ 'WAN lock still unavailable; policy administration deferred without stealing a live lock'
+  else
+    _Fail_ 'WAN lock still unavailable; maintenance aborted without stealing a live lock'
+  fi
+
+  _ReleaseMaintenancePriority_ >/dev/null 2>&1 || :
+  return 1
+}
+
+_AcquireWANLockForMaintenance_() {
+  _AcquireWANLockWithInteractivePriority_ maintenance
+}
+
+# Called only while holding CONFIG_LOCK by maintenance operations.
+# Inspector admission takes CONFIG_LOCK briefly before reserving its slot, so
+# no new inspector can start between this check and uninstalling files.
+_ActiveInspectorSessions_() {
+  local slot
+
+  for slot in "$RUNTIME"/inspector-slots/slot-*; do
+    if [ ! -e "$slot" ] && [ ! -L "$slot" ]; then
+      continue
+    fi
+
+    return 0
+  done
+
+  return 1
+}
+
+# A private inspector cleans up only the processes and files it owns.
+# Never stop scheduler-owned listeners or release the scheduler WAN lock.
+_CleanupInspectorSession_() {
+  _StopProbeInstances_ >/dev/null 2>&1 || :
+  rm -f "$RUNTIME/inspection-$$.txt"
+
+  if [ -n "${RG_PROBE_DIR:-}" ]; then
+    rm -rf "$RG_PROBE_DIR"
+  fi
+
+  if [ -n "${RG_INSPECT_SLOT:-}" ]; then
+    _ReleaseNamedLock_ "$RG_INSPECT_SLOT" >/dev/null 2>&1 || :
+  fi
+
+  if [ "${RG_INSPECT_CONFIG_HELD:-0}" = 1 ]; then
+    _ReleaseConfigLock_ >/dev/null 2>&1 || :
+  fi
 }
 
 # Read-only lock classification for interactive status. Never reclaim a lock just
@@ -605,22 +978,235 @@ _GetWANLockDisplay_() {
   return 1
 }
 
-# Interactive policy operations tolerate brief scheduled-check contention;
-# cron and the DNS-switching engine keep their immediate fail-closed locks.
+# Policy review and revocation take the same interactive admission priority as
+# maintenance. New cron cycles skip; a current WAN writer always finishes.
 _AcquireWANLockForPolicy_() {
+  if ! _AcquireWANLockWithInteractivePriority_ policy; then
+    return 1
+  fi
+
+  RG_POLICY_WAN_HELD=1
+  return 0
+}
+
+_ReleasePolicyWANLock_() {
+  if [ "${RG_POLICY_WAN_HELD:-0}" != 1 ]; then
+    return 0
+  fi
+
+  if ! _ReleaseWANLock_; then
+    return 1
+  fi
+
+  RG_POLICY_WAN_HELD=0
+  return 0
+}
+
+# Policy review also reads shared configuration. Hold CONFIG_LOCK only during
+# its initial snapshot and final approval commit, never during user input.
+_AcquireConfigLockForPolicy_() {
   local attempt
+
   attempt=1
-  while [ "$attempt" -le 7 ]; do
-    _AcquireWANLock_ && return 0
-    [ "$attempt" -lt 7 ] || break
-    if [ "$attempt" -eq 1 ]; then
-      _Say_ 'DNS monitoring is busy; waiting briefly for the active check to finish...'
+  while [ "$attempt" -le 12 ]; do
+    if _AcquireConfigLock_; then
+      RG_POLICY_CONFIG_HELD=1
+      return 0
     fi
-    sleep 2
+
+    if [ "$attempt" -eq 1 ]; then
+      _Say_ 'DNS policy: waiting for an active configuration edit to finish...'
+    fi
+
+    if [ "$attempt" -eq 12 ]; then
+      break
+    fi
+
+    sleep 1
     attempt=$((attempt + 1))
   done
-  _Fail_ 'DNS operation still active or lock unverified. No approval changed; retry when the check finishes.'
+
+  _Fail_ 'Configuration lock still unavailable; policy administration deferred'
   return 1
+}
+
+_ReleasePolicyConfigLock_() {
+  if [ "${RG_POLICY_CONFIG_HELD:-0}" != 1 ]; then
+    return 0
+  fi
+
+  if ! _ReleaseConfigLock_; then
+    return 1
+  fi
+
+  RG_POLICY_CONFIG_HELD=0
+  return 0
+}
+
+# This is an EXIT cleanup for the policy-operation subshell. These ownership
+# markers must not be local: BusyBox ash can run an EXIT trap after locals
+# leave scope. Never remove another process's locks.
+_CleanupPolicyLocks_() {
+  _ReleasePolicyConfigLock_ >/dev/null 2>&1 || :
+  _ReleasePolicyWANLock_ >/dev/null 2>&1 || :
+  _ReleaseMaintenancePriority_ >/dev/null 2>&1 || :
+}
+
+# Resolve the human-readable identity of a checked resolver. The provider
+# inventory already associates each temporary wanN/backupN ID with its actual
+# address, TLS port and authentication hostname. Never expose SPKI pins.
+_GetHealthResolverIdentity_() {
+  local requested_id id address hostname local_port tls_port extra
+
+  requested_id="$1"
+  RG_HEALTH_RESOLVER_ADDRESS=''
+  RG_HEALTH_RESOLVER_TLS_PORT=''
+  RG_HEALTH_RESOLVER_HOSTNAME=''
+
+  if [ -z "${PROVIDERS:-}" ] || [ ! -r "$PROVIDERS" ] || [ -L "$PROVIDERS" ]; then
+    return 1
+  fi
+
+  while IFS='|' read -r id address hostname local_port tls_port extra; do
+    if [ "$id" != "$requested_id" ]; then
+      continue
+    fi
+
+    RG_HEALTH_RESOLVER_ADDRESS="$address"
+    RG_HEALTH_RESOLVER_TLS_PORT="$tls_port"
+    RG_HEALTH_RESOLVER_HOSTNAME="$hostname"
+    return 0
+  done < "$PROVIDERS"
+
+  return 1
+}
+
+# Highlight health-check outcomes in an interactive terminal without changing
+# the plain output used by cron, redirected commands or diagnostic logs.
+# Include the resolver IP directly in manual results so wanN IDs do not require
+# scrolling back to the Stubby startup messages.
+_PrintHealthCheckResult_() {
+  local result details displayed_details resolver_id
+
+  result="$1"
+  shift
+  details="$*"
+  displayed_details="$details"
+
+  if [ "${RG_HEALTH_SHOW_RESOLVERS:-0}" = 1 ]; then
+    resolver_id="${details%% *}"
+
+    if _GetHealthResolverIdentity_ "$resolver_id"; then
+      displayed_details="$resolver_id [$RG_HEALTH_RESOLVER_ADDRESS:$RG_HEALTH_RESOLVER_TLS_PORT]${details#"$resolver_id"}"
+    fi
+
+    if [ "$result" = FAIL ]; then
+      RG_HEALTH_FAILED_RECORDS=$((RG_HEALTH_FAILED_RECORDS + 1))
+
+      case " ${RG_HEALTH_FAILED_IDS:-} " in
+        *" $resolver_id "*)
+          ;;
+        *)
+          RG_HEALTH_FAILED_IDS="${RG_HEALTH_FAILED_IDS:+$RG_HEALTH_FAILED_IDS }$resolver_id"
+          ;;
+      esac
+
+      # A resolver can fail during a preferred-pool recovery probe without
+      # belonging to the active filtered pool. Preserve that distinction.
+      RG_HEALTH_FAILURE_PHASES="${RG_HEALTH_FAILURE_PHASES:-}|$resolver_id:${RG_HEALTH_PROBE_PHASE:-active}|"
+    fi
+  fi
+
+  if [ "${RG_HEALTH_COLOR_ENABLED:-0}" != 1 ]; then
+    _Say_ "    $result $displayed_details"
+    return 0
+  fi
+
+  case "$result" in
+    PASS)
+      # Keep successful detail lines neutral so a red failure stands out.
+      printf '    %sPASS%s %s\n' "$RG_GREEN" "$RG_RESET" "$displayed_details"
+      ;;
+    FAIL)
+      # Emphasize the entire failed check, including its reason.
+      printf '    %sFAIL %s%s\n' "$RG_RED" "$displayed_details" "$RG_RESET"
+      ;;
+    *)
+      _Say_ "    $result $displayed_details"
+      ;;
+  esac
+}
+
+# A short end-of-check summary keeps failed resolver identities on screen just
+# before returning to the menu. This is presentation only: the probe result,
+# failover decisions and monitoring counters are not derived from these lists.
+_PrintManualHealthSummary_() {
+  local resolver_id source phase_text failed_resolvers
+
+  if [ "${RG_HEALTH_SHOW_RESOLVERS:-0}" != 1 ]; then
+    return 0
+  fi
+
+  _Say_ ''
+  _Say_ '----------------------------------------------------------------'
+  _Say_ '  DNS HEALTH CHECK SUMMARY'
+  _Say_ '----------------------------------------------------------------'
+
+  if [ "${RG_HEALTH_FAILED_RECORDS:-0}" -eq 0 ]; then
+    printf '  %sNo failed DNS record checks observed.%s\n' "$RG_GREEN" "$RG_RESET"
+    return 0
+  fi
+
+  failed_resolvers=0
+  for resolver_id in ${RG_HEALTH_FAILED_IDS:-}; do
+    failed_resolvers=$((failed_resolvers + 1))
+  done
+
+  printf '  %sFAILED: %s resolver(s), %s DNS record check(s)%s\n' \
+    "$RG_RED" "$failed_resolvers" "$RG_HEALTH_FAILED_RECORDS" "$RG_RESET"
+
+  for resolver_id in ${RG_HEALTH_FAILED_IDS:-}; do
+    source='address unavailable'
+    if _GetHealthResolverIdentity_ "$resolver_id"; then
+      source="$RG_HEALTH_RESOLVER_ADDRESS:$RG_HEALTH_RESOLVER_TLS_PORT"
+    fi
+
+    phase_text=''
+    case "${RG_HEALTH_FAILURE_PHASES:-}" in
+      *"|$resolver_id:active|"*)
+        phase_text='active pool'
+        ;;
+    esac
+    case "${RG_HEALTH_FAILURE_PHASES:-}" in
+      *"|$resolver_id:preferred|"*)
+        if [ -n "$phase_text" ]; then
+          phase_text="$phase_text + preferred recovery"
+        else
+          phase_text='preferred recovery (not active)'
+        fi
+        ;;
+    esac
+    case "${RG_HEALTH_FAILURE_PHASES:-}" in
+      *"|$resolver_id:alternate|"*)
+        if [ -n "$phase_text" ]; then
+          phase_text="$phase_text + alternate"
+        else
+          phase_text='alternate pool'
+        fi
+        ;;
+    esac
+
+    printf '  %s%-7s %s%s' "$RG_RED" "$resolver_id" "$source" "$RG_RESET"
+    if [ -n "${RG_HEALTH_RESOLVER_HOSTNAME:-}" ]; then
+      printf '  TLS: %s' "$RG_HEALTH_RESOLVER_HOSTNAME"
+    fi
+    if [ -n "$phase_text" ]; then
+      printf '  [%s]' "$phase_text"
+    fi
+    printf '\n'
+  done
+
+  _Say_ '  See the red FAIL lines above for individual DNS response errors.'
 }
 
 _ProbeDNSRecord_() {
@@ -629,35 +1215,53 @@ _ProbeDNSRecord_() {
   port="$(_GetProviderPort_ "$id")" || return 1
   if ! output="$("$DIG" @127.0.0.1 -p "$port" "$qname" "$qtype" \
       +time="$TIMEOUT_SECONDS" +tries=1 +noall +comments +answer 2>&1)"; then
-    _Say_ "    FAIL $id $qname $qtype: dig timeout/error"
+    _PrintHealthCheckResult_ FAIL "$id $qname $qtype: dig timeout/error"
     return 1
   fi
   actual_rcode="$(printf '%s\n' "$output" | sed -n 's/.*status: \([A-Z][A-Z0-9_]*\),.*/\1/p' | head -n 1)"
   actual_count="$(printf '%s\n' "$output" | awk '/^;; flags:/ { for(i=1;i<=NF;i++) if($i=="ANSWER:") {gsub(/,/,"",$(i+1)); print $(i+1); exit} }')"
   case "$actual_rcode:$actual_count" in
-    :*|*:) _Say_ "    FAIL $id $qname $qtype: missing DNS header"; return 1 ;;
+    :*|*:) _PrintHealthCheckResult_ FAIL "$id $qname $qtype: missing DNS header"; return 1 ;;
   esac
-  case "$actual_count" in *[!0-9]*|'') _Say_ "    FAIL $id $qname $qtype: malformed answer count"; return 1;; esac
+  case "$actual_count" in *[!0-9]*|'') _PrintHealthCheckResult_ FAIL "$id $qname $qtype: malformed answer count"; return 1;; esac
   # Policy mismatches are resolver-health evidence, not infrastructure faults.
   # Wrong Plex A/AAAA records must NOT enter a blanket INCONCLUSIVE veto.
   # Switching still requires corroboration and independently healthy alternatives.
   if [ "$want_rcode" != ANY ] && [ "$actual_rcode" != "$want_rcode" ]; then
-    _Say_ "    FAIL $id $qname $qtype: RCODE $actual_rcode expected $want_rcode (policy mismatch)"
+    _PrintHealthCheckResult_ FAIL "$id $qname $qtype: RCODE $actual_rcode expected $want_rcode (policy mismatch)"
     return 1
   fi
-  if [ "$want_count" != ANY ] && [ "$actual_count" != "$want_count" ]; then
-    _Say_ "    FAIL $id $qname $qtype: ANSWER count $actual_count expected $want_count (policy mismatch)"
-    return 1
-  fi
+  case "$want_count" in
+    ANY)
+      # The administrator explicitly chose to ignore the number of answers.
+      ;;
+    AT_LEAST_1)
+      # DNS ANSWER includes aliases such as CNAME, so a nonzero header count
+      # does not prove the requested A, AAAA or other record type was returned.
+      if [ "$actual_count" -eq 0 ] || ! printf '%s\n' "$output" | awk -v qt="$qtype" '
+          $1 !~ /^;/ && $4 == qt { found = 1 }
+          END { exit found ? 0 : 1 }
+        '; then
+        _PrintHealthCheckResult_ FAIL "$id $qname $qtype: no $qtype answer record (expected at least 1; policy mismatch)"
+        return 1
+      fi
+      ;;
+    *)
+      if [ "$actual_count" != "$want_count" ]; then
+        _PrintHealthCheckResult_ FAIL "$id $qname $qtype: ANSWER count $actual_count expected $want_count (policy mismatch)"
+        return 1
+      fi
+      ;;
+  esac
   if [ "$want_value" != '-' ]; then
     if ! printf '%s\n' "$output" | awk -v qt="$qtype" -v expected="$want_value" '
       $1 !~ /^;/ && $4 == qt && $5 == expected {found=1}
       END {exit found ? 0 : 1}'; then
-      _Say_ "    FAIL $id $qname $qtype: expected answer $want_value absent (policy mismatch)"
+      _PrintHealthCheckResult_ FAIL "$id $qname $qtype: expected answer $want_value absent (policy mismatch)"
       return 1
     fi
   fi
-  _Say_ "    PASS $id $qname $qtype: $actual_rcode answers=$actual_count"
+  _PrintHealthCheckResult_ PASS "$id $qname $qtype: $actual_rcode answers=$actual_count"
   return 0
 }
 
@@ -827,20 +1431,98 @@ _InspectDNS_() (
   esac
   case "$requested" in ALL|all|'') requested=all ;; esac
   _RequireProbeDependencies_ || return 1
+  # Admission is brief; two inspectors starting simultaneously may contend
+  # for milliseconds. Bounded retries avoid rejecting a normal menu action.
+  inspect_try=1
+  while ! _AcquireConfigLock_; do
+    if [ "$inspect_try" -ge 6 ]; then
+      _Fail_ 'Configuration commit or maintenance in progress; inspector start deferred'
+      return 1
+    fi
+
+    sleep 1
+    inspect_try=$((inspect_try + 1))
+  done
+  RG_INSPECT_CONFIG_HELD=1
+  RG_PROBE_DIR=''
+  RG_INSPECT_SLOT=''
+  trap '_CleanupInspectorSession_' EXIT HUP INT TERM
+  # Give each inspector its own probe instances and nonoverlapping localhost
+  # ports. This avoids sharing scheduler Stubby processes, PIDs or provider
+  # lists, and needs no WAN lock for a read-only DNS query.
+  if [ -L "$RUNTIME/inspector-slots" ] || [ -L "$RUNTIME/inspectors" ]; then
+    return 1
+  fi
+
+  if ! mkdir -p "$RUNTIME/inspector-slots" "$RUNTIME/inspectors"; then
+    return 1
+  fi
+
+  RG_PROBE_DIR="$RUNTIME/inspectors/$$"
+  if [ -e "$RG_PROBE_DIR" ] || [ -L "$RG_PROBE_DIR" ]; then
+    return 1
+  fi
+
+  if ! mkdir "$RG_PROBE_DIR"; then
+    return 1
+  fi
+  if ! mkdir "$RG_PROBE_DIR/configs" "$RG_PROBE_DIR/pids"; then
+    return 1
+  fi
+  slot=0
+  while [ "$slot" -lt 32 ]; do
+    candidate="$RUNTIME/inspector-slots/slot-$slot"
+    if _AcquireNamedLock_ "$candidate"; then
+      RG_INSPECT_SLOT="$candidate"
+      break
+    fi
+    slot=$((slot+1))
+  done
+  if [ -z "$RG_INSPECT_SLOT" ]; then
+    _Fail_ 'All inspector probe port blocks are busy'
+    return 1
+  fi
+
+  if ! _ReleaseConfigLock_; then
+    _Fail_ 'Inspector could not release short admission lock'
+    return 1
+  fi
+  RG_INSPECT_CONFIG_HELD=0
+  WAN_PORT_START=$((58000 + 64 * slot))
+  PROVIDERS="$RG_PROBE_DIR/providers.tsv"
   _PrepareProviders_ || return 1
+  if [ "$(wc -l < "$PROVIDERS" | tr -d ' ')" -gt 64 ]; then
+    _Fail_ 'Too many configured resolvers for independent inspector port block'
+    return 1
+  fi
+  # Saved preferred providers already contain the scheduler's localhost ports.
+  # Rebase ALL inspector ports, including preferred entries, to this session's
+  # reserved block; changing WAN_PORT_START alone would be insufficient.
+  if ! awk -F'|' -v base="$WAN_PORT_START" '
+    BEGIN {
+      OFS = "|"
+    }
+    NF == 5 && $1 != "" {
+      $4 = base + NR - 1
+      print
+      next
+    }
+    {
+      exit 1
+    }
+  ' "$PROVIDERS" > "$RG_PROBE_DIR/providers-rebased.tsv"; then
+    _Fail_ 'Cannot allocate isolated inspector probe ports'; return 1
+  fi
+  mv "$RG_PROBE_DIR/providers-rebased.tsv" "$PROVIDERS" || return 1
   if [ "$requested" != all ]; then
     _IsValidID_ "$requested" && _GetProviderInfo_ "$requested" >/dev/null || {
       _Fail_ "Unknown configured provider: $requested (run discover)"; return 2;
     }
   fi
-  if ! _AcquireWANLock_; then
-    _Fail_ 'Another WAN watchdog/drill/probe owns the DNS test lock'; return 1
-  fi
   if [ -n "$capturefile" ]; then
     [ -f "$capturefile" ] && [ ! -L "$capturefile" ] || {
-      _ReleaseWANLock_; _Fail_ 'Unsafe inspector result file'; return 1; }
+      _Fail_ 'Unsafe inspector result file'; return 1; }
   fi
-  trap '_StopProbeInstances_ >/dev/null 2>&1 || :; rm -f "$RUNTIME/inspection-$$.txt"; _ReleaseWANLock_ >/dev/null 2>&1 || :' EXIT HUP INT TERM
   _Say_ ''
   _Say_ '================ DNS RESPONSE INSPECTOR ================'
   printf 'DNS inspection: %s%s%s | types=%s%s%s | provider=%s%s%s\n' \
@@ -891,26 +1573,146 @@ _InspectDNS_() (
 )
 
 
+# Parse *every* resolver, then validate every address before emitting any
+# result. Avoid accepting a valid IPv4 prefix when a later IPv6 entry is bad.
+# Preserve the exact serialized NVRAM list for snapshots, filters and rollback.
 _ParseDNSRulelist_() {
-  awk '
-    BEGIN {FS="<"; OFS="|"; err=0}
+  local parsed ip port host pin format rest
+
+  # Parse the entire NVRAM list before producing any output. A later invalid
+  # entry must invalidate the entire list, not leave a usable partial prefix.
+  # The parsed text stays shell-local, so nested calls need no shared tmp file.
+  parsed="$(awk '
+    BEGIN {
+      FS = "<"
+      OFS = "|"
+      err = 0
+    }
+
     {
-      for (i=2; i<=NF; i++) {
-        if ($i=="") continue
-        n=split($i,p,">")
-        if (n!=3 && n!=4) {err=1; break}
-        if (expected==0) expected=n
-        # The ASUS GUI permits an empty TLS port; production Stubby uses 853.
-        # Normalize it for comparison without rewriting the raw WAN rulelist.
-        if (p[2]=="") p[2]="853"
-        if (n!=expected || p[1]=="" || p[3]=="") {err=1; break}
-        if (p[1] !~ /^[0-9.]+$/ || p[2] !~ /^[0-9]+$/ || p[3] !~ /^[A-Za-z0-9.-]+$/) {err=1; break}
-        print p[1],p[2],p[3],(n==4?p[4]:""),n
+      if ($1 != "") {
+        err = 1
+      }
+
+      for (i = 2; i <= NF; i++) {
+        if ($i == "") {
+          err = 1
+          break
+        }
+
+        fields = split($i, record, ">")
+        if (fields != 3 && fields != 4) {
+          err = 1
+          break
+        }
+
+        if (expected == 0) {
+          expected = fields
+        }
+
+        # An empty ASUS GUI TLS port means 853. Normalize comparison only;
+        # the original rulelist (including pin) remains untouched on disk.
+        if (record[2] == "") {
+          record[2] = "853"
+        }
+
+        if (fields != expected || record[1] == "" || record[3] == "") {
+          err = 1
+          break
+        }
+        if (record[1] !~ /^[0-9A-Fa-f:.]+$/ ||
+            record[2] !~ /^[0-9]+$/ ||
+            record[3] !~ /^[A-Za-z0-9.-]+$/) {
+          err = 1
+          break
+        }
+
+        pin = (fields == 4 ? record[4] : "")
+        print record[1], record[2], record[3], pin, fields
         count++
       }
     }
-    END {if (err || count==0) exit 1}
-  '
+
+    END {
+      if (err || count == 0) {
+        exit 1
+      }
+    }
+  ')" || return 1
+
+  if [ -z "$parsed" ]; then
+    return 1
+  fi
+
+  # Validate the complete parsed list before emitting it to any caller.
+  # Here-doc input avoids the shell state loss associated with a pipeline.
+  while IFS='|' read -r ip port host pin format rest; do
+    if ! _IsValidIP_ "$ip" || ! _IsValidTLSPort_ "$port" ||
+       ! _IsValidDomain_ "$host" || [ -n "${rest:-}" ]; then
+      return 1
+    fi
+  done <<RG_PARSED_RULELIST
+$parsed
+RG_PARSED_RULELIST
+
+  printf '%s\n' "$parsed"
+}
+
+# Prevent accidental reuse of an old, partial preferred snapshot on a
+# previously IPv4-only build. Refuse all managed switching until the saved
+# provider roster exactly represents the entire original NVRAM serialization.
+_ValidatePreferredSnapshot_() {
+  local parsed
+
+  # Both halves of the preferred snapshot must be complete and regular files.
+  if [ ! -s "$PREF_RULELIST" ] || [ ! -s "$PREF_PROVIDERS" ] ||
+     [ -L "$PREF_RULELIST" ] || [ -L "$PREF_PROVIDERS" ]; then
+    return 1
+  fi
+
+  parsed="$RUNTIME/validate-preferred-$$"
+  if [ -e "$parsed" ] || [ -L "$parsed" ]; then
+    return 1
+  fi
+
+  if ! _ParseDNSRulelist_ < "$PREF_RULELIST" > "$parsed"; then
+    rm -f "$parsed"
+    return 1
+  fi
+
+  # Match the complete router list to the saved providers, in exactly the
+  # same order. Case-folded identity comparisons support IPv6 hexadecimal.
+  if ! awk -F'|' '
+    NR == FNR {
+      original[++expected_count] = $1 "|" $2 "|" $3
+      next
+    }
+
+    {
+      if ($1 !~ /^wan[0-9]+$/ || NF != 5) {
+        invalid = 1
+      } else {
+        saved_count++
+        expected_id = "wan" saved_count
+        observed_identity = tolower($2 "|" $5 "|" $3)
+        expected_identity = tolower(original[saved_count])
+        if ($1 != expected_id || expected_identity != observed_identity) {
+          invalid = 1
+        }
+      }
+    }
+
+    END {
+      if (invalid || saved_count == 0 || saved_count != expected_count) {
+        exit 1
+      }
+    }
+  ' "$parsed" "$PREF_PROVIDERS"; then
+    rm -f "$parsed"
+    return 1
+  fi
+
+  rm -f "$parsed"
 }
 
 _IsStrictProductionDoT_() {
@@ -941,10 +1743,10 @@ _InitializeDefaultDNSPolicy_() {
   local mode
   mode="$(_GetRouterIPv6Mode_)"
   if [ "$mode" = enabled ] && [ ! -e "$POLICY_APPROVAL" ] && [ ! -L "$POLICY_APPROVAL" ] && awk -F'|' '
-      $0 !~ /^#/ && NF {n++; if ($0 != "example.com|A|NOERROR|ANY|-") bad=1}
+      $0 !~ /^#/ && NF {n++; if ($0 != "a.root-servers.net|A|NOERROR|AT_LEAST_1|-") bad=1}
       END {exit !(n==1 && !bad)}' "$CHECKS"; then
-    _ChangeTSVFile_ "$CHECKS" check add 'example.com|AAAA' \
-      'example.com|AAAA|NOERROR|ANY|-' >/dev/null || return 1
+    _ChangeTSVFile_ "$CHECKS" check add 'a.root-servers.net|AAAA' \
+      'a.root-servers.net|AAAA|NOERROR|ANY|-' >/dev/null || return 1
   fi
   case "$mode" in
     enabled) _Say_ '  Router IPv6: Enabled' ;;
@@ -961,6 +1763,10 @@ _EnrollPreferredDNS_() {
   local raw parsed expected count
   if [ -e "$PREF_RULELIST" ] || [ -e "$PREF_PROVIDERS" ]; then
     if [ -r "$PREF_RULELIST" ] && [ -r "$PREF_PROVIDERS" ]; then
+      if ! _ValidatePreferredSnapshot_; then
+        _Fail_ 'Existing preferred DNS snapshot does not represent a complete IPv4/IPv6 resolver list; re-enrollment required'
+        return 1
+      fi
       _Say_ 'Preferred WAN snapshot already enrolled; not overwriting it.'
       return 0
     fi
@@ -977,7 +1783,7 @@ _EnrollPreferredDNS_() {
   expected="$(awk -F'|' '$1 ~ /^wan[0-9]+$/ {n++} END{print n+0}' "$PROVIDERS")"
   [ "$count" = "$expected" ] || { rm -f "$parsed"; _Fail_ 'WAN NVRAM and generated Stubby provider counts disagree'; return 1; }
   if ! awk -F'|' 'NR==FNR {a[FNR]=$2"|"$5"|"$3; next}
-      {if (a[FNR] != $1"|"$2"|"$3) bad=1; n++}
+      {if (tolower(a[FNR]) != tolower($1"|"$2"|"$3)) bad=1; n++}
       END {exit bad?1:0}' "$PROVIDERS" "$parsed"; then
     rm -f "$parsed"; _Fail_ 'WAN NVRAM and Stubby provider order differ'; return 1
   fi
@@ -1005,9 +1811,9 @@ _BuildLivePreferredProviders_() {
     rm -f "$parsed" "$live"; return 1; }
   [ -s "$live" ] && [ -s "$parsed" ] || {
     rm -f "$parsed" "$live"; return 1; }
-  # Order and exact IPv4 endpoint, TLS port and hostname must all agree.
+  # Every IPv4/IPv6 endpoint, TLS port, and hostname must agree in order.
   if ! awk -F'|' 'NR==FNR {a[FNR]=$1"|"$2"|"$3; m++; next}
-      {n++; if (a[FNR]!=$1"|"$3"|"$2) bad=1}
+      {n++; if (tolower(a[FNR])!=tolower($1"|"$3"|"$2)) bad=1}
       END {exit (bad || n!=m || n==0)?1:0}' "$parsed" "$live"; then
     rm -f "$parsed" "$live"
     _Fail_ 'WAN NVRAM and production Stubby resolver identity/order do not agree'
@@ -1016,10 +1822,10 @@ _BuildLivePreferredProviders_() {
   : > "$output" || { rm -f "$parsed" "$live"; return 1; }
   n=0
   while IFS='|' read -r ip port name extra format; do
-    _IsValidIPv4_ "$ip" && _IsValidTLSPort_ "$port" &&
+    _IsValidIP_ "$ip" && _IsValidTLSPort_ "$port" &&
       _IsValidDomain_ "$name" && [ -n "$format" ] || {
         rm -f "$parsed" "$live" "$output"
-        _Fail_ 'Only validated IPv4 Strict DoT resolver identities can be adopted'
+        _Fail_ 'Only complete, validated IPv4/IPv6 Strict DoT resolver identities can be adopted'
         return 1
       }
     n=$((n+1)); localport=$((WAN_PORT_START+n-1))
@@ -1178,6 +1984,108 @@ _GetFilteredRulelist_() {
   printf '%s\n' "$value"
 }
 
+# Compare a managed subset against the exact enrolled ASUS WAN rulelist.
+# Match complete serialized records, including any SPKI pin, but return only
+# the endpoint identity for display. Pins must not be copied into syslog.
+_ListExcludedPreferredDNSMembers_() {
+  local active preferred
+
+  active="$1"
+
+  if [ ! -s "$PREF_RULELIST" ] || [ -L "$PREF_RULELIST" ]; then
+    return 1
+  fi
+
+  preferred="$(cat "$PREF_RULELIST")" || return 1
+
+  awk -v preferred="$preferred" -v active="$active" '
+    BEGIN {
+      active_count = split(active, active_members, "<")
+      preferred_count = split(preferred, preferred_members, "<")
+
+      for (i = 2; i <= active_count; i++) {
+        active_inventory[active_members[i]]++
+      }
+
+      for (i = 2; i <= preferred_count; i++) {
+        entry = preferred_members[i]
+
+        if (active_inventory[entry] > 0) {
+          active_inventory[entry]--
+          continue
+        }
+
+        field_count = split(entry, fields, ">")
+        if (field_count != 3 && field_count != 4) {
+          exit 1
+        }
+
+        port = fields[2]
+        if (port == "") {
+          port = "853"
+        }
+
+        printf "%s|%s|%s\n", fields[1], port, fields[3]
+      }
+    }
+  '
+}
+
+# Emit details only after a verified WAN switch (not on each cron probe).
+# filtered1/filtered2 are rotating state labels, not permanent server lists.
+_LogFilteredDNSMembership_() {
+  local old_pool new_pool previous desired excluded count active_count preferred_count
+  local address port tls_hostname
+
+  old_pool="$1"
+  new_pool="$2"
+  previous="$3"
+  desired="$4"
+
+  case "$new_pool" in
+    filtered1|filtered2)
+      excluded="$(_ListExcludedPreferredDNSMembers_ "$desired")" || return 1
+      ;;
+    preferred)
+      case "$old_pool" in
+        filtered1|filtered2)
+          excluded="$(_ListExcludedPreferredDNSMembers_ "$previous")" || return 1
+          ;;
+        *)
+          return 0
+          ;;
+      esac
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+
+  count="$(printf '%s\n' "$excluded" | awk 'NF { n++ } END { print n + 0 }')"
+  preferred_count="$(awk -F '<' '{ print NF - 1; exit }' "$PREF_RULELIST")"
+  active_count="$(printf '%s\n' "$desired" | awk -F '<' '{ print NF - 1; exit }')"
+
+  if [ "$new_pool" = preferred ]; then
+    _LogEvent_ notice "DNS FILTERED RECOVERY: pool=preferred; restored=$count; active=$active_count/$preferred_count"
+  else
+    _LogEvent_ notice "DNS FILTERED MEMBERSHIP: pool=$new_pool; active=$active_count/$preferred_count; excluded=$count"
+  fi
+
+  if [ -z "$excluded" ]; then
+    return 0
+  fi
+
+  while IFS='|' read -r address port tls_hostname; do
+    if [ "$new_pool" = preferred ]; then
+      _LogEvent_ notice "DNS RESOLVER RESTORED: address=$address port=$port tls_auth=$tls_hostname"
+    else
+      _LogEvent_ warning "DNS RESOLVER EXCLUDED: pool=$new_pool address=$address port=$port tls_auth=$tls_hostname"
+    fi
+  done <<EOF_EXCLUDED_MEMBERS
+$excluded
+EOF_EXCLUDED_MEMBERS
+}
+
 # Construct the filtered list directly from the original NVRAM serialization.
 # The ID file contains only confirmed healthy wanN member IDs.
 _BuildFilteredRulelistFromMembers_() {
@@ -1214,7 +2122,7 @@ _ProbeWANMemberStatuses_() {
         elif [ "$state" = PASS ]; then state=FAIL
         fi
       fi
-    done < "$CHECKS"
+    done < "${RG_MONITOR_CHECKS:-$CHECKS}"
     printf '%s|%s\n' "$id" "$state" >> "$destination" || { rm -f "$members"; return 1; }
     if [ "$state" = INCONCLUSIVE ]; then overall=2
     elif [ "$state" = FAIL ] && [ "$overall" -eq 0 ]; then overall=1
@@ -1235,7 +2143,7 @@ _UpdateWANHistory_() {
   case "$now" in ''|*[!0-9]*) return 1;; esac
   ttl=$((SCHEDULE_INTERVAL_MINUTES * 60 * 9))
   [ "$ttl" -ge 600 ] || ttl=600
-  fingerprint="$({ _ReadWANRulelist_; cat "$CHECKS"; printf '%s\n' "$pool"; } | _SHA256Digest_ 2>/dev/null)" || return 1
+  fingerprint="$({ _ReadWANRulelist_; cat "${RG_MONITOR_CHECKS:-$CHECKS}"; printf '%s\n' "$pool"; } | _SHA256Digest_ 2>/dev/null)" || return 1
   case "$fingerprint" in ''|*[!0-9a-f]*) return 1;; esac
   previous="$RUNTIME/member-history-old-$$"
   : > "$previous" || return 1
@@ -1396,9 +2304,9 @@ _GetPoolMembers_() {
       filtered="$(_GetFilteredRulelist_ "$pool")" || return 1
       parsed="$RUNTIME/filtered-members-$$"
       printf '%s\n' "$filtered" | _ParseDNSRulelist_ > "$parsed" || return 1
-      awk -F'|' 'NR==FNR {wanted[$1 "|" $3 "|" $2]++; next}
+      awk -F'|' 'NR==FNR {wanted[tolower($1 "|" $3 "|" $2)]++; next}
         $1 ~ /^wan[0-9]+$/ {
-          k=$2 "|" $3 "|" $5
+          k=tolower($2 "|" $3 "|" $5)
           if (wanted[k]>0) {print; wanted[k]--}
         }' "$parsed" "$PROVIDERS"
       rm -f "$parsed"
@@ -1430,7 +2338,7 @@ _ProbeResolverPool_() {
         elif [ "$outcome" -eq 0 ]; then outcome=1
         fi
       fi
-    done < "$CHECKS"
+    done < "${RG_MONITOR_CHECKS:-$CHECKS}"
   done < "$members"
   rm -f "$members"
   return "$outcome"
@@ -1460,7 +2368,7 @@ _BuildBackupRulelist_() {
   _GetPoolMembers_ "$pool" > "$members" || return 1
   [ -s "$members" ] || { rm -f "$members"; return 1; }
   while IFS='|' read -r id ip name localport tport extra; do
-    _IsValidIPv4_ "$ip" && _IsValidTLSPort_ "$tport" && _IsValidDomain_ "$name" || return 1
+    _IsValidIP_ "$ip" && _IsValidTLSPort_ "$tport" && _IsValidDomain_ "$name" || return 1
     if [ "$n" = 4 ]; then printf '<%s>%s>%s>' "$ip" "$tport" "$name"
     else printf '<%s>%s>%s' "$ip" "$tport" "$name"; fi
   done < "$members"
@@ -1494,8 +2402,8 @@ _VerifyLiveEndpoints_() {
   else
     _BuildBackupRulelist_ "$pool" | _ParseDNSRulelist_ > "$parsed" || return 1
   fi
-  awk -F'|' '{print $1"|"$2"|"$3}' "$parsed" > "$desired"
-  _ParseWANUpstreams_ | awk -F'|' '{print $1"|"$3"|"$2}' > "$live" || return 1
+  awk -F'|' '{print tolower($1)"|"$2"|"tolower($3)}' "$parsed" > "$desired"
+  _ParseWANUpstreams_ | awk -F'|' '{print tolower($1)"|"$3"|"tolower($2)}' > "$live" || return 1
   if ! cmp -s "$desired" "$live"; then
     rm -f "$parsed" "$desired" "$live"; return 1
   fi
@@ -1590,6 +2498,10 @@ _MarkDNSRecoveryHold_() {
 _CheckLiveSwitchSafety_() {
   [ "$(_ReadNVRAM_ dnspriv_enable)" = 1 ] || { _Fail_ 'DNS Privacy disabled; refusing WAN switch'; return 1; }
   [ -r "$PREF_RULELIST" ] && [ -r "$PREF_PROVIDERS" ] || { _Fail_ 'No preferred snapshot; run enroll first'; return 1; }
+  if ! _ValidatePreferredSnapshot_; then
+    _Fail_ 'Preferred IPv4/IPv6 snapshot is incomplete; refusing WAN switch'
+    return 1
+  fi
   _IsStrictProductionDoT_ || { _Fail_ 'Production Stubby is not authenticated TLS-only'; return 1; }
   [ ! -e "$PREFERRED_SYNC" ] && [ ! -L "$PREFERRED_SYNC" ] || return 1
   _GetActiveWANPool_ >/dev/null || { _Fail_ 'WAN configuration changed outside ResolvGuard; refusing to overwrite'; return 1; }
@@ -1617,13 +2529,14 @@ _CheckAutomaticFailoverAuthorization_() {
 # SERVFAIL/NXDOMAIN/NOERROR can all be legitimate from an alive listener.
 # Unexpected/malformed data, dig failures or missing QR header fail closed.
 _VerifyLocalDNSResponse_() {
-  local server tag nonce out got count flags tick
+  local server tag out got count flags
   server="$1"; tag="$2"
-  tick="$(date -u +%s 2>/dev/null)" || return 1
-  case "$tick" in ''|*[!0-9]*) return 1;; esac
-  nonce="rg-infra-$$-$tick.example.com"
   out="$RUNTIME/infra-$tag-$$"
-  if ! "$DIG" "@$server" "$nonce" A +time="$TIMEOUT_SECONDS" +tries=1 +noall +comments +answer +authority > "$out" 2>&1; then
+  # Query the DNS root (.) for NS records instead of generating arbitrary
+  # subdomains beneath example.com. This only verifies a well-formed local
+  # listener response; authenticated upstream health is checked separately.
+  # Cached root NS data is acceptable for this local-listener readiness test.
+  if ! "$DIG" "@$server" . NS +time="$TIMEOUT_SECONDS" +tries=1 +noall +comments +answer +authority > "$out" 2>&1; then
     _Say_ "INFRASTRUCTURE NOT READY: $tag listener did not answer"
     rm -f "$out"; return 1
   fi
@@ -1653,37 +2566,222 @@ _VerifyStubbyListenerResponse_() {
   _VerifyLocalDNSResponse_ 127.0.1.1 stubby
 }
 
+# Validate the complete upstream file before trusting the router's LAN DNS path.
+# An unqualified server= line MUST point at the local production Stubby
+# listener. Domain-scoped exceptions can coexist, but are not a plaintext
+# fallback for ordinary DNS queries: DNSMasq uses them for matching names only.
+#
+# Return the explicit domain exceptions as "domain|server" records so the
+# caller can validate their IP addresses and disclose the bypass to the user.
+_ScanDNSMasqUpstreamFile_() {
+  awk '
+    function trim_whitespace(value) {
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+      return value
+    }
+
+    /^[[:space:]]*#/ || /^[[:space:]]*$/ {
+      next
+    }
+
+    {
+      line = trim_whitespace($0)
+
+      # A DNSMasq #port is not a comment. Only strip # preceded by space.
+      sub(/[[:space:]]+#.*$/, "", line)
+      line = trim_whitespace(line)
+
+      if (line == "server=127.0.1.1" ||
+          line == "server=127.0.1.1#53") {
+        default_servers++
+        next
+      }
+
+      # BusyBox awk treats a slash inside a bracket expression in a regex
+      # literal as the end of the regex on some firmware builds. Parse the
+      # DNSMasq domain delimiter as plain text instead of matching [^/].
+      if (substr(line, 1, 8) == "server=/") {
+        scoped_entry = substr(line, 9)
+        separator = index(scoped_entry, "/")
+
+        if (separator <= 1) {
+          invalid = 1
+          next
+        }
+
+        domain = substr(scoped_entry, 1, separator - 1)
+        destination = substr(scoped_entry, separator + 1)
+
+        if (destination == "" || index(destination, "/") != 0) {
+          invalid = 1
+          next
+        }
+
+        sub(/\.$/, "", domain)
+
+        # Reject root, wildcard, single-label and other overly broad scopes.
+        if (domain !~ /^[A-Za-z0-9-]+([.][A-Za-z0-9-]+)+$/ ||
+            domain ~ /[.][.]/) {
+          invalid = 1
+          next
+        }
+
+        printf "%s|%s\n", domain, destination
+        next
+      }
+
+      # Reject all other directives, particularly generic plaintext servers.
+      invalid = 1
+    }
+
+    END {
+      if (default_servers < 1 || invalid) {
+        exit 1
+      }
+    }
+  ' "$DNSMASQ_SERVERS"
+}
+
+_ValidateDNSMasqUpstreamFile_() {
+  local domain_exceptions domain server
+
+  if ! domain_exceptions="$(_ScanDNSMasqUpstreamFile_)"; then
+    _Say_ 'LAN DNS NOT READY: invalid DNSMasq upstream or missing Stubby default'
+    return 1
+  fi
+
+  # A split-DNS exception has a domain scope, but routes that domain outside
+  # production DoT. Accept only literal IP endpoints and disclose the scope.
+  if [ -n "$domain_exceptions" ]; then
+    while IFS='|' read -r domain server; do
+      if ! _IsValidIPv4_ "$server" && ! _IsValidIPv6_ "$server"; then
+        _Say_ "LAN DNS NOT READY: invalid domain-scoped DNS upstream for $domain"
+        return 1
+      fi
+    done <<EOF_DNSMASQ_SCOPED_SERVERS
+$domain_exceptions
+EOF_DNSMASQ_SCOPED_SERVERS
+
+    # Validate the exceptions here, but do not print an interactive notice.
+    # This validation can run repeatedly while Stubby is starting and during
+    # DNS restoration. Quick Setup displays a single, prominent disclosure
+    # in the wizard before automatic-failover authorization is requested.
+  fi
+
+  return 0
+}
+
+# Disclose domain-specific plaintext DNS exceptions before asking the user to
+# authorize automatic failover (either during Quick Setup or from the menu).
+# Validation stays independent of presentation: this function makes no DNS or
+# configuration changes, and pauses only for an interactive terminal.
+_ShowDNSMasqScopedSetupWarning_() {
+  local domain_exceptions domain upstream
+
+  # The wizard and its authorization helper may both call this routine.
+  # A disclosure and acknowledgement are needed only once per invocation.
+  if [ "${RG_SCOPED_WARNING_SHOWN:-0}" = 1 ]; then
+    return 0
+  fi
+
+  if [ ! -r "$DNSMASQ_SERVERS" ]; then
+    return 0
+  fi
+
+  # A malformed upstream file is reported by the normal readiness checks;
+  # never describe an invalid configuration as successfully protected.
+  if ! domain_exceptions="$(_ScanDNSMasqUpstreamFile_ 2>/dev/null)"; then
+    return 0
+  fi
+
+  if [ -z "$domain_exceptions" ]; then
+    return 0
+  fi
+
+  # Use the same literal-IP validation as the readiness check. The display
+  # must not accidentally accept or endorse a malformed split-DNS exception.
+  while IFS='|' read -r domain upstream; do
+    if ! _IsValidIPv4_ "$upstream" && ! _IsValidIPv6_ "$upstream"; then
+      return 0
+    fi
+  done <<EOF_DNSMASQ_WARNING_VALIDATE
+$domain_exceptions
+EOF_DNSMASQ_WARNING_VALIDATE
+
+  RG_SCOPED_WARNING_SHOWN=1
+  _SetMenuPalette_
+
+  printf '\n%s' "$RG_RED"
+  _Say_ '================================================================'
+  _Say_ '  WARNING: DNS REQUESTS BYPASS STRICT DNS-OVER-TLS'
+  _Say_ '================================================================'
+  printf '%s' "$RG_RESET"
+
+  _Say_ '  DNSMasq is configured to use Stubby by default, but these'
+  _Say_ '  domain-specific exceptions use separate DNS servers:'
+  _Say_ ''
+
+  while IFS='|' read -r domain upstream; do
+    printf '  %sDOMAIN:%s   %s\n' "$RG_RED" "$RG_RESET" "$domain"
+    printf '  %sUPSTREAM:%s %s\n' "$RG_RED" "$RG_RESET" "$upstream"
+  done <<EOF_DNSMASQ_WARNING_LIST
+$domain_exceptions
+EOF_DNSMASQ_WARNING_LIST
+
+  printf '\n%s' "$RG_RED"
+  _Say_ '  Matching queries bypass the default Stubby/Strict DoT path.'
+  _Say_ '  ResolvGuard did not create or modify these DNSMasq rules.'
+  _Say_ '================================================================'
+  printf '%s' "$RG_RESET"
+
+  # Do not consume stdin or block noninteractive scripted invocations.
+  # Only an actual interactive SSH terminal needs acknowledgment.
+  if [ -t 0 ] && [ -t 1 ]; then
+    printf '\n%sPress <Enter> to acknowledge this DNS warning and continue...%s' \
+      "$RG_RED" "$RG_RESET"
+    IFS= read -r _rg_dns_warning_ack || :
+    printf '\n'
+  fi
+
+  return 0
+}
+
 _VerifyLANForwardingConfig_() {
   local lan
-  [ "$(_ReadNVRAM_ dnspriv_enable)" = 1 ] &&
-    [ "$(_ReadNVRAM_ dnspriv_profile)" = 1 ] || {
-      _Say_ 'LAN DNS NOT READY: ASUS Strict DNS Privacy is not enabled'; return 1;
-    }
-  [ -r "$DNSMASQ_MAIN" ] || {
-    _Say_ "LAN DNS NOT READY: DNSMasq main configuration not readable: $DNSMASQ_MAIN"; return 1;
-  }
-  [ -r "$DNSMASQ_SERVERS" ] || {
-    _Say_ "LAN DNS NOT READY: DNSMasq upstream servers file not readable: $DNSMASQ_SERVERS"; return 1;
-  }
-  awk '
-    /^[[:space:]]*#/ || /^[[:space:]]*$/ {next}
-    /^[[:space:]]*server=/ {
-      line=$0; sub(/^[[:space:]]*/, "", line); sub(/[[:space:]]*#.*/, "", line)
-      sub(/[[:space:]]*$/, "", line)
-      if (line!="server=127.0.1.1" && line!="server=127.0.1.1#53") bad=1
-      count++; next
-    }
-    {bad=1}
-    END {exit(count>0 && !bad)?0:1}
-  ' "$DNSMASQ_SERVERS" || {
-    _Say_ 'LAN DNS NOT READY: DNSMasq has missing/unexpected upstream (no plaintext fallback permitted)'; return 1;
-  }
-  grep -Eq '^[[:space:]]*no-resolv[[:space:]]*$' "$DNSMASQ_MAIN" &&
-    grep -Eq '^[[:space:]]*servers-file=/tmp/resolv\.dnsmasq[[:space:]]*$' "$DNSMASQ_MAIN" || {
-      _Say_ 'LAN DNS NOT READY: DNSMasq does not declare its strict forwarding file'; return 1;
-    }
+
+  if [ "$(_ReadNVRAM_ dnspriv_enable)" != 1 ] ||
+     [ "$(_ReadNVRAM_ dnspriv_profile)" != 1 ]; then
+    _Say_ 'LAN DNS NOT READY: ASUS Strict DNS Privacy is not enabled'
+    return 1
+  fi
+
+  if [ ! -r "$DNSMASQ_MAIN" ]; then
+    _Say_ "LAN DNS NOT READY: DNSMasq main configuration not readable: $DNSMASQ_MAIN"
+    return 1
+  fi
+
+  if [ ! -r "$DNSMASQ_SERVERS" ]; then
+    _Say_ "LAN DNS NOT READY: DNSMasq upstream servers file not readable: $DNSMASQ_SERVERS"
+    return 1
+  fi
+
+  if ! _ValidateDNSMasqUpstreamFile_; then
+    return 1
+  fi
+
+  if ! grep -Eq '^[[:space:]]*no-resolv[[:space:]]*$' "$DNSMASQ_MAIN" ||
+     ! grep -Eq '^[[:space:]]*servers-file=/tmp/resolv\.dnsmasq[[:space:]]*$' "$DNSMASQ_MAIN"; then
+    _Say_ 'LAN DNS NOT READY: DNSMasq does not declare its strict forwarding file'
+    return 1
+  fi
+
   lan="$(_ReadNVRAM_ lan_ipaddr)"
-  _IsValidIPv4_ "$lan" || { _Say_ 'LAN DNS NOT READY: LAN address invalid'; return 1; }
+  if ! _IsValidIPv4_ "$lan"; then
+    _Say_ 'LAN DNS NOT READY: LAN address invalid'
+    return 1
+  fi
+
   return 0
 }
 
@@ -1801,6 +2899,49 @@ _SHA256Digest_() {
   printf '%s\n' "$digest" | LC_ALL=C tr 'A-F' 'a-f'
 }
 
+# Epoch detects a policy/config edit during a long DNS probe cycle. A changed
+# policy must never authorize a WAN switch using pre-edit observations, even
+# when the administrator approves the new policy before this cycle ends.
+_GetMonitorPolicyEpoch_() {
+  local file staged digest
+
+  staged="$RUNTIME/monitor-policy-epoch-$$"
+  if [ -e "$staged" ] || [ -L "$staged" ]; then
+    return 1
+  fi
+
+  # The path label and raw content of each policy file contribute to the
+  # fingerprint. Do not omit the file label or change their order.
+  if ! (
+    umask 077
+    for file in "$CHECKS" "$EXTRA_PROVIDERS" "$SETTINGS" \
+                "$PREF_RULELIST" "$PREF_PROVIDERS" "$POLICY_APPROVAL"; do
+      if ! printf 'policy-file:%s\n' "$file"; then
+        exit 1
+      fi
+
+      if [ -f "$file" ] && [ ! -L "$file" ]; then
+        if ! cat "$file"; then
+          exit 1
+        fi
+      else
+        printf '%s\n' '(missing-or-unsafe)' || exit 1
+      fi
+    done
+  ) > "$staged"; then
+    rm -f "$staged"
+    return 1
+  fi
+
+  if ! digest="$(_SHA256Digest_ "$staged")"; then
+    rm -f "$staged"
+    return 1
+  fi
+
+  rm -f "$staged" || return 1
+  printf '%s\n' "$digest"
+}
+
 _GetPolicyFingerprint_() {
   local digest
   [ -r "$CHECKS" ] || { _Fail_ 'Cannot read DNS health checks for policy fingerprint'; return 1; }
@@ -1875,8 +3016,16 @@ _ApprovePolicy_() (
   local fingerprint staged approval_prompt view count
   approval_prompt="${1:-Approve DNS policy?}"
   view="${2:-detail}"
+  RG_POLICY_CONFIG_HELD=0
+  RG_POLICY_WAN_HELD=0
+  RG_MAINTENANCE_PRIORITY_HELD=0
+  # Install cleanup before waiting: a termination during the bounded wait
+  # must not leave behind this policy operation's priority reservation.
+  trap '_CleanupPolicyLocks_' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' HUP TERM
   _AcquireWANLockForPolicy_ || return 1
-  trap '_ReleaseWANLock_ >/dev/null 2>&1 || :' EXIT HUP INT TERM
+  _AcquireConfigLockForPolicy_ || return 1
   [ ! -e "$PENDING_TRANSACTION" ] && [ ! -L "$PENDING_TRANSACTION" ] &&
     [ ! -e "$RECOVERY_HOLD" ] && [ ! -L "$RECOVERY_HOLD" ] || {
     _Fail_ 'Unresolved WAN transaction or recovery hold; policy approval blocked'; return 1; }
@@ -1913,15 +3062,30 @@ _ApprovePolicy_() (
     done < "$CHECKS"
   fi
   _Say_ ''
-  # Do not hold the WAN watchdog lock while the operator considers the
-  # policy: cron must continue to monitor normally during a long prompt.
-  _ReleaseWANLock_ || { _Fail_ 'Unable to release DNS lock before confirmation'; return 1; }
+  # Never hold a WAN lock, config lock, or priority reservation while an
+  # administrator reads the policy or considers the approval prompt.
+  # Monitoring therefore runs normally during an arbitrarily long review.
+  _ReleasePolicyConfigLock_ || {
+    _Fail_ 'Unable to release configuration lock before confirmation'
+    return 1
+  }
+  _ReleasePolicyWANLock_ || {
+    _Fail_ 'Unable to release DNS lock before confirmation'
+    return 1
+  }
+  _ReleaseMaintenancePriority_ || {
+    _Fail_ 'Unable to release interactive priority before confirmation'
+    return 1
+  }
   if [ "$view" = quick ]; then
     _ConfirmYesNo_ "$approval_prompt" quiet || return 1
   else
     _ConfirmYesNo_ "$approval_prompt" || return 1
   fi
+  # Re-establish priority after consent, then verify the reviewed policy
+  # under both locks before persisting any approval.
   _AcquireWANLockForPolicy_ || return 1
+  _AcquireConfigLockForPolicy_ || return 1
   [ ! -e "$PENDING_TRANSACTION" ] && [ ! -L "$PENDING_TRANSACTION" ] &&
     [ ! -e "$RECOVERY_HOLD" ] && [ ! -L "$RECOVERY_HOLD" ] || {
     _Fail_ 'WAN recovery state changed during review; approval refused'; return 1; }
@@ -1958,8 +3122,15 @@ _ApprovePolicy_() (
 # Reapproving alone must never reactivate an old automatic-failover marker.
 _RevokePolicy_() (
   _ConfirmYesNo_ 'Revoke DNS policy approval (also disables automatic failover)?' || return 1
+  RG_POLICY_WAN_HELD=0
+  RG_POLICY_CONFIG_HELD=0
+  RG_MAINTENANCE_PRIORITY_HELD=0
+  # Confirmation happens before admission; the scheduler keeps working
+  # while the operator reads the prompt.
+  trap '_CleanupPolicyLocks_' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' HUP TERM
   _AcquireWANLockForPolicy_ || return 1
-  trap '_ReleaseWANLock_ >/dev/null 2>&1 || :' EXIT HUP INT TERM
   [ ! -L "$AUTO_FAILOVER_MARKER" ] && [ ! -L "$POLICY_APPROVAL" ] || {
     _Fail_ 'Unsafe policy/authorization path; refusing revocation'; return 1; }
   rm -f "$AUTO_FAILOVER_MARKER" || {
@@ -1982,8 +3153,52 @@ _ManagePolicy_() {
   esac
 }
 
-_SwitchDNSPool_() {
+# A WAN-switch subprocess must release only a configuration lock that it
+# acquired itself. The EXIT trap executes after function-local variables may
+# have gone out of scope on BusyBox ash, so this ownership marker is NOT local.
+# The switching function runs in a subshell, keeping the marker private to it.
+_CleanupSwitchConfigLock_() {
+  if [ "${RG_SWITCH_CONFIG_LOCK_OWNED:-0}" = 1 ]; then
+    _ReleaseConfigLock_ >/dev/null 2>&1 || :
+  fi
+}
+
+_SwitchDNSPool_() (
   local old new reason prev desired actual verified
+  # Config commits may run during read-only probes, but not during WAN writes.
+  # A maintenance caller can already own CONFIG_LOCK while holding WAN_LOCK.
+  RG_SWITCH_CONFIG_LOCK_OWNED=0
+  if [ "${RG_CONFIG_LOCK_ALREADY_HELD:-0}" = 1 ]; then
+    if [ ! -d "$CONFIG_LOCK" ] || [ -L "$CONFIG_LOCK" ] ||
+       [ ! -f "$CONFIG_LOCK/owner" ] || [ -L "$CONFIG_LOCK/owner" ] ||
+       [ "$(cat "$CONFIG_LOCK/owner")" != "$$" ]; then
+      _Fail_ 'Maintenance configuration lock ownership cannot be verified'
+      return 1
+    fi
+  else
+    if ! _AcquireConfigLock_; then
+      _Fail_ 'Configuration commit in progress; WAN switch deferred'
+      return 1
+    fi
+    RG_SWITCH_CONFIG_LOCK_OWNED=1
+  fi
+
+  trap '_CleanupSwitchConfigLock_' EXIT HUP INT TERM
+  # Probes may run concurrently with a menu edit. A switch is allowed only
+  # when the recorded policy epoch still matches the current configuration.
+  # A maintenance request made during probing must stop any new scheduled
+  # switch decision. A transaction already in progress still completes safely.
+  if [ -n "${RG_MONITOR_POLICY_EPOCH:-}" ] && _MaintenancePriorityPending_; then
+    _Say_ 'WAN SWITCH SAFETY HOLD: interactive maintenance has priority.'
+    return 1
+  fi
+
+  if [ -n "${RG_MONITOR_POLICY_EPOCH:-}" ]; then
+    if [ "$(_GetMonitorPolicyEpoch_)" != "$RG_MONITOR_POLICY_EPOCH" ]; then
+      _Say_ 'WAN SWITCH SAFETY HOLD: configuration changed during DNS probing.'
+      return 1
+    fi
+  fi
   old="$1"; new="$2"; reason="$3"
   case "$new" in
     filtered1|filtered2)
@@ -2062,8 +3277,9 @@ _SwitchDNSPool_() {
   else
     _LogEvent_ warning "DNS POOL CHANGE: $old -> $new; Strict DoT verified ($reason)"
   fi
+  _LogFilteredDNSMembership_ "$old" "$new" "$prev" "$desired" || :
   return 0
-}
+)
 
 _ReadMonitoringState_() {
   local f
@@ -2081,27 +3297,100 @@ _WriteMonitoringState_() {
   mv "$RUNTIME/state-counters.new.$$" "$RUNTIME/state-counters"
 }
 
+# A health-check cycle owns these temporary files and both locks only
+# while explicitly acquired. Keep cleanup limited to its own probe processes.
+_CleanupMonitorCycle_() {
+  _StopProbeInstances_ >/dev/null 2>&1 || :
+
+  rm -f "$RUNTIME/member-first-$$" \
+        "$RUNTIME/member-confirm-$$" \
+        "$RUNTIME/member-survivors-$$" \
+        "$RUNTIME/monitor-checks-$$"
+
+  if [ "${RG_CONFIG_HELD:-0}" = 1 ]; then
+    _ReleaseConfigLock_ >/dev/null 2>&1 || :
+  fi
+
+  _ReleaseWANLock_ >/dev/null 2>&1 || :
+}
+
 _RunDNSHealthCheck_() (
   local current backup selected pool result alt_rc mode
   local status1 status2 survivors proposed target eligible confirm_needed switch_failure
   mode="${1:-manual}"
   switch_failure=0
+
+  # Never emit terminal escape codes into scheduled logs or captured output.
+  # A direct manual CLI check and the menu's CH action share this path.
+  RG_HEALTH_COLOR_ENABLED=0
+  RG_HEALTH_SHOW_RESOLVERS=0
+  RG_HEALTH_FAILED_RECORDS=0
+  RG_HEALTH_FAILED_IDS=''
+  RG_HEALTH_FAILURE_PHASES=''
+  RG_HEALTH_PROBE_PHASE=active
+
+  if [ "$mode" != scheduled ] && [ -t 1 ]; then
+    RG_HEALTH_SHOW_RESOLVERS=1
+    _SetMenuPalette_
+
+    if [ -n "$RG_GREEN" ] && [ -n "$RG_RED" ]; then
+      RG_HEALTH_COLOR_ENABLED=1
+    fi
+  fi
   [ -r "$PREF_RULELIST" ] || { _Fail_ 'Run enroll before monitoring or switching WAN DoT'; return 1; }
   [ ! -e "$PENDING_TRANSACTION" ] && [ ! -e "$RECOVERY_HOLD" ] || {
     _Fail_ 'Unresolved WAN transaction; use Maintenance & Recovery to inspect preferred-DNS restoration'; return 1; }
+  if [ "$mode" = scheduled ] && _MaintenancePriorityPending_; then
+    _Say_ 'SKIP: interactive maintenance has priority over scheduled DNS checks.'
+    return 0
+  fi
   if ! _AcquireWANLock_; then _Fail_ 'Another WAN watchdog or drill holds the lock'; return 1; fi
   status1="$RUNTIME/member-first-$$"; status2="$RUNTIME/member-confirm-$$"
   survivors="$RUNTIME/member-survivors-$$"
   # EXIT traps can run after local variables leave scope on router BusyBox ash.
   # Reconstruct exact per-process temp paths instead of referring to locals.
-  trap '_StopProbeInstances_ >/dev/null 2>&1 || :; rm -f "$RUNTIME/member-first-$$" "$RUNTIME/member-confirm-$$" "$RUNTIME/member-survivors-$$"; _ReleaseWANLock_ >/dev/null 2>&1 || :' EXIT HUP INT TERM
+  trap '_CleanupMonitorCycle_' EXIT HUP INT TERM
+  # Close the admission race if maintenance requested priority while the
+  # scheduler was waiting for its WAN lock.
+  if [ "$mode" = scheduled ] && _MaintenancePriorityPending_; then
+    _Say_ 'SKIP: maintenance requested while scheduler was acquiring the WAN lock.'
+    return 0
+  fi
+  RG_CONFIG_HELD=0
+  if ! _AcquireConfigLock_; then
+    if [ "$mode" = scheduled ]; then
+      _Say_ 'SKIP: configuration commit in progress; next scheduled cycle will retry.'
+      return 0
+    fi
+    _Fail_ 'Configuration commit in progress; retry the manual health check'
+    return 1
+  fi
+  RG_CONFIG_HELD=1
   _SyncPreferredWANLocked_ || return 1
   _ValidateConfiguration_ >/dev/null || return 1
   _PrepareResolverPools_ || return 1
+  # Capture both the checks and the policy fingerprint under CONFIG_LOCK.
+  # Once this snapshot is prepared, lengthy DNS probes need no config lock.
+  RG_MONITOR_CHECKS="$RUNTIME/monitor-checks-$$"
+  if [ -e "$RG_MONITOR_CHECKS" ] || [ -L "$RG_MONITOR_CHECKS" ]; then
+    return 1
+  fi
+
+  if ! cp "$CHECKS" "$RG_MONITOR_CHECKS"; then
+    return 1
+  fi
+  RG_MONITOR_POLICY_EPOCH="$(_GetMonitorPolicyEpoch_)" || return 1
+
+  if ! _ReleaseConfigLock_; then
+    _Fail_ 'Unable to release config lock'
+    return 1
+  fi
+  RG_CONFIG_HELD=0
   current="$(_GetActiveWANPool_)" || { _Fail_ 'Active WAN NVRAM list differs from enrolled state; refusing'; return 1; }
   _StartProbeInstances_ || return 1
   _ReadMonitoringState_
   _Say_ "ROUTER WAN DoT pool=$current preferred=preferred failures=$failures recoveries=$recoveries"
+  RG_HEALTH_PROBE_PHASE=active
   case "$current" in
     preferred|filtered1|filtered2)
       if _ProbeWANMemberStatuses_ "$current" "$status1"; then result=0
@@ -2122,6 +3411,11 @@ _RunDNSHealthCheck_() (
     fi
     failures=0
     if [ "$current" != preferred ]; then
+      RG_HEALTH_PROBE_PHASE=preferred
+      if [ "${RG_HEALTH_SHOW_RESOLVERS:-0}" = 1 ]; then
+        printf '\n  %sChecking preferred pool for possible recovery (not the active pool):%s\n' \
+          "$RG_CYAN" "$RG_RESET"
+      fi
       if _ProbeResolverPool_ preferred; then
         recoveries=$((recoveries+1))
         if [ "$recoveries" -ge "$RECOVERY_THRESHOLD" ]; then
@@ -2263,6 +3557,7 @@ _RunDNSHealthCheck_() (
           esac
           [ "$pool" != "$current" ] || continue
           _Say_ "  Checking alternate DNS pool $pool ($backup)"
+          RG_HEALTH_PROBE_PHASE=alternate
           if _ProbeResolverPool_ "$pool" && _ProbeResolverPool_ "$pool"; then
             selected="$pool"; break
           fi
@@ -2284,6 +3579,15 @@ _RunDNSHealthCheck_() (
       fi
     fi
   fi
+  # Discard observations and counters derived from an obsolete policy.
+  # Any actual WAN write has an additional epoch guard at the switch boundary.
+  if [ "$(_GetMonitorPolicyEpoch_)" != "$RG_MONITOR_POLICY_EPOCH" ]; then
+    failures=0
+    recoveries=0
+    rm -f "$MEMBER_HISTORY" || :
+    _Say_ 'MONITOR SAFETY HOLD: configuration changed during health check; counters reset.'
+    switch_failure=0
+  fi
   # Surface an attempted-but-failed DNS switch to cron/CLI even when
   # rollback was successful. 0 means no switch failed (including monitor-only
   # and no-authorized-candidate outcomes); 3 identifies a switch failure.
@@ -2293,6 +3597,7 @@ _RunDNSHealthCheck_() (
       [ "$switch_failure" -ne 0 ] || return 1
     fi
   fi
+  _PrintManualHealthSummary_
   return "$switch_failure"
 )
 
@@ -2622,15 +3927,20 @@ _RestorePreferredDNSLocked_() {
 _RestorePreferredDNS_() (
   [ -s "$PREF_RULELIST" ] || { _Fail_ 'Enroll preferred WAN DNS first'; return 1; }
   _ConfirmYesNo_ 'Restore preferred WAN DNS? (May restart Stubby)' || return 1
-  if ! _AcquireWANLock_; then _Fail_ 'Another DNS operation holds the WAN lock'; return 1; fi
-  trap '_ReleaseWANLock_ >/dev/null 2>&1 || :' EXIT HUP INT TERM
+  if ! _AcquireWANLockForMaintenance_; then
+    _Fail_ 'Unable to reserve WAN access for restore'
+    return 1
+  fi
+  trap '_CleanupMaintenanceLocks_' EXIT HUP INT TERM
+  _AcquireConfigLock_ || { _Fail_ 'Configuration commit in progress; restore deferred'; return 1; }
+  RG_CONFIG_LOCK_ALREADY_HELD=1
   _RestorePreferredDNSLocked_
 )
 
 
 
 _ShowStatus_() {
-  local active sync_ok=1
+  local active current_rulelist excluded address port tls_hostname sync_ok=1
   if ! _SyncPreferredWAN_; then
     sync_ok=0
     _Say_ 'NOTICE: Another DNS operation is active or WAN synchronization is unverified.'
@@ -2646,6 +3956,23 @@ _ShowStatus_() {
   fi
   _Say_ "$SCRIPT_NAME root=$ROOT SCRIPT_VERSION=$SCRIPT_VERSION SCRIPT_VERSTAG=$SCRIPT_VERSTAG SCRIPT_BRANCH=$SCRIPT_BRANCH"
   _Say_ "Production WAN DoT pool: $active"
+  case "$active" in
+    filtered1|filtered2)
+      # Status is read-only. A failed membership read must not change WAN DNS.
+      current_rulelist="$(_ReadWANRulelist_ 2>/dev/null)" || current_rulelist=''
+      if [ -n "$current_rulelist" ]; then
+        excluded="$(_ListExcludedPreferredDNSMembers_ "$current_rulelist" 2>/dev/null)" || excluded=''
+        if [ -n "$excluded" ]; then
+          _Say_ 'Currently excluded preferred DNS resolvers:'
+          while IFS='|' read -r address port tls_hostname; do
+            _Say_ "  address=$address port=$port tls_auth=$tls_hostname"
+          done <<EOF_CURRENT_EXCLUSIONS
+$excluded
+EOF_CURRENT_EXCLUSIONS
+        fi
+      fi
+      ;;
+  esac
   _Say_ 'Router-wide mode: all LAN DNS clients retain the existing DNSMasq -> production Stubby path.'
   _Say_ 'Monitor targets do NOT receive domain-specific routing.'
   [ -r "$PREF_RULELIST" ] && _Say_ 'Preferred WAN list captured: yes' || _Say_ 'Preferred WAN list captured: no (run enroll)'
@@ -2882,6 +4209,10 @@ _EnableAutomaticFailover_() {
     _Fail_ 'Configure at least two distinct WAN provider groups or an independent backup for automatic failover'
     return 1
   fi
+  # Outside Quick Setup, present the same security disclosure before consent.
+  # A warning already acknowledged in this wizard is not shown a second time.
+  _ShowDNSMasqScopedSetupWarning_
+
   if ! approval_status="$(_GetPolicyApprovalState_)"; then
     if [ "$view" != quick ]; then
       _Say_ "DNS policy approval required: $approval_status"
@@ -3101,17 +4432,18 @@ _RotateScheduleLog_() {
 _RunScheduledCheck_() {
   local outcome
   [ -r "$SCHEDULE_MARKER" ] || { _Say_ 'SKIP: monitoring schedule not enabled'; return 0; }
+  if _MaintenancePriorityPending_; then
+    _Say_ 'SKIP: interactive DNS maintenance has priority; scheduled check deferred.'
+    return 0
+  fi
   _RotateScheduleLog_ || :
   _Say_ "SCHEDULE UTC: $(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || _Say_ 'clock-unavailable')"
   _CheckBootReadiness_ || return 0
   [ ! -e "$PENDING_TRANSACTION" ] && [ ! -e "$RECOVERY_HOLD" ] || {
     _Say_ 'SKIP: unresolved WAN transaction or recovery hold; no WAN switching'; return 0;
   }
-  if _SyncPreferredWAN_ && _ValidateConfiguration_ >/dev/null; then
-    _RunDNSHealthCheck_ scheduled
-    outcome=$?
-  else
-    outcome=$?
+  if _RunDNSHealthCheck_ scheduled; then outcome=0
+  else outcome=$?
   fi
   _Say_ "SCHEDULE UTC END: $(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || _Say_ 'clock-unavailable') result=$outcome"
   return "$outcome"
@@ -3494,8 +4826,8 @@ _StageTSVFile_() {
 _ChangeTSVFile_() (
   local file kind mode key value staged
   file="$1"; kind="$2"; mode="$3"; key="$4"; value="${5:-}"
-  _AcquireWANLock_ || { _Fail_ 'Another WAN operation is running'; return 1; }
-  trap '_ReleaseWANLock_ >/dev/null 2>&1 || :' EXIT HUP INT TERM
+  _AcquireConfigLock_ || { _Fail_ 'Another configuration commit is running'; return 1; }
+  trap '_ReleaseConfigLock_ >/dev/null 2>&1 || :' EXIT HUP INT TERM
   _CheckConfigurationSafety_ || return 1
   staged="$file.rg-stage.$$"
   [ ! -e "$staged" ] && [ ! -L "$staged" ] || return 1
@@ -3523,8 +4855,8 @@ _SetSetting_() {
     *) _Fail_ 'Unknown setting'; return 1 ;;
   esac
   (
-    _AcquireWANLock_ || { _Fail_ 'Another WAN operation is running'; return 1; }
-    trap '_ReleaseWANLock_ >/dev/null 2>&1 || :' EXIT HUP INT TERM
+    _AcquireConfigLock_ || { _Fail_ 'Another configuration commit is running'; return 1; }
+    trap '_ReleaseConfigLock_ >/dev/null 2>&1 || :' EXIT HUP INT TERM
     _CheckConfigurationSafety_ || return 1
     staged="$SETTINGS.rg-stage.$$"
     [ ! -e "$staged" ] && [ ! -L "$staged" ] || return 1
@@ -3610,7 +4942,7 @@ _ShowIntegrationSettingsMenu_() {
 
 _IsValidDNSCheck_() {
   _IsValidDomain_ "$1" && _IsValidRecordType_ "$2" && _IsValidRCODE_ "$3" &&
-    _IsValidAnswerCount_ "$4" && _IsSafeToken_ "$5"
+    _IsValidDNSAnswerCount_ "$4" && _IsSafeToken_ "$5"
 }
 
 _PromptDNSCheck_() {
@@ -3618,7 +4950,7 @@ _PromptDNSCheck_() {
   _Ask_ 'DNS hostname' "${1:-}" || return 1; qname="$RG_ANSWER"
   _Ask_ 'DNS record type (A/AAAA etc.)' "${2:-A}" || return 1; qtype="$RG_ANSWER"
   _Ask_ 'Expected RCODE' "${3:-NOERROR}" || return 1; rcode="$RG_ANSWER"
-  _Ask_ 'Expected answer count (ANY or number)' "${4:-ANY}" || return 1; count="$RG_ANSWER"
+  _Ask_ 'Expected answer count (ANY, AT_LEAST_1, or exact number)' "${4:-ANY}" || return 1; count="$RG_ANSWER"
   _Ask_ 'Expected record data (- to ignore)' "${5:--}" || return 1; rdata="$RG_ANSWER"
   _IsValidDNSCheck_ "$qname" "$qtype" "$rcode" "$count" "$rdata" || {
     _Fail_ 'Invalid DNS check fields'; return 1;
@@ -3713,8 +5045,8 @@ _InstallBackupPreset_() (
   _SetBackupPreset_ "$choice" || return 1
   id1="${RG_PRESET_IDPREFIX}1"
   id2="${RG_PRESET_IDPREFIX}2"
-  _AcquireWANLock_ || { _Fail_ 'Another WAN operation is running'; return 1; }
-  trap '_ReleaseWANLock_ >/dev/null 2>&1 || :' EXIT HUP INT TERM
+  _AcquireConfigLock_ || { _Fail_ 'Another configuration commit is running'; return 1; }
+  trap '_ReleaseConfigLock_ >/dev/null 2>&1 || :' EXIT HUP INT TERM
   _CheckConfigurationSafety_ || return 1
   _PrepareProviders_ || return 1
   if awk -F'|' -v h="$RG_PRESET_HOST" -v port=853 -v a="$RG_PRESET_IP1" -v b="$RG_PRESET_IP2" \
@@ -3752,7 +5084,7 @@ _ShowBackupResolversMenu_() {
   local choice id ip tls tport oldrow
   while :; do
     _ShowHeader_ 'Backup DoT Resolvers'
-    _Say_ '  ID | IPv4 | TLS authentication hostname | TLS port'
+    _Say_ '  ID | IPv4/IPv6 | TLS authentication hostname | TLS port'
     awk -F'|' '$1 !~ /^#/ && NF==4 {printf "  %s | %s | %s | %s\n",$1,$2,$3,$4}' "$EXTRA_PROVIDERS"
     _PrintMenuItem_ ad 'Add backup resolver (presets or custom)'
     _PrintMenuItem_ ch 'Change backup resolver'
@@ -3789,11 +5121,11 @@ EOF_RG_PROVIDER
           ip=''; tls=''; tport='853'
         fi
         _Say_ 'Enter e or exit at any prompt to cancel.'
-        _AskBackupField_ 'Resolver IPv4' "$ip" || continue; ip="$RG_ANSWER"
+        _AskBackupField_ 'Resolver IPv4/IPv6' "$ip" || continue; ip="$RG_ANSWER"
         _AskBackupField_ 'Certificate TLS authentication hostname' "$tls" || continue; tls="$RG_ANSWER"
         _AskBackupField_ 'Upstream TLS port' "${tport:-853}" || continue; tport="$RG_ANSWER"
-        if ! _IsValidID_ "$id" || ! _IsValidIPv4_ "$ip" || ! _IsValidDomain_ "$tls" || ! _IsValidTLSPort_ "$tport"; then
-          _Fail_ 'Invalid provider ID, IPv4, TLS name or port'; _PromptEnter_; continue
+        if ! _IsValidID_ "$id" || ! _IsValidIP_ "$ip" || ! _IsValidDomain_ "$tls" || ! _IsValidTLSPort_ "$tport"; then
+          _Fail_ 'Invalid provider ID, IPv4/IPv6, TLS name or port'; _PromptEnter_; continue
         fi
         case "$id" in wan[0-9]*) _Fail_ 'Resolver IDs beginning wan + number are reserved'; _PromptEnter_; continue;; esac
         if [ "$choice" = AD ]; then
@@ -3839,8 +5171,9 @@ _ShowConfigurationMenu_() {
 
 
 # Online update: GitHub-hosted version.txt and version-pinned single-script Release asset.
-# Only the installed script may change. Router NVRAM, policy, runtime services,
-# config, enrollment and transaction files are not overwritten by an update.
+# An update replaces the installed script and removes its temporary rollback
+# files. Router NVRAM, DNS policy, enrollment, and transaction state are not
+# modified by the update process.
 _FetchHTTPS_() {
   local url dest
   url="$1"; dest="$2"
@@ -3869,12 +5202,13 @@ _IsNewerVersion_() {
 # Development's version.txt stays a single line. Read the build tag from
 # the development script itself instead of adding a second manifest field.
 _ReadDevBuildTag_() {
-  local candidate buildtag
+  local candidate buildtag dev_script_url
+  dev_script_url="${1:-$UPDATE_DEV_SCRIPT_URL}"
   candidate="$RUNTIME/dev-script-check.$$"
   [ ! -e "$candidate" ] && [ ! -L "$candidate" ] || {
     _Fail_ 'Development script staging path already exists'; return 1;
   }
-  if ! _FetchHTTPS_ "$UPDATE_DEV_SCRIPT_URL" "$candidate"; then
+  if ! _FetchHTTPS_ "$dev_script_url" "$candidate"; then
     rm -f "$candidate"; return 1
   fi
   if [ "$(wc -c < "$candidate")" -gt 1048576 ] || ! sh -n "$candidate" ||
@@ -3902,12 +5236,27 @@ _IsNewerBuildTag_() {
 }
 
 _ReadReleaseManifest_() {
-  local manifest records
+  local manifest records requested_channel requested_manifest_url requested_dev_url
+  requested_channel="${1:-$UPDATE_CHANNEL}"
+  case "$requested_channel" in
+    development)
+      requested_manifest_url="$SCRIPT_URL_BASE/refs/heads/dev/version.txt"
+      requested_dev_url="$SCRIPT_URL_BASE/refs/heads/dev/resolvguard.sh"
+      ;;
+    stable)
+      requested_manifest_url="$SCRIPT_URL_BASE/refs/heads/main/version.txt"
+      requested_dev_url=''
+      ;;
+    *)
+      _Fail_ "Unsupported update channel: $requested_channel"
+      return 1
+      ;;
+  esac
   manifest="$RUNTIME/release-version.$$"
   [ ! -e "$manifest" ] && [ ! -L "$manifest" ] || {
     _Fail_ 'Update version staging path already exists'; return 1;
   }
-  if ! _FetchHTTPS_ "$UPDATE_MANIFEST_URL" "$manifest"; then
+  if ! _FetchHTTPS_ "$requested_manifest_url" "$manifest"; then
     rm -f "$manifest"; return 1
   fi
   records="$(awk 'END { print NR }' "$manifest")"
@@ -3920,9 +5269,10 @@ _ReadReleaseManifest_() {
   # Channel and asset URL are locally pinned: version.txt cannot redirect
   # downloads to an arbitrary host or asset name.
   RELEASE_VERSTAG=''
-  if [ "$UPDATE_CHANNEL" = development ]; then
-    RELEASE_SCRIPT_URL="$UPDATE_DEV_SCRIPT_URL"
-    _ReadDevBuildTag_ || return 1
+  RELEASE_CHANNEL="$requested_channel"
+  if [ "$requested_channel" = development ]; then
+    RELEASE_SCRIPT_URL="$requested_dev_url"
+    _ReadDevBuildTag_ "$requested_dev_url" || return 1
   else
     RELEASE_SCRIPT_URL="$RELEASE_URL_BASE/v$RELEASE_VERSION/$RELEASE_UPDATE_ASSET"
   fi
@@ -3952,16 +5302,29 @@ _UpdateSafetyPreflight_() {
   return 0
 }
 
+# Used by restore, update and uninstall after acquiring the WAN lock. The config
+# lock may be absent if its later acquisition failed; do not release it then.
+_CleanupMaintenanceLocks_() {
+  if [ "${RG_CONFIG_LOCK_ALREADY_HELD:-0}" = 1 ]; then
+    _ReleaseConfigLock_ >/dev/null 2>&1 || :
+    RG_CONFIG_LOCK_ALREADY_HELD=0
+  fi
+
+  _ReleaseWANLock_ >/dev/null 2>&1 || :
+  _ReleaseMaintenancePriority_ >/dev/null 2>&1 || :
+}
+
 _ApplyVerifiedUpdate_() (
   local stage newscript staged installed backup tempbackup
   umask 077
   _UpdateSafetyPreflight_ || exit 1
-  if ! _AcquireWANLock_; then
-    _Fail_ 'Another DNS operation is active; update deferred'
+  if ! _AcquireWANLockForMaintenance_; then
+    _Fail_ 'Unable to reserve WAN access for update'
     exit 1
   fi
-  # Protect against cron/manual operations during final script replacement.
-  trap '_ReleaseWANLock_ >/dev/null 2>&1 || :' EXIT
+  # Protect against cron/manual operations and synchronize the short script
+  # replacement with interactive configuration commits.
+  trap '_CleanupMaintenanceLocks_' EXIT
   trap 'exit 130' INT
   trap 'exit 143' HUP TERM
   _UpdateSafetyPreflight_ || exit 1
@@ -3987,7 +5350,7 @@ _ApplyVerifiedUpdate_() (
     grep -F 'amtmupdate)' "$newscript" >/dev/null 2>&1 || {
     rm -rf "$stage"; _Fail_ 'Incompatible script name, version, schema or updater interface'; exit 1;
   }
-  if [ "$UPDATE_CHANNEL" = development ]; then
+  if [ "$RELEASE_CHANNEL" = development ]; then
     grep -Fx 'SCRIPT_BRANCH="dev"' "$newscript" >/dev/null 2>&1 &&
       grep -Fx "readonly SCRIPT_VERSTAG=\"$RELEASE_VERSTAG\"" "$newscript" >/dev/null 2>&1 || {
       rm -rf "$stage"; _Fail_ 'Development update branch or build tag mismatch'; exit 1;
@@ -3997,49 +5360,163 @@ _ApplyVerifiedUpdate_() (
       rm -rf "$stage"; _Fail_ 'Release asset is not marked as stable'; exit 1;
     }
   fi
+  _AcquireConfigLock_ || {
+    rm -rf "$stage"
+    _Fail_ 'Configuration commit in progress; script replacement deferred'
+    exit 1
+  }
+  RG_CONFIG_LOCK_ALREADY_HELD=1
+  _UpdateSafetyPreflight_ || exit 1
   installed="$ROOT/resolvguard.sh"
   staged="$ROOT/.resolvguard.sh.update.$$"
   tempbackup="$STATE_DIR/.updater-previous.sh.$$"
   backup="$STATE_DIR/updater-previous.sh"
+
+  # The replacement is staged beside the installed script so the final move
+  # stays on the same filesystem. The old script is retained only until the
+  # new installation has been verified (or a failed installation restored).
   for path in "$staged" "$tempbackup"; do
-    [ ! -e "$path" ] && [ ! -L "$path" ] || {
-      rm -rf "$stage"; _Fail_ 'Update destination staging path occupied'; exit 1;
-    }
+    if [ -e "$path" ] || [ -L "$path" ]; then
+      rm -rf "$stage"
+      _Fail_ 'Update destination staging path occupied'
+      exit 1
+    fi
   done
-  [ ! -L "$backup" ] || {
-    rm -rf "$stage"; _Fail_ 'Existing updater backup is unsafe'; exit 1;
-  }
-  cp "$newscript" "$staged" && chmod 755 "$staged" &&
-    cp "$installed" "$tempbackup" && chmod 600 "$tempbackup" || {
-    rm -f "$staged" "$tempbackup"; rm -rf "$stage"
-    _Fail_ 'Cannot stage new script or preserve old script'; exit 1;
-  }
-  mv -f "$tempbackup" "$backup" || {
-    rm -f "$staged" "$tempbackup"; rm -rf "$stage"
-    _Fail_ 'Cannot save prior version'; exit 1;
-  }
-  if ! mv -f "$staged" "$installed"; then
-    rm -f "$staged"; rm -rf "$stage"
-    _Fail_ 'Atomic script replacement failed; original installation retained'
+
+  # Previous builds saved a persistent updater-previous.sh. Accept an ordinary
+  # legacy file so that a successful update can retire it, but refuse unsafe
+  # state entries rather than deleting unknown files or following symlinks.
+  if [ -L "$backup" ]; then
+    rm -rf "$stage"
+    _Fail_ 'Existing updater backup is a symbolic link'
     exit 1
   fi
-  # Post-replacement byte comparison; restore the previous script on mismatch.
-  if ! cmp -s "$installed" "$newscript"; then
-    cp "$backup" "$staged" && chmod 755 "$staged" && mv -f "$staged" "$installed" || {
-      _Fail_ 'CRITICAL: update verification and rollback failed; prior script retained at updater-previous.sh'
-      rm -rf "$stage"; exit 1;
-    }
-    rm -rf "$stage"; _Fail_ 'Update verification failed; previous script restored'; exit 1
+
+  if [ -e "$backup" ] && [ ! -f "$backup" ]; then
+    rm -rf "$stage"
+    _Fail_ 'Existing updater backup is not a regular file'
+    exit 1
   fi
-  rm -rf "$stage" || :
-  if [ "$UPDATE_CHANNEL" = development ]; then
+
+  if ! cp "$newscript" "$staged" || ! chmod 755 "$staged" ||
+     ! cp "$installed" "$tempbackup" || ! chmod 600 "$tempbackup"; then
+    rm -f "$staged" "$tempbackup"
+    rm -rf "$stage"
+    _Fail_ 'Cannot stage new script or temporarily preserve old script'
+    exit 1
+  fi
+
+  if ! mv -f "$staged" "$installed"; then
+    rm -f "$staged"
+    rm -rf "$stage"
+
+    # Preserve the temporary copy when replacement fails unexpectedly: the
+    # installed script may no longer be identical to the previous version.
+    if cmp -s "$installed" "$tempbackup"; then
+      rm -f "$tempbackup" || :
+      _Fail_ 'Atomic script replacement failed; original installation retained'
+    else
+      _Fail_ "CRITICAL: script replacement failed; previous script retained at $tempbackup"
+    fi
+    exit 1
+  fi
+
+  # A mismatch after replacement must restore the previous script before any
+  # rollback file is deleted. Keep that file if restoration cannot be proven.
+  if ! cmp -s "$installed" "$newscript"; then
+    if cp "$tempbackup" "$staged" && chmod 755 "$staged" &&
+       mv -f "$staged" "$installed" && cmp -s "$installed" "$tempbackup"; then
+      rm -f "$tempbackup" || _Fail_ "Temporary rollback cleanup failed: $tempbackup"
+      rm -rf "$stage"
+      _Fail_ 'Update verification failed; previous script restored and verified'
+    else
+      rm -f "$staged"
+      rm -rf "$stage"
+      _Fail_ "CRITICAL: update verification and rollback failed; prior script retained at $tempbackup"
+    fi
+    exit 1
+  fi
+
+  # No permanent previous-version backup is retained after success. Clean up
+  # the temporary rollback file and the legacy persistent file (if any).
+  # A failed removal is reported as incomplete maintenance, never as a clean
+  # success, even though the newly installed script already passed verification.
+  if ! rm -f "$tempbackup"; then
+    rm -rf "$stage"
+    _Fail_ "Update installed and verified, but temporary rollback cleanup failed: $tempbackup"
+    exit 1
+  fi
+
+  if [ -f "$backup" ] && ! rm -f "$backup"; then
+    rm -rf "$stage"
+    _Fail_ "Update installed and verified, but legacy backup cleanup failed: $backup"
+    exit 1
+  fi
+
+  if ! rm -rf "$stage"; then
+    _Fail_ "Update installed and verified, but download staging cleanup failed: $stage"
+    exit 1
+  fi
+
+  if [ "$RELEASE_CHANNEL" = development ]; then
     _Say_ "ResolvGuard development update: ${SCRIPT_VERSION}_${SCRIPT_VERSTAG} -> ${RELEASE_VERSION}_${RELEASE_VERSTAG}"
   else
     _Say_ "ResolvGuard updated: $SCRIPT_VERSION -> $RELEASE_VERSION"
   fi
-  _Say_ "Previous version saved: $backup"
+  _Say_ 'Update installed and verified successfully.'
+  _Say_ 'Temporary update files cleaned up.'
   exit 0
 )
+
+# MerlinAU-style CLI: "develop" installs the newest development script;
+# "stable" installs the current stable Release asset (even if that is an
+# older version). The installed script's SCRIPT_BRANCH marker persists the
+# selected channel; subsequent amtmupdate operations follow that channel.
+# The normal verified updater lock/rollback path is reused for both commands.
+_SwitchReleaseChannel_() {
+  local target_channel
+
+  case "${1:-}" in
+    develop)
+      target_channel=development
+      ;;
+    stable)
+      target_channel=stable
+      ;;
+    *)
+      _Fail_ 'Usage: resolvguard [develop|stable]'
+      return 1
+      ;;
+  esac
+
+  if ! _UpdateSafetyPreflight_; then
+    return 1
+  fi
+
+  if [ "$UPDATE_CHANNEL" = "$target_channel" ]; then
+    _Say_ "Already using the $target_channel channel; checking for updates."
+    _ManageOnlineUpdate_ update
+    return $?
+  fi
+
+  if ! _ReadReleaseManifest_ "$target_channel"; then
+    return 1
+  fi
+
+  # A development build may have a higher version than published stable.
+  # An explicit channel change must never silently downgrade it.
+  if _IsNewerVersion_ "$SCRIPT_VERSION" "$RELEASE_VERSION"; then
+    _Say_ "NOTICE: $target_channel currently offers v$RELEASE_VERSION, older than installed v$SCRIPT_VERSION."
+
+    if ! _ConfirmYesNo_ 'Install the older release to switch channels?'; then
+      _Say_ 'Channel switch cancelled; installed script unchanged.'
+      return 1
+    fi
+  fi
+
+  _Say_ "Switching ResolvGuard from $UPDATE_CHANNEL to $target_channel."
+  _ApplyVerifiedUpdate_
+}
 
 _ManageOnlineUpdate_() {
   local mode
@@ -4170,6 +5647,12 @@ _UninstallNeverEnrolled_() {
 
 _UninstallLocked_() {
   local never_enrolled
+  # Admission is closed by the configuration lock held by _DoUnInstallation_.
+  # Refuse deleting the add-on while an independent read-only inspector lives.
+  if _ActiveInspectorSessions_; then
+    _Fail_ 'An independent DNS inspector is still active; finish inspection before uninstall'
+    return 1
+  fi
   # Recovery of an already journaled managed switch takes precedence over
   # external synchronization. Do not strand an otherwise recoverable uninstall.
   if [ -e "$PENDING_TRANSACTION" ] || [ -L "$PENDING_TRANSACTION" ] ||
@@ -4235,20 +5718,38 @@ _DoUnInstallation_() {
     _ConfirmYesNo_ 'Uninstall ResolvGuard? (restore managed DNS if needed)' || return 1
   fi
 
-  if ! _AcquireWANLock_; then
-    _Fail_ 'Another WAN DNS operation holds the lock; uninstall aborted'
+  if ! _AcquireWANLockForMaintenance_; then
+    _Fail_ 'Unable to reserve WAN access for uninstall'
     return 1
   fi
-  trap '_ReleaseWANLock_ >/dev/null 2>&1 || :' EXIT
+  trap '_CleanupMaintenanceLocks_' EXIT
   trap 'exit 130' INT
   trap 'exit 143' HUP TERM
-  if ! _UninstallLocked_; then
-    _ReleaseWANLock_ >/dev/null 2>&1 || :
+  # A scheduled probe may be active, but an uninstall must acquire both
+  # locks before removing any shared installation or state files.
+  if ! _AcquireConfigLock_; then
+    _Fail_ 'Configuration commit in progress; uninstall deferred'
+    _CleanupMaintenanceLocks_
     trap - EXIT HUP INT TERM
     return 1
   fi
+  RG_CONFIG_LOCK_ALREADY_HELD=1
+  if ! _UninstallLocked_; then
+    _CleanupMaintenanceLocks_
+    trap - EXIT HUP INT TERM
+    return 1
+  fi
+  if ! _ReleaseConfigLock_; then
+    _Fail_ 'Uninstall completed, but configuration lock release failed; inspect runtime state'
+    exit 1
+  fi
+  RG_CONFIG_LOCK_ALREADY_HELD=0
   if ! _ReleaseWANLock_; then
     _Fail_ 'Add-on removed but WAN lock release failed; inspect runtime lock manually'
+    exit 1
+  fi
+  if ! _ReleaseMaintenancePriority_; then
+    _Fail_ 'Add-on removed but maintenance priority release failed; inspect runtime state'
     exit 1
   fi
   trap - EXIT HUP INT TERM
@@ -4461,10 +5962,25 @@ _ShowAdvancedSettingsMenu_() {
     case "$choice" in
       RE) _RestorePreferredDNS_; _PromptEnter_ ;;
       DP) _EnsureDigDependency_; _PromptEnter_ ;;
-      UP) if _ManageOnlineUpdate_ status && [ "${UPDATE_AVAILABLE:-0}" = 1 ]; then
-           _ConfirmYesNo_ 'Install available update?' && _ManageOnlineUpdate_ update || :
-         fi
-         _PromptEnter_ ;;
+      UP)
+        if _ManageOnlineUpdate_ status && [ "${UPDATE_AVAILABLE:-0}" = 1 ]; then
+          if _ConfirmYesNo_ 'Install available update?'; then
+            if _ManageOnlineUpdate_ update; then
+              # The verified updater runs in a subshell. Its WAN/configuration
+              # locks and cleanup traps finish before control returns here.
+              # Replace this running menu rather than displaying the old
+              # SCRIPT_VERSTAG after installing a newer script on disk.
+              _Say_ 'Restarting ResolvGuard...'
+              exec /bin/sh "$ROOT/resolvguard.sh" menu
+
+              # exec does not return on success. This is only a fallback if
+              # the shell cannot start the installed script.
+              _Fail_ 'Unable to restart the updated ResolvGuard script'
+            fi
+          fi
+        fi
+        _PromptEnter_
+        ;;
       UN) _DoUnInstallation_; _PromptEnter_ ;;
       E|EXIT) return 0 ;;
       *) _ShowInvalidSelection_ ;;
@@ -4482,51 +5998,124 @@ _DescribeAlternatePools_() {
   ' "$POOLS"
 }
 
+# Keep status values aligned and highlight their meaning only in a terminal.
+# _ShowHeader_ has already initialized the menu palette. The same function
+# emits plain text when stdout is redirected or NO_COLOR is set.
+_PrintQuickStatusRow_() {
+  local label value colour
+
+  label="$1"
+  value="$2"
+  colour="${3:-}"
+
+  printf '  %-23s %s%s%s\n' "$label" "$colour" "$value" "$RG_RESET"
+}
+
 _ShowQuickStatus_() {
-  local active mode approval pool_summary sync_ok=1
+  local active mode approval pool_summary sync_ok
+  local pool_colour mode_colour approval_colour
+
+  sync_ok=1
   _ShowHeader_ 'Protection Status'
+
+  # A concurrent DNS operation must not cause the menu to reclaim a WAN lock.
+  # Continue to show a read-only snapshot when synchronization is unavailable.
   if ! _SyncPreferredWAN_; then
     sync_ok=0
-    _Say_ '  NOTICE: DNS operation active or WAN sync unverified; read-only status follows.'
+    printf '\n  %s%sNOTICE: STATUS TEMPORARILY LIMITED%s\n' \
+      "$RG_YELLOW" "$RG_BOLD" "$RG_RESET"
+    _Say_ '  DNS operation active or WAN synchronization unverified.'
+    _Say_ '  Showing read-only status; alternate pool discovery is deferred.'
   fi
+
+  _Say_ ''
+
   if [ -r "$PREF_RULELIST" ] && [ -r "$PREF_PROVIDERS" ]; then
     active="$(_GetActiveWANPool_ 2>/dev/null)" || active='UNKNOWN / EXTERNAL CHANGE'
+
     if [ "$sync_ok" -eq 0 ]; then
       active="$(_GetWANLockDisplay_ 2>/dev/null)" || active='WAN NOT VERIFIED'
     fi
-    printf '  %-23s%s\n' 'WAN DNS pool:' "$active"
-    _Say_ '  Preferred snapshot:    SAVED'
+
+    case "$active" in
+      preferred)
+        pool_colour="$RG_GREEN"
+        ;;
+      filtered1|filtered2)
+        pool_colour="$RG_YELLOW"
+        ;;
+      *'PROGRESS'*|*'NOT VERIFIED'*)
+        pool_colour="$RG_YELLOW"
+        ;;
+      *)
+        pool_colour="$RG_RED"
+        ;;
+    esac
+
+    _PrintQuickStatusRow_ 'WAN DNS pool:' "$active" "$pool_colour"
+    _PrintQuickStatusRow_ 'Preferred snapshot:' 'SAVED' "$RG_GREEN"
   else
-    _Say_ '  Preferred snapshot:    NOT SET UP'
+    _PrintQuickStatusRow_ 'WAN DNS pool:' 'NOT ENROLLED' "$RG_YELLOW"
+    _PrintQuickStatusRow_ 'Preferred snapshot:' 'NOT SET UP' "$RG_RED"
   fi
+
   if [ ! -r "$SCHEDULE_MARKER" ]; then
     mode='INACTIVE'
+    mode_colour="$RG_YELLOW"
   elif _CheckAutomaticFailoverAuthorization_ >/dev/null 2>&1; then
     mode='AUTOMATIC FAILOVER ON'
+    mode_colour="$RG_GREEN"
   elif [ -r "$AUTO_FAILOVER_MARKER" ]; then
     mode='POLICY SAFETY HOLD'
+    mode_colour="$RG_RED"
   else
     mode='MONITORING ONLY'
+    mode_colour="$RG_CYAN"
   fi
-  _Say_ "  Protection:            $mode"
+  _PrintQuickStatusRow_ 'Protection:' "$mode" "$mode_colour"
+
   if [ -r "$SCHEDULE_MARKER" ]; then
-    _Say_ "  Monitoring:            EVERY $SCHEDULE_INTERVAL_MINUTES MIN"
+    _PrintQuickStatusRow_ 'Monitoring:' \
+      "EVERY $SCHEDULE_INTERVAL_MINUTES MIN" "$RG_GREEN"
   else
-    _Say_ '  Monitoring:            OFF'
+    _PrintQuickStatusRow_ 'Monitoring:' 'OFF' "$RG_YELLOW"
   fi
+
   approval="$(_GetPolicyApprovalState_ 2>/dev/null)" || :
-  case "$approval" in VALID\ \(*) approval=VALID ;; esac
-  _Say_ "  Policy approval:       ${approval:-UNKNOWN}"
+  case "$approval" in
+    VALID\ \(*)
+      approval='VALID'
+      approval_colour="$RG_GREEN"
+      ;;
+    MISSING*)
+      approval_colour="$RG_YELLOW"
+      ;;
+    *)
+      approval_colour="$RG_RED"
+      ;;
+  esac
+  _PrintQuickStatusRow_ 'Policy approval:' "${approval:-UNKNOWN}" "$approval_colour"
+
   if [ "$sync_ok" -eq 0 ]; then
-    _Say_ '  Alternate pools:       BUSY / NOT VERIFIED'
+    _PrintQuickStatusRow_ 'Alternate pools:' 'BUSY / NOT VERIFIED' "$RG_YELLOW"
   elif _PrepareProviders_ >/dev/null 2>&1 && _PrepareResolverPools_; then
     pool_summary="$(_DescribeAlternatePools_)" || pool_summary='UNAVAILABLE'
-    _Say_ "  Alternate pools:       $pool_summary"
+    _PrintQuickStatusRow_ 'Alternate pools:' "$pool_summary" "$RG_CYAN"
   else
-    _Say_ '  Alternate pools:       NOT READY'
+    _PrintQuickStatusRow_ 'Alternate pools:' 'NOT READY' "$RG_RED"
   fi
+
+  if [ "$sync_ok" -eq 1 ]; then
+    case "$active" in
+      filtered1|filtered2)
+        printf '\n  %sNOTE:%s A filtered pool excludes one or more preferred resolvers.\n' \
+          "$RG_YELLOW" "$RG_RESET"
+        _Say_ '  See Advanced Options > Monitoring & Diagnostics > Full Technical Status.'
+        ;;
+    esac
+  fi
+
   _Say_ ''
-  _Say_ 'Advanced Options: logs, policy, recovery.'
 }
 
 _ConfigureQuickBackup_() {
@@ -4605,10 +6194,33 @@ _RunQuickSetupWizard_() {
       _Fail_ 'Enable Strict DNS Privacy in ASUSWRT-Merlin before setup'; return 1; }
   _PrepareProviders_ || return 1
   if [ ! -r "$PREF_RULELIST" ] || [ ! -r "$PREF_PROVIDERS" ]; then
+    # Never offer a partial preferred/restore point: match the entire live
+    # NVRAM resolver list to the active firmware-generated Stubby identities.
+    local verified configured
+    verified="$RUNTIME/quicksetup-verified-$$"
+    configured="$RUNTIME/quicksetup-configured-$$"
+    if ! _BuildLivePreferredProviders_ "$(_ReadWANRulelist_)" "$verified"; then
+      rm -f "$verified"
+      _Fail_ 'Complete IPv4/IPv6 preferred DNS could not be verified; enrollment refused'
+      return 1
+    fi
+
+    awk -F'|' '
+      $1 ~ /^wan[0-9]+$/ {
+        print
+      }
+    ' "$PROVIDERS" > "$configured"
+
+    if ! cmp -s "$verified" "$configured"; then
+      rm -f "$verified" "$configured"
+      _Fail_ 'Configured Stubby and WAN preferred resolver lists differ; enrollment refused'
+      return 1
+    fi
+    rm -f "$verified" "$configured"
     printf '  %sCurrent router DNS (Strict DoT):%s\n' "$RG_BOLD" "$RG_RESET"
     awk -F'|' -v col="$RG_CYAN" -v reset="$RG_RESET" \
-      '$1 ~ /^wan[0-9]+$/ {printf "    %s%-15s%s %s\n",col,$2,reset,$3}' "$PROVIDERS"
-    _ConfirmYesNo_ 'Use these as preferred DNS (and restore point)?' || return 1
+      '$1 ~ /^wan[0-9]+$/ {printf "    %s%-39s%s %s\n",col,$2,reset,$3}' "$PROVIDERS"
+    _ConfirmYesNo_ 'Use ALL these as preferred DNS (and restore point)?' || return 1
     _EnrollPreferredDNS_ >/dev/null || return 1
     printf '  %sPreferred DNS saved.%s\n' "$RG_GREEN" "$RG_RESET"
   else
@@ -4622,13 +6234,13 @@ _RunQuickSetupWizard_() {
   _ShowSetupStep_ 3 'DNS CHECKS & PROTECTION'
   _InitializeDefaultDNSPolicy_ || return 1
   if awk -F'|' '
-      $0 !~ /^#/ && NF {n++; if ($0 != "example.com|A|NOERROR|ANY|-" &&
-        $0 != "example.com|AAAA|NOERROR|ANY|-") bad=1}
+      $0 !~ /^#/ && NF {n++; if ($0 != "a.root-servers.net|A|NOERROR|AT_LEAST_1|-" &&
+        $0 != "a.root-servers.net|AAAA|NOERROR|ANY|-") bad=1}
       END {exit !(n>=1 && n<=2 && !bad)}' "$CHECKS"; then
-    if grep -Fqx 'example.com|AAAA|NOERROR|ANY|-' "$CHECKS"; then
-      _Say_ '  Health checks: example.com (A, AAAA)'
+    if grep -Fqx 'a.root-servers.net|AAAA|NOERROR|ANY|-' "$CHECKS"; then
+      _Say_ '  Health checks: a.root-servers.net (A at least 1, AAAA RCODE only)'
     else
-      _Say_ '  Health checks: example.com (A)'
+      _Say_ '  Health checks: a.root-servers.net (A at least 1)'
     fi
   else
     _Say_ '  Your saved DNS health checks will be used.'
@@ -4638,6 +6250,11 @@ _RunQuickSetupWizard_() {
       _Say_ '  No changes saved; existing checks will be used.'
     }
   fi
+  # Disclose domain-scoped DNS bypasses before requesting approval for
+  # automatic WAN switching. Interactive SSH users must acknowledge the
+  # warning; noninteractive callers receive plain text without a pause.
+  _ShowDNSMasqScopedSetupWarning_
+
   if [ -r "$AUTO_FAILOVER_MARKER" ] && _CheckAutomaticFailoverAuthorization_ >/dev/null 2>&1; then
     printf '  %sAutomatic failover already enabled.%s\n' "$RG_GREEN" "$RG_RESET"
     return 0
@@ -4819,7 +6436,7 @@ _MainMenu_() {
 # Direct CLI operations on the installed path must not bypass the installer.
 # Boot and scheduled jobs must never prompt for dependencies or install Entware.
 case "${1:-menu}" in
-  install|menu|uninstall|amtmupdate|help|-h|--help) : ;;
+  install|menu|uninstall|amtmupdate|develop|stable|help|-h|--help) : ;;
   startup|scheduled-check)
     _IsInstallationComplete_ || { _Fail_ 'Install ResolvGuard before enabling unattended operation'; exit 1; } ;;
   *) if [ "$ROOT" = "$INSTALL_ROOT" ]; then
@@ -4843,22 +6460,27 @@ case "${1:-menu}" in
   dependencies|deps) _EnsureDigDependency_ ;;
   uninstall) _DoUnInstallation_ ;;
   amtmupdate) _ManageOnlineUpdate_ "${2:-update}" ;;
+  develop|stable) _SwitchReleaseChannel_ "$1" ;;
   schedule) _ManageScheduledMonitoring_ "${2:-status}" ;;
   policy) _ManagePolicy_ "${2:-status}" ;;
   startup) _ScheduleStartup_ ;;
   scheduled-check) _RunScheduledCheck_ ;;
-  validate) _ValidateConfiguration_ ;;
+  validate) (
+    PROVIDERS="$RUNTIME/providers-validation-$$.tsv"
+    trap 'rm -f "$RUNTIME/providers-validation-$$.tsv"' EXIT HUP INT TERM
+    _ValidateConfiguration_
+  ) ;;
   enroll) _EnrollPreferredDNS_ ;;
   restore) _RestorePreferredDNS_ ;;
   pools) _SyncPreferredWAN_ && _PrepareProviders_ && _PrepareResolverPools_ && cat "$POOLS" ;;
   discover) _DiscoverResolvers_ ;;
-  check) _SyncPreferredWAN_ && _ValidateConfiguration_ >/dev/null && _RunDNSHealthCheck_ ;;
-  probe) _SyncPreferredWAN_ && _InspectDNS_ "${2:-}" "${3:-BOTH}" "${4:-all}" "${5:-summary}" ;;
+  check) _RunDNSHealthCheck_ ;;
+  probe) _InspectDNS_ "${2:-}" "${3:-BOTH}" "${4:-all}" "${5:-summary}" ;;
   status) _ShowStatus_ ;;
   help|-h|--help)
     cat <<HELP
 ResolvGuard v$SCRIPT_VERSION (WAN DNS-over-TLS monitoring and failover)
-Usage: sh $ROOT/resolvguard.sh [install|menu|quick-setup|dependencies|configure|uninstall|discover|validate|enroll|pools|check|status|restore|probe <hostname-or-URL> [BOTH|TYPE] [provider-id|all] [summary|full]|schedule [status|enable|disable|logs]|startup|policy [status|approve|revoke]|amtmupdate [check|status|update]]
+Usage: sh $ROOT/resolvguard.sh [install|menu|quick-setup|dependencies|configure|uninstall|discover|validate|enroll|pools|check|status|restore|probe <hostname-or-URL> [BOTH|TYPE] [provider-id|all] [summary|full]|schedule [status|enable|disable|logs]|startup|policy [status|approve|revoke]|amtmupdate [check|status|update]|develop|stable]
 
 No arguments: if installation is needed, install and offer Quick Setup once; otherwise open the SSH menu. An incomplete setup remains selectable from the menu. e or exit leaves the current menu.
 install verifies prerequisites (including optional bind-dig installation), initializes missing config, and publishes the main script only after preparation succeeds.
@@ -4880,6 +6502,8 @@ On boot, startup re-registers cron and reconciles known WAN state without WAN wr
 Confirmed failed WAN endpoints may be temporarily excluded; known healthy original endpoints return after sustained successful checks.
 Stable updates read GitHub main/version.txt and use version-pinned GitHub Release assets.
 Development builds read dev/version.txt and use the raw dev script; SCRIPT_VERSTAG identifies same-version revisions.
+Run develop or stable to fetch, validate, and switch to the corresponding channel. A switch to an older stable version asks for confirmation.
+The chosen channel persists in the downloaded script's SCRIPT_BRANCH marker; subsequent updates stay on that channel.
 Run amtmupdate status to check for a newer release; run amtmupdate update to install it.
 amtmupdate check is the offline amtm capability probe; amtmupdate defaults to update.
 Updates preserve configuration, enrollment, DNS, and recovery state; unsafe WAN ownership blocks updating.
