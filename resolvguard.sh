@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.0
-readonly SCRIPT_VERSTAG="26111502"
+readonly SCRIPT_VERSTAG="26111503"
 readonly SCRIPT_NAME="ResolvGuard"
 ## Set to "master" for Production Releases ##
 SCRIPT_BRANCH="dev"
@@ -5646,51 +5646,125 @@ _DescribeAlternatePools_() {
   ' "$POOLS"
 }
 
+# Keep status values aligned and highlight their meaning only in a terminal.
+# _ShowHeader_ has already initialized the menu palette. The same function
+# emits plain text when stdout is redirected or NO_COLOR is set.
+_PrintQuickStatusRow_() {
+  local label value colour
+
+  label="$1"
+  value="$2"
+  colour="${3:-}"
+
+  printf '  %-23s %s%s%s\n' "$label" "$colour" "$value" "$RG_RESET"
+}
+
 _ShowQuickStatus_() {
-  local active mode approval pool_summary sync_ok=1
+  local active mode approval pool_summary sync_ok
+  local pool_colour mode_colour approval_colour
+
+  sync_ok=1
   _ShowHeader_ 'Protection Status'
+
+  # A concurrent DNS operation must not cause the menu to reclaim a WAN lock.
+  # Continue to show a read-only snapshot when synchronization is unavailable.
   if ! _SyncPreferredWAN_; then
     sync_ok=0
-    _Say_ '  NOTICE: DNS operation active or WAN sync unverified; read-only status follows.'
+    printf '\n  %s%sNOTICE: STATUS TEMPORARILY LIMITED%s\n' \
+      "$RG_YELLOW" "$RG_BOLD" "$RG_RESET"
+    _Say_ '  DNS operation active or WAN synchronization unverified.'
+    _Say_ '  Showing read-only status; alternate pool discovery is deferred.'
   fi
+
+  _Say_ ''
+
   if [ -r "$PREF_RULELIST" ] && [ -r "$PREF_PROVIDERS" ]; then
     active="$(_GetActiveWANPool_ 2>/dev/null)" || active='UNKNOWN / EXTERNAL CHANGE'
+
     if [ "$sync_ok" -eq 0 ]; then
       active="$(_GetWANLockDisplay_ 2>/dev/null)" || active='WAN NOT VERIFIED'
     fi
-    printf '  %-23s%s\n' 'WAN DNS pool:' "$active"
-    _Say_ '  Preferred snapshot:    SAVED'
+
+    case "$active" in
+      preferred)
+        pool_colour="$RG_GREEN"
+        ;;
+      filtered1|filtered2)
+        pool_colour="$RG_YELLOW"
+        ;;
+      *'PROGRESS'*|*'NOT VERIFIED'*)
+        pool_colour="$RG_YELLOW"
+        ;;
+      *)
+        pool_colour="$RG_RED"
+        ;;
+    esac
+
+    _PrintQuickStatusRow_ 'WAN DNS pool:' "$active" "$pool_colour"
+    _PrintQuickStatusRow_ 'Preferred snapshot:' 'SAVED' "$RG_GREEN"
   else
-    _Say_ '  Preferred snapshot:    NOT SET UP'
+    _PrintQuickStatusRow_ 'WAN DNS pool:' 'NOT ENROLLED' "$RG_YELLOW"
+    _PrintQuickStatusRow_ 'Preferred snapshot:' 'NOT SET UP' "$RG_RED"
   fi
+
   if [ ! -r "$SCHEDULE_MARKER" ]; then
     mode='INACTIVE'
+    mode_colour="$RG_YELLOW"
   elif _CheckAutomaticFailoverAuthorization_ >/dev/null 2>&1; then
     mode='AUTOMATIC FAILOVER ON'
+    mode_colour="$RG_GREEN"
   elif [ -r "$AUTO_FAILOVER_MARKER" ]; then
     mode='POLICY SAFETY HOLD'
+    mode_colour="$RG_RED"
   else
     mode='MONITORING ONLY'
+    mode_colour="$RG_CYAN"
   fi
-  _Say_ "  Protection:            $mode"
+  _PrintQuickStatusRow_ 'Protection:' "$mode" "$mode_colour"
+
   if [ -r "$SCHEDULE_MARKER" ]; then
-    _Say_ "  Monitoring:            EVERY $SCHEDULE_INTERVAL_MINUTES MIN"
+    _PrintQuickStatusRow_ 'Monitoring:' \
+      "EVERY $SCHEDULE_INTERVAL_MINUTES MIN" "$RG_GREEN"
   else
-    _Say_ '  Monitoring:            OFF'
+    _PrintQuickStatusRow_ 'Monitoring:' 'OFF' "$RG_YELLOW"
   fi
+
   approval="$(_GetPolicyApprovalState_ 2>/dev/null)" || :
-  case "$approval" in VALID\ \(*) approval=VALID ;; esac
-  _Say_ "  Policy approval:       ${approval:-UNKNOWN}"
+  case "$approval" in
+    VALID\ \(*)
+      approval='VALID'
+      approval_colour="$RG_GREEN"
+      ;;
+    MISSING*)
+      approval_colour="$RG_YELLOW"
+      ;;
+    *)
+      approval_colour="$RG_RED"
+      ;;
+  esac
+  _PrintQuickStatusRow_ 'Policy approval:' "${approval:-UNKNOWN}" "$approval_colour"
+
   if [ "$sync_ok" -eq 0 ]; then
-    _Say_ '  Alternate pools:       BUSY / NOT VERIFIED'
+    _PrintQuickStatusRow_ 'Alternate pools:' 'BUSY / NOT VERIFIED' "$RG_YELLOW"
   elif _PrepareProviders_ >/dev/null 2>&1 && _PrepareResolverPools_; then
     pool_summary="$(_DescribeAlternatePools_)" || pool_summary='UNAVAILABLE'
-    _Say_ "  Alternate pools:       $pool_summary"
+    _PrintQuickStatusRow_ 'Alternate pools:' "$pool_summary" "$RG_CYAN"
   else
-    _Say_ '  Alternate pools:       NOT READY'
+    _PrintQuickStatusRow_ 'Alternate pools:' 'NOT READY' "$RG_RED"
   fi
+
+  if [ "$sync_ok" -eq 1 ]; then
+    case "$active" in
+      filtered1|filtered2)
+        printf '\n  %sNOTE:%s A filtered pool excludes one or more preferred resolvers.\n' \
+          "$RG_YELLOW" "$RG_RESET"
+        _Say_ '  See Advanced Options > Monitoring & Diagnostics > Full Technical Status.'
+        ;;
+    esac
+  fi
+
   _Say_ ''
-  _Say_ 'Advanced Options: logs, policy, recovery.'
+  printf '  %sAdvanced Options:%s logs, policy, recovery.\n' "$RG_CYAN" "$RG_RESET"
 }
 
 _ConfigureQuickBackup_() {
