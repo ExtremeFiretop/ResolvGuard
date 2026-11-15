@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.0
-readonly SCRIPT_VERSTAG="26111402"
+readonly SCRIPT_VERSTAG="26111403"
 readonly SCRIPT_NAME="ResolvGuard"
 ## Set to "master" for Production Releases ##
 SCRIPT_BRANCH="dev"
@@ -1651,6 +1651,108 @@ _GetFilteredRulelist_() {
   printf '%s\n' "$value"
 }
 
+# Compare a managed subset against the exact enrolled ASUS WAN rulelist.
+# Match complete serialized records, including any SPKI pin, but return only
+# the endpoint identity for display. Pins must not be copied into syslog.
+_ListExcludedPreferredDNSMembers_() {
+  local active preferred
+
+  active="$1"
+
+  if [ ! -s "$PREF_RULELIST" ] || [ -L "$PREF_RULELIST" ]; then
+    return 1
+  fi
+
+  preferred="$(cat "$PREF_RULELIST")" || return 1
+
+  awk -v preferred="$preferred" -v active="$active" '
+    BEGIN {
+      active_count = split(active, active_members, "<")
+      preferred_count = split(preferred, preferred_members, "<")
+
+      for (i = 2; i <= active_count; i++) {
+        active_inventory[active_members[i]]++
+      }
+
+      for (i = 2; i <= preferred_count; i++) {
+        entry = preferred_members[i]
+
+        if (active_inventory[entry] > 0) {
+          active_inventory[entry]--
+          continue
+        }
+
+        field_count = split(entry, fields, ">")
+        if (field_count != 3 && field_count != 4) {
+          exit 1
+        }
+
+        port = fields[2]
+        if (port == "") {
+          port = "853"
+        }
+
+        printf "%s|%s|%s\n", fields[1], port, fields[3]
+      }
+    }
+  '
+}
+
+# Emit details only after a verified WAN switch (not on each cron probe).
+# filtered1/filtered2 are rotating state labels, not permanent server lists.
+_LogFilteredDNSMembership_() {
+  local old_pool new_pool previous desired excluded count active_count preferred_count
+  local address port tls_hostname
+
+  old_pool="$1"
+  new_pool="$2"
+  previous="$3"
+  desired="$4"
+
+  case "$new_pool" in
+    filtered1|filtered2)
+      excluded="$(_ListExcludedPreferredDNSMembers_ "$desired")" || return 1
+      ;;
+    preferred)
+      case "$old_pool" in
+        filtered1|filtered2)
+          excluded="$(_ListExcludedPreferredDNSMembers_ "$previous")" || return 1
+          ;;
+        *)
+          return 0
+          ;;
+      esac
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+
+  count="$(printf '%s\n' "$excluded" | awk 'NF { n++ } END { print n + 0 }')"
+  preferred_count="$(awk -F '<' '{ print NF - 1; exit }' "$PREF_RULELIST")"
+  active_count="$(printf '%s\n' "$desired" | awk -F '<' '{ print NF - 1; exit }')"
+
+  if [ "$new_pool" = preferred ]; then
+    _LogEvent_ notice "DNS FILTERED RECOVERY: pool=preferred; restored=$count; active=$active_count/$preferred_count"
+  else
+    _LogEvent_ notice "DNS FILTERED MEMBERSHIP: pool=$new_pool; active=$active_count/$preferred_count; excluded=$count"
+  fi
+
+  if [ -z "$excluded" ]; then
+    return 0
+  fi
+
+  while IFS='|' read -r address port tls_hostname; do
+    if [ "$new_pool" = preferred ]; then
+      _LogEvent_ notice "DNS RESOLVER RESTORED: address=$address port=$port tls_auth=$tls_hostname"
+    else
+      _LogEvent_ warning "DNS RESOLVER EXCLUDED: pool=$new_pool address=$address port=$port tls_auth=$tls_hostname"
+    fi
+  done <<EOF_EXCLUDED_MEMBERS
+$excluded
+EOF_EXCLUDED_MEMBERS
+}
+
 # Construct the filtered list directly from the original NVRAM serialization.
 # The ID file contains only confirmed healthy wanN member IDs.
 _BuildFilteredRulelistFromMembers_() {
@@ -2609,6 +2711,7 @@ _SwitchDNSPool_() (
   else
     _LogEvent_ warning "DNS POOL CHANGE: $old -> $new; Strict DoT verified ($reason)"
   fi
+  _LogFilteredDNSMembership_ "$old" "$new" "$prev" "$desired" || :
   return 0
 )
 
@@ -3232,7 +3335,7 @@ _RestorePreferredDNS_() (
 
 
 _ShowStatus_() {
-  local active sync_ok=1
+  local active current_rulelist excluded address port tls_hostname sync_ok=1
   if ! _SyncPreferredWAN_; then
     sync_ok=0
     _Say_ 'NOTICE: Another DNS operation is active or WAN synchronization is unverified.'
@@ -3248,6 +3351,23 @@ _ShowStatus_() {
   fi
   _Say_ "$SCRIPT_NAME root=$ROOT SCRIPT_VERSION=$SCRIPT_VERSION SCRIPT_VERSTAG=$SCRIPT_VERSTAG SCRIPT_BRANCH=$SCRIPT_BRANCH"
   _Say_ "Production WAN DoT pool: $active"
+  case "$active" in
+    filtered1|filtered2)
+      # Status is read-only. A failed membership read must not change WAN DNS.
+      current_rulelist="$(_ReadWANRulelist_ 2>/dev/null)" || current_rulelist=''
+      if [ -n "$current_rulelist" ]; then
+        excluded="$(_ListExcludedPreferredDNSMembers_ "$current_rulelist" 2>/dev/null)" || excluded=''
+        if [ -n "$excluded" ]; then
+          _Say_ 'Currently excluded preferred DNS resolvers:'
+          while IFS='|' read -r address port tls_hostname; do
+            _Say_ "  address=$address port=$port tls_auth=$tls_hostname"
+          done <<EOF_CURRENT_EXCLUSIONS
+$excluded
+EOF_CURRENT_EXCLUSIONS
+        fi
+      fi
+      ;;
+  esac
   _Say_ 'Router-wide mode: all LAN DNS clients retain the existing DNSMasq -> production Stubby path.'
   _Say_ 'Monitor targets do NOT receive domain-specific routing.'
   [ -r "$PREF_RULELIST" ] && _Say_ 'Preferred WAN list captured: yes' || _Say_ 'Preferred WAN list captured: no (run enroll)'
