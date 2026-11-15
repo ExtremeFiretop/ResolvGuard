@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.0
-readonly SCRIPT_VERSTAG="26111505"
+readonly SCRIPT_VERSTAG="26111506"
 readonly SCRIPT_NAME="ResolvGuard"
 ## Set to "master" for Production Releases ##
 SCRIPT_BRANCH="dev"
@@ -171,7 +171,7 @@ RG_SETTINGS_DEFAULT
       ;;
     checks.tsv) cat <<'RG_CHECKS_DEFAULT'
 # hostname|record_type|expected_rcode|expected_answer_count|expected_record_data_or_dash
-example.com|A|NOERROR|ANY|-
+a.root-servers.net|A|NOERROR|AT_LEAST_1|-
 RG_CHECKS_DEFAULT
       ;;
     extra-providers.tsv) cat <<'RG_PROVIDERS_DEFAULT'
@@ -481,6 +481,20 @@ _IsValidAnswerCount_() {
   case "$1" in ANY) return 0;; ''|*[!0-9]*) return 1;; *) return 0;; esac
 }
 
+# DNS-check answer constraints are distinct from numeric monitoring thresholds.
+# AT_LEAST_1 requires a real answer record of the requested DNS type; the
+# packet's total ANSWER count alone can also include CNAME records.
+_IsValidDNSAnswerCount_() {
+  case "$1" in
+    AT_LEAST_1)
+      return 0
+      ;;
+    *)
+      _IsValidAnswerCount_ "$1"
+      ;;
+  esac
+}
+
 _ParseWANUpstreams_() {
   [ -r "$WAN_STUBBY_CONFIG" ] || { _Fail_ "WAN Stubby config missing: $WAN_STUBBY_CONFIG"; return 1; }
   awk '
@@ -626,7 +640,7 @@ _ValidateConfiguration_() {
   while IFS='|' read -r qname qtype rcode answers expected extra; do
     case "$qname" in ''|\#*) continue;; esac
     [ -z "${extra:-}" ] && _IsValidDomain_ "$qname" && _IsValidRecordType_ "$qtype" &&
-      _IsValidRCODE_ "$rcode" && _IsValidAnswerCount_ "$answers" && _IsSafeToken_ "$expected" || {
+      _IsValidRCODE_ "$rcode" && _IsValidDNSAnswerCount_ "$answers" && _IsSafeToken_ "$expected" || {
       _Fail_ "Invalid DNS health check: $qname $qtype"; return 1;
     }
   done < "$CHECKS"
@@ -1217,10 +1231,28 @@ _ProbeDNSRecord_() {
     _PrintHealthCheckResult_ FAIL "$id $qname $qtype: RCODE $actual_rcode expected $want_rcode (policy mismatch)"
     return 1
   fi
-  if [ "$want_count" != ANY ] && [ "$actual_count" != "$want_count" ]; then
-    _PrintHealthCheckResult_ FAIL "$id $qname $qtype: ANSWER count $actual_count expected $want_count (policy mismatch)"
-    return 1
-  fi
+  case "$want_count" in
+    ANY)
+      # The administrator explicitly chose to ignore the number of answers.
+      ;;
+    AT_LEAST_1)
+      # DNS ANSWER includes aliases such as CNAME, so a nonzero header count
+      # does not prove the requested A, AAAA or other record type was returned.
+      if [ "$actual_count" -eq 0 ] || ! printf '%s\n' "$output" | awk -v qt="$qtype" '
+          $1 !~ /^;/ && $4 == qt { found = 1 }
+          END { exit found ? 0 : 1 }
+        '; then
+        _PrintHealthCheckResult_ FAIL "$id $qname $qtype: no $qtype answer record (expected at least 1; policy mismatch)"
+        return 1
+      fi
+      ;;
+    *)
+      if [ "$actual_count" != "$want_count" ]; then
+        _PrintHealthCheckResult_ FAIL "$id $qname $qtype: ANSWER count $actual_count expected $want_count (policy mismatch)"
+        return 1
+      fi
+      ;;
+  esac
   if [ "$want_value" != '-' ]; then
     if ! printf '%s\n' "$output" | awk -v qt="$qtype" -v expected="$want_value" '
       $1 !~ /^;/ && $4 == qt && $5 == expected {found=1}
@@ -1711,10 +1743,10 @@ _InitializeDefaultDNSPolicy_() {
   local mode
   mode="$(_GetRouterIPv6Mode_)"
   if [ "$mode" = enabled ] && [ ! -e "$POLICY_APPROVAL" ] && [ ! -L "$POLICY_APPROVAL" ] && awk -F'|' '
-      $0 !~ /^#/ && NF {n++; if ($0 != "example.com|A|NOERROR|ANY|-") bad=1}
+      $0 !~ /^#/ && NF {n++; if ($0 != "a.root-servers.net|A|NOERROR|AT_LEAST_1|-") bad=1}
       END {exit !(n==1 && !bad)}' "$CHECKS"; then
-    _ChangeTSVFile_ "$CHECKS" check add 'example.com|AAAA' \
-      'example.com|AAAA|NOERROR|ANY|-' >/dev/null || return 1
+    _ChangeTSVFile_ "$CHECKS" check add 'a.root-servers.net|AAAA' \
+      'a.root-servers.net|AAAA|NOERROR|ANY|-' >/dev/null || return 1
   fi
   case "$mode" in
     enabled) _Say_ '  Router IPv6: Enabled' ;;
@@ -2497,13 +2529,14 @@ _CheckAutomaticFailoverAuthorization_() {
 # SERVFAIL/NXDOMAIN/NOERROR can all be legitimate from an alive listener.
 # Unexpected/malformed data, dig failures or missing QR header fail closed.
 _VerifyLocalDNSResponse_() {
-  local server tag nonce out got count flags tick
+  local server tag out got count flags
   server="$1"; tag="$2"
-  tick="$(date -u +%s 2>/dev/null)" || return 1
-  case "$tick" in ''|*[!0-9]*) return 1;; esac
-  nonce="rg-infra-$$-$tick.example.com"
   out="$RUNTIME/infra-$tag-$$"
-  if ! "$DIG" "@$server" "$nonce" A +time="$TIMEOUT_SECONDS" +tries=1 +noall +comments +answer +authority > "$out" 2>&1; then
+  # Query the DNS root (.) for NS records instead of generating arbitrary
+  # subdomains beneath example.com. This only verifies a well-formed local
+  # listener response; authenticated upstream health is checked separately.
+  # Cached root NS data is acceptable for this local-listener readiness test.
+  if ! "$DIG" "@$server" . NS +time="$TIMEOUT_SECONDS" +tries=1 +noall +comments +answer +authority > "$out" 2>&1; then
     _Say_ "INFRASTRUCTURE NOT READY: $tag listener did not answer"
     rm -f "$out"; return 1
   fi
@@ -4909,7 +4942,7 @@ _ShowIntegrationSettingsMenu_() {
 
 _IsValidDNSCheck_() {
   _IsValidDomain_ "$1" && _IsValidRecordType_ "$2" && _IsValidRCODE_ "$3" &&
-    _IsValidAnswerCount_ "$4" && _IsSafeToken_ "$5"
+    _IsValidDNSAnswerCount_ "$4" && _IsSafeToken_ "$5"
 }
 
 _PromptDNSCheck_() {
@@ -4917,7 +4950,7 @@ _PromptDNSCheck_() {
   _Ask_ 'DNS hostname' "${1:-}" || return 1; qname="$RG_ANSWER"
   _Ask_ 'DNS record type (A/AAAA etc.)' "${2:-A}" || return 1; qtype="$RG_ANSWER"
   _Ask_ 'Expected RCODE' "${3:-NOERROR}" || return 1; rcode="$RG_ANSWER"
-  _Ask_ 'Expected answer count (ANY or number)' "${4:-ANY}" || return 1; count="$RG_ANSWER"
+  _Ask_ 'Expected answer count (ANY, AT_LEAST_1, or exact number)' "${4:-ANY}" || return 1; count="$RG_ANSWER"
   _Ask_ 'Expected record data (- to ignore)' "${5:--}" || return 1; rdata="$RG_ANSWER"
   _IsValidDNSCheck_ "$qname" "$qtype" "$rcode" "$count" "$rdata" || {
     _Fail_ 'Invalid DNS check fields'; return 1;
@@ -6128,13 +6161,13 @@ _RunQuickSetupWizard_() {
   _ShowSetupStep_ 3 'DNS CHECKS & PROTECTION'
   _InitializeDefaultDNSPolicy_ || return 1
   if awk -F'|' '
-      $0 !~ /^#/ && NF {n++; if ($0 != "example.com|A|NOERROR|ANY|-" &&
-        $0 != "example.com|AAAA|NOERROR|ANY|-") bad=1}
+      $0 !~ /^#/ && NF {n++; if ($0 != "a.root-servers.net|A|NOERROR|AT_LEAST_1|-" &&
+        $0 != "a.root-servers.net|AAAA|NOERROR|ANY|-") bad=1}
       END {exit !(n>=1 && n<=2 && !bad)}' "$CHECKS"; then
-    if grep -Fqx 'example.com|AAAA|NOERROR|ANY|-' "$CHECKS"; then
-      _Say_ '  Health checks: example.com (A, AAAA)'
+    if grep -Fqx 'a.root-servers.net|AAAA|NOERROR|ANY|-' "$CHECKS"; then
+      _Say_ '  Health checks: a.root-servers.net (A at least 1, AAAA RCODE only)'
     else
-      _Say_ '  Health checks: example.com (A)'
+      _Say_ '  Health checks: a.root-servers.net (A at least 1)'
     fi
   else
     _Say_ '  Your saved DNS health checks will be used.'
