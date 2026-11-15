@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.0
-readonly SCRIPT_VERSTAG="26111503"
+readonly SCRIPT_VERSTAG="26111504"
 readonly SCRIPT_NAME="ResolvGuard"
 ## Set to "master" for Production Releases ##
 SCRIPT_BRANCH="dev"
@@ -853,10 +853,15 @@ _ReleaseMaintenancePriority_() {
   return 0
 }
 
-_AcquireWANLockForMaintenance_() {
-  local attempt
+# The maintenance reservation is also used for interactive policy actions.
+# Keeping one priority gate prevents cron from racing either kind of operation.
+# The active WAN lock remains exclusive: this function never steals it.
+_AcquireWANLockWithInteractivePriority_() {
+  local operation attempt
 
-  # Announce intent before waiting, so new scheduled checks stand aside.
+  operation="$1"
+
+  # Reserve admission before waiting for an existing DNS operation to finish.
   if ! _AcquireMaintenancePriority_; then
     return 1
   fi
@@ -868,7 +873,11 @@ _AcquireWANLockForMaintenance_() {
     fi
 
     if [ "$attempt" -eq 1 ]; then
-      _Say_ 'DNS maintenance has priority; waiting for the current WAN operation to finish...'
+      if [ "$operation" = policy ]; then
+        _Say_ 'DNS policy administration has priority; waiting for the current WAN operation to finish...'
+      else
+        _Say_ 'DNS maintenance has priority; waiting for the current WAN operation to finish...'
+      fi
     fi
 
     if [ "$attempt" -eq 90 ]; then
@@ -879,9 +888,18 @@ _AcquireWANLockForMaintenance_() {
     attempt=$((attempt + 1))
   done
 
-  _Fail_ 'WAN lock still unavailable; maintenance aborted without stealing a live lock'
+  if [ "$operation" = policy ]; then
+    _Fail_ 'WAN lock still unavailable; policy administration deferred without stealing a live lock'
+  else
+    _Fail_ 'WAN lock still unavailable; maintenance aborted without stealing a live lock'
+  fi
+
   _ReleaseMaintenancePriority_ >/dev/null 2>&1 || :
   return 1
+}
+
+_AcquireWANLockForMaintenance_() {
+  _AcquireWANLockWithInteractivePriority_ maintenance
 }
 
 # Called only while holding CONFIG_LOCK by maintenance operations.
@@ -946,22 +964,78 @@ _GetWANLockDisplay_() {
   return 1
 }
 
-# Interactive policy operations tolerate brief scheduled-check contention;
-# cron and the DNS-switching engine keep their immediate fail-closed locks.
+# Policy review and revocation take the same interactive admission priority as
+# maintenance. New cron cycles skip; a current WAN writer always finishes.
 _AcquireWANLockForPolicy_() {
+  if ! _AcquireWANLockWithInteractivePriority_ policy; then
+    return 1
+  fi
+
+  RG_POLICY_WAN_HELD=1
+  return 0
+}
+
+_ReleasePolicyWANLock_() {
+  if [ "${RG_POLICY_WAN_HELD:-0}" != 1 ]; then
+    return 0
+  fi
+
+  if ! _ReleaseWANLock_; then
+    return 1
+  fi
+
+  RG_POLICY_WAN_HELD=0
+  return 0
+}
+
+# Policy review also reads shared configuration. Hold CONFIG_LOCK only during
+# its initial snapshot and final approval commit, never during user input.
+_AcquireConfigLockForPolicy_() {
   local attempt
+
   attempt=1
-  while [ "$attempt" -le 7 ]; do
-    _AcquireWANLock_ && return 0
-    [ "$attempt" -lt 7 ] || break
-    if [ "$attempt" -eq 1 ]; then
-      _Say_ 'DNS monitoring is busy; waiting briefly for the active check to finish...'
+  while [ "$attempt" -le 12 ]; do
+    if _AcquireConfigLock_; then
+      RG_POLICY_CONFIG_HELD=1
+      return 0
     fi
-    sleep 2
+
+    if [ "$attempt" -eq 1 ]; then
+      _Say_ 'DNS policy: waiting for an active configuration edit to finish...'
+    fi
+
+    if [ "$attempt" -eq 12 ]; then
+      break
+    fi
+
+    sleep 1
     attempt=$((attempt + 1))
   done
-  _Fail_ 'DNS operation still active or lock unverified. No approval changed; retry when the check finishes.'
+
+  _Fail_ 'Configuration lock still unavailable; policy administration deferred'
   return 1
+}
+
+_ReleasePolicyConfigLock_() {
+  if [ "${RG_POLICY_CONFIG_HELD:-0}" != 1 ]; then
+    return 0
+  fi
+
+  if ! _ReleaseConfigLock_; then
+    return 1
+  fi
+
+  RG_POLICY_CONFIG_HELD=0
+  return 0
+}
+
+# This is an EXIT cleanup for the policy-operation subshell. These ownership
+# markers must not be local: BusyBox ash can run an EXIT trap after locals
+# leave scope. Never remove another process's locks.
+_CleanupPolicyLocks_() {
+  _ReleasePolicyConfigLock_ >/dev/null 2>&1 || :
+  _ReleasePolicyWANLock_ >/dev/null 2>&1 || :
+  _ReleaseMaintenancePriority_ >/dev/null 2>&1 || :
 }
 
 # Highlight health-check outcomes in an interactive terminal without changing
@@ -2782,8 +2856,16 @@ _ApprovePolicy_() (
   local fingerprint staged approval_prompt view count
   approval_prompt="${1:-Approve DNS policy?}"
   view="${2:-detail}"
+  RG_POLICY_CONFIG_HELD=0
+  RG_POLICY_WAN_HELD=0
+  RG_MAINTENANCE_PRIORITY_HELD=0
+  # Install cleanup before waiting: a termination during the bounded wait
+  # must not leave behind this policy operation's priority reservation.
+  trap '_CleanupPolicyLocks_' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' HUP TERM
   _AcquireWANLockForPolicy_ || return 1
-  trap '_ReleaseWANLock_ >/dev/null 2>&1 || :' EXIT HUP INT TERM
+  _AcquireConfigLockForPolicy_ || return 1
   [ ! -e "$PENDING_TRANSACTION" ] && [ ! -L "$PENDING_TRANSACTION" ] &&
     [ ! -e "$RECOVERY_HOLD" ] && [ ! -L "$RECOVERY_HOLD" ] || {
     _Fail_ 'Unresolved WAN transaction or recovery hold; policy approval blocked'; return 1; }
@@ -2820,15 +2902,30 @@ _ApprovePolicy_() (
     done < "$CHECKS"
   fi
   _Say_ ''
-  # Do not hold the WAN watchdog lock while the operator considers the
-  # policy: cron must continue to monitor normally during a long prompt.
-  _ReleaseWANLock_ || { _Fail_ 'Unable to release DNS lock before confirmation'; return 1; }
+  # Never hold a WAN lock, config lock, or priority reservation while an
+  # administrator reads the policy or considers the approval prompt.
+  # Monitoring therefore runs normally during an arbitrarily long review.
+  _ReleasePolicyConfigLock_ || {
+    _Fail_ 'Unable to release configuration lock before confirmation'
+    return 1
+  }
+  _ReleasePolicyWANLock_ || {
+    _Fail_ 'Unable to release DNS lock before confirmation'
+    return 1
+  }
+  _ReleaseMaintenancePriority_ || {
+    _Fail_ 'Unable to release interactive priority before confirmation'
+    return 1
+  }
   if [ "$view" = quick ]; then
     _ConfirmYesNo_ "$approval_prompt" quiet || return 1
   else
     _ConfirmYesNo_ "$approval_prompt" || return 1
   fi
+  # Re-establish priority after consent, then verify the reviewed policy
+  # under both locks before persisting any approval.
   _AcquireWANLockForPolicy_ || return 1
+  _AcquireConfigLockForPolicy_ || return 1
   [ ! -e "$PENDING_TRANSACTION" ] && [ ! -L "$PENDING_TRANSACTION" ] &&
     [ ! -e "$RECOVERY_HOLD" ] && [ ! -L "$RECOVERY_HOLD" ] || {
     _Fail_ 'WAN recovery state changed during review; approval refused'; return 1; }
@@ -2865,8 +2962,15 @@ _ApprovePolicy_() (
 # Reapproving alone must never reactivate an old automatic-failover marker.
 _RevokePolicy_() (
   _ConfirmYesNo_ 'Revoke DNS policy approval (also disables automatic failover)?' || return 1
+  RG_POLICY_WAN_HELD=0
+  RG_POLICY_CONFIG_HELD=0
+  RG_MAINTENANCE_PRIORITY_HELD=0
+  # Confirmation happens before admission; the scheduler keeps working
+  # while the operator reads the prompt.
+  trap '_CleanupPolicyLocks_' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' HUP TERM
   _AcquireWANLockForPolicy_ || return 1
-  trap '_ReleaseWANLock_ >/dev/null 2>&1 || :' EXIT HUP INT TERM
   [ ! -L "$AUTO_FAILOVER_MARKER" ] && [ ! -L "$POLICY_APPROVAL" ] || {
     _Fail_ 'Unsafe policy/authorization path; refusing revocation'; return 1; }
   rm -f "$AUTO_FAILOVER_MARKER" || {
