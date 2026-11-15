@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.0
-readonly SCRIPT_VERSTAG="26111405"
+readonly SCRIPT_VERSTAG="26111406"
 readonly SCRIPT_NAME="ResolvGuard"
 ## Set to "master" for Production Releases ##
 SCRIPT_BRANCH="dev"
@@ -2329,16 +2329,85 @@ _ValidateDNSMasqUpstreamFile_() {
 $domain_exceptions
 EOF_DNSMASQ_SCOPED_SERVERS
 
-    # Cron jobs are noninteractive; don't flood the minute-by-minute log.
-    # Interactive installation/readiness checks disclose plaintext exceptions.
-    if [ -t 1 ]; then
-      _Say_ 'LAN DNS NOTICE: default DNS uses Strict DoT; explicit domain-scoped upstreams bypass it:'
-      while IFS='|' read -r domain server; do
-        _Say_ "  domain=$domain upstream=$server"
-      done <<EOF_DNSMASQ_SCOPED_NOTICE
-$domain_exceptions
-EOF_DNSMASQ_SCOPED_NOTICE
+    # Validate the exceptions here, but do not print an interactive notice.
+    # This validation can run repeatedly while Stubby is starting and during
+    # DNS restoration. Quick Setup displays a single, prominent disclosure
+    # in the wizard before automatic-failover authorization is requested.
+  fi
+
+  return 0
+}
+
+# Disclose domain-specific plaintext DNS exceptions before asking the user to
+# authorize automatic failover (either during Quick Setup or from the menu).
+# Validation stays independent of presentation: this function makes no DNS or
+# configuration changes, and pauses only for an interactive terminal.
+_ShowDNSMasqScopedSetupWarning_() {
+  local domain_exceptions domain upstream
+
+  # The wizard and its authorization helper may both call this routine.
+  # A disclosure and acknowledgement are needed only once per invocation.
+  if [ "${RG_SCOPED_WARNING_SHOWN:-0}" = 1 ]; then
+    return 0
+  fi
+
+  if [ ! -r "$DNSMASQ_SERVERS" ]; then
+    return 0
+  fi
+
+  # A malformed upstream file is reported by the normal readiness checks;
+  # never describe an invalid configuration as successfully protected.
+  if ! domain_exceptions="$(_ScanDNSMasqUpstreamFile_ 2>/dev/null)"; then
+    return 0
+  fi
+
+  if [ -z "$domain_exceptions" ]; then
+    return 0
+  fi
+
+  # Use the same literal-IP validation as the readiness check. The display
+  # must not accidentally accept or endorse a malformed split-DNS exception.
+  while IFS='|' read -r domain upstream; do
+    if ! _IsValidIPv4_ "$upstream" && ! _IsValidIPv6_ "$upstream"; then
+      return 0
     fi
+  done <<EOF_DNSMASQ_WARNING_VALIDATE
+$domain_exceptions
+EOF_DNSMASQ_WARNING_VALIDATE
+
+  RG_SCOPED_WARNING_SHOWN=1
+  _SetMenuPalette_
+
+  printf '\n%s' "$RG_RED"
+  _Say_ '================================================================'
+  _Say_ '  WARNING: DNS REQUESTS BYPASS STRICT DNS-OVER-TLS'
+  _Say_ '================================================================'
+  printf '%s' "$RG_RESET"
+
+  _Say_ '  DNSMasq is configured to use Stubby by default, but these'
+  _Say_ '  domain-specific exceptions use separate DNS servers:'
+  _Say_ ''
+
+  while IFS='|' read -r domain upstream; do
+    printf '  %sDOMAIN:%s   %s\n' "$RG_RED" "$RG_RESET" "$domain"
+    printf '  %sUPSTREAM:%s %s\n' "$RG_RED" "$RG_RESET" "$upstream"
+  done <<EOF_DNSMASQ_WARNING_LIST
+$domain_exceptions
+EOF_DNSMASQ_WARNING_LIST
+
+  printf '\n%s' "$RG_RED"
+  _Say_ '  Matching queries bypass the default Stubby/Strict DoT path.'
+  _Say_ '  ResolvGuard did not create or modify these DNSMasq rules.'
+  _Say_ '================================================================'
+  printf '%s' "$RG_RESET"
+
+  # Do not consume stdin or block noninteractive scripted invocations.
+  # Only an actual interactive SSH terminal needs acknowledgment.
+  if [ -t 0 ] && [ -t 1 ]; then
+    printf '\n%sPress <Enter> to acknowledge this DNS warning and continue...%s' \
+      "$RG_RED" "$RG_RESET"
+    IFS= read -r _rg_dns_warning_ack || :
+    printf '\n'
   fi
 
   return 0
@@ -3730,6 +3799,10 @@ _EnableAutomaticFailover_() {
     _Fail_ 'Configure at least two distinct WAN provider groups or an independent backup for automatic failover'
     return 1
   fi
+  # Outside Quick Setup, present the same security disclosure before consent.
+  # A warning already acknowledged in this wizard is not shown a second time.
+  _ShowDNSMasqScopedSetupWarning_
+
   if ! approval_status="$(_GetPolicyApprovalState_)"; then
     if [ "$view" != quick ]; then
       _Say_ "DNS policy approval required: $approval_status"
@@ -5613,6 +5686,11 @@ _RunQuickSetupWizard_() {
       _Say_ '  No changes saved; existing checks will be used.'
     }
   fi
+  # Disclose domain-scoped DNS bypasses before requesting approval for
+  # automatic WAN switching. Interactive SSH users must acknowledge the
+  # warning; noninteractive callers receive plain text without a pause.
+  _ShowDNSMasqScopedSetupWarning_
+
   if [ -r "$AUTO_FAILOVER_MARKER" ] && _CheckAutomaticFailoverAuthorization_ >/dev/null 2>&1; then
     printf '  %sAutomatic failover already enabled.%s\n' "$RG_GREEN" "$RG_RESET"
     return 0
