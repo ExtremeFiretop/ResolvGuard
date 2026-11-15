@@ -48,6 +48,8 @@ jobs:
           test -f metrics/release_downloads.csv
           cp metrics/release_downloads.csv /tmp/resolvguard-release-downloads.csv
 
+          rm -rf metrics
+
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
 
