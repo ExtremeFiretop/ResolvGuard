@@ -1,6 +1,6 @@
 # ResolvGuard — Intelligent DNS Monitoring & Failover for Asuswrt-Merlin
 
-## v0.1.9
+## v0.2.0
 
 **Your DNS provider can be online and still return the wrong answer. ResolvGuard helps you catch that.**
 
