@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.2
-readonly SCRIPT_VERSTAG="26111615"
+readonly SCRIPT_VERSTAG="26111616"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -3579,7 +3579,8 @@ _InstallProgressPause_() {
 }
 
 # AMTM-style installation lifecycle. The installer performs no DNS enrollment,
-# cron writes, WAN changes, or automatic-failover approval. Quick Setup remains
+# cron writes, WAN changes, or automatic-failover approval. It installs the
+# independent services-start hook required to restore the WebUI after reboot. Quick Setup remains
 # the separate, operator-driven next step.
 _IsInstallationComplete_() {
   [ "$ROOT" = "$INSTALL_ROOT" ] &&
@@ -3630,16 +3631,10 @@ _FetchWebUIAsset_() {
   local dest version tag channel url
   dest="$1";version="$2";tag="$3";channel="$4"
   [ ! -e "$dest" ] && [ ! -L "$dest" ] || return 1
-  # Source checkout supports local/offline testing. Normal one-script installs
-  # download the companion ASP from the pinned release or the dev branch.
-  if [ -f "$SOURCE_DIR/ResolvGuard.asp" ] && [ ! -L "$SOURCE_DIR/ResolvGuard.asp" ] &&
-     [ "$SOURCE_DIR/ResolvGuard.asp" != "$dest" ] &&
-     _VerifyWebUIAsset_ "$SOURCE_DIR/ResolvGuard.asp" "$version" "$tag" "$channel"; then
-    cp "$SOURCE_DIR/ResolvGuard.asp" "$dest" || return 1
-  else
-    url="$(_WebUIAssetURL_ "$channel" "$version")" || return 1
-    _FetchHTTPS_ "$url" "$dest" || return 1
-  fi
+  # Always fetch the independent companion ASP from the selected branch's
+  # raw GitHub URL. A stale local checkout must never shadow that source.
+  url="$(_WebUIAssetURL_ "$channel" "$version")" || return 1
+  _FetchHTTPS_ "$url" "$dest" || return 1
   if ! _VerifyWebUIAsset_ "$dest" "$version" "$tag" "$channel"; then
     rm -f "$dest"
     _Fail_ 'Downloaded WebUI ASP failed identity, content or size verification'
@@ -3704,6 +3699,12 @@ _BootstrapExistingWebUI_() (
   # Another normal menu, boot hook, or installer can finish this in parallel.
   flock -n 7 || exit 0
 
+  # UI and DNS monitoring share one startup callback but not an enrollment.
+  # Always keep it installed, even for monitoring-disabled installations.
+  if ! _InstallScheduleHook_ quiet; then
+    _Say_ 'NOTICE: Could not register ResolvGuard services-start; reboot recovery unavailable'
+    exit 1
+  fi
   if ! _EnsureInstalledWebUIAsset_; then
     _Say_ 'NOTICE: WebUI asset bootstrap failed; DNS monitoring and CLI remain available'
     exit 1
@@ -3859,7 +3860,10 @@ _InstallResolvGuard_() (
   fi
   _IsInstallationComplete_ || { _Fail_ 'Installation verification failed'; exit 1; }
   printf '  %sResolvGuard installed successfully:%s %s\n' "$RG_GREEN" "$RG_RESET" "$target"
-  # Native WebUI is optional at this stage: its asset is installed and
+  if ! _InstallScheduleHook_ quiet; then
+    _Say_ '  NOTICE: Persistent WebUI startup registration failed; check JFFS custom scripts.'
+  fi
+  # Native WebUI mounting is best-effort: its ASP has already been fetched and
   # verified, while firmware's /www tree may not be ready until startup.
   if _RGWebUI_ mount >/tmp/resolvguard-webui-install-mount.log 2>&1; then
     _RGWebUI_ publish >/dev/null 2>&1 || :
@@ -4230,7 +4234,7 @@ _EnableScheduledMonitoring_() {
     _InstallScheduleHook_ quiet || return 1
     if ! _RegisterScheduleCron_; then
       cru d "$SCHEDULE_JOB" >/dev/null 2>&1 || :
-      _RemoveScheduleHook_ || :
+      # Leave the shared startup hook intact if cron fails.
       _Fail_ 'Monitoring was not enabled because cron registration failed'
       return 1
     fi
@@ -4239,7 +4243,7 @@ _EnableScheduledMonitoring_() {
        ! mv "$staged" "$SCHEDULE_MARKER"; then
       rm -f "$staged"
       cru d "$SCHEDULE_JOB" >/dev/null 2>&1 || :
-      _RemoveScheduleHook_ || :
+      # The shared startup hook is independent of monitoring enrollment.
       _Fail_ 'Monitoring authorization could not be saved'; return 1
     fi
   fi
@@ -4337,7 +4341,8 @@ _DisableScheduledMonitoring_() {
     fi
     rm -f "$RUNTIME/cron-list-$$"
   fi
-  _RemoveScheduleHook_ || return 1
+  # The services-start callback also restores the WebUI after reboot.
+  # Do not delete it when DNS monitoring is disabled. Uninstall owns cleanup.
   rm -f "$SCHEDULE_MARKER" "$AUTO_FAILOVER_MARKER" || return 1
   _LogEvent_ notice 'DNS MONITORING DISABLED: scheduler and automatic switching authorization removed' >/dev/null
   [ "$success_output" = quiet ] || _Say_ 'DNS monitoring: OFF (automatic failover OFF)'
@@ -5084,6 +5089,7 @@ _RGWebUI_() (
 
   case "${1:-help}" in
     publish) publish ;;
+    bootstrap) _BootstrapExistingWebUI_ ;;
     mount) mount_page && _RGManual_ hook-install ;;
     unmount) _RGManual_ hook-remove && unmount_page ;;
     startup)
@@ -5102,7 +5108,7 @@ _RGWebUI_() (
       else err 'no completed snapshot; run publish after a scheduled check';exit 1;fi ;;
     manual-run) _RGManual_ run ;;
     manual-status) _RGManual_ status ;;
-    *) say 'Usage: sh resolvguard.sh webui [mount|unmount|publish|startup|status|manual-run|manual-status]' ;;
+    *) say 'Usage: sh resolvguard.sh webui [bootstrap|mount|unmount|publish|startup|status|manual-run|manual-status]' ;;
   esac
 
 )
@@ -6207,7 +6213,7 @@ _ApplyVerifiedUpdate_() (
   # Firmware UI may not be ready; a failure is reported rather than risking
   # a DNS-affecting rollback for a purely visual mount operation.
   if [ "$update_webui" = 1 ]; then
-    if /bin/sh "$installed" webui mount >/tmp/resolvguard-webui-update-mount.log 2>&1; then
+    if /bin/sh "$installed" webui bootstrap >/tmp/resolvguard-webui-update-mount.log 2>&1; then
       # Remove old prototype assets only after a successful remount.
       legacy="$ROOT/webui"
       if [ -d "$legacy" ] && [ ! -L "$legacy" ]; then
@@ -6219,7 +6225,7 @@ _ApplyVerifiedUpdate_() (
         rmdir "$legacy" 2>/dev/null || :
       fi
     else
-      _Say_ 'NOTICE: WebUI ASP installed; native page remount deferred. Run: sh /jffs/addons/ResolvGuard.d/resolvguard.sh webui mount'
+      _Say_ 'NOTICE: WebUI ASP installed; automatic bootstrap deferred. Run: sh /jffs/addons/ResolvGuard.d/resolvguard.sh webui bootstrap'
       _Say_ 'NOTICE: legacy WebUI files retained until the new page mounts successfully.'
     fi
   fi
@@ -6393,11 +6399,18 @@ _UninstallNeverEnrolled_() {
     [ ! -e "$PREF_PROVIDERS" ] && [ ! -L "$PREF_PROVIDERS" ] || return 1
   hook="$HOOK_DIR/services-start"
   if [ -f "$hook" ] && [ ! -L "$hook" ]; then
+    # The one ResolvGuard-owned services-start block is permitted even for
+    # an unenrolled installation: it only restores the independent WebUI.
+    # Refuse stray/modified references rather than deleting a foreign hook.
     if grep -F "$ROOT/resolvguard.sh" "$hook" >/dev/null 2>&1 ||
        grep -Fqx '# RESOLVGUARD BEGIN' "$hook" ||
        grep -Fqx '# RESOLVGUARD END' "$hook"; then
-      _Fail_ 'Unenrolled installation still has a startup hook; uninstall blocked'
-      return 1
+      _CheckOwnedStartupHook_ || return 1
+      if ! grep -Fqx '# RESOLVGUARD BEGIN' "$hook" ||
+         [ "$(grep -Fc "$ROOT/resolvguard.sh" "$hook")" -ne 1 ]; then
+        _Fail_ 'Unrecognized ResolvGuard services-start reference; uninstall blocked'
+        return 1
+      fi
     fi
   fi
   jobs="$(cru l 2>/dev/null)" || {
@@ -7264,7 +7277,7 @@ case "${1:-menu}" in
   help|-h|--help)
     cat <<HELP
 ResolvGuard v$SCRIPT_VERSION (WAN DNS-over-TLS monitoring and failover)
-Usage: sh $ROOT/resolvguard.sh [install|menu|quick-setup|dependencies|configure|uninstall|discover|validate|enroll|pools|check|status|restore|probe <hostname-or-URL> [BOTH|TYPE] [provider-id|all] [summary|full]|schedule [status|enable|disable|logs]|startup|webui [mount|unmount|publish|status]|policy [status|approve|revoke]|amtmupdate [check|status|update]|develop|stable]
+Usage: sh $ROOT/resolvguard.sh [install|menu|quick-setup|dependencies|configure|uninstall|discover|validate|enroll|pools|check|status|restore|probe <hostname-or-URL> [BOTH|TYPE] [provider-id|all] [summary|full]|schedule [status|enable|disable|logs]|startup|webui [bootstrap|mount|unmount|publish|status]|policy [status|approve|revoke]|amtmupdate [check|status|update]|develop|stable]
 
 No arguments: if installation is needed, install and offer Quick Setup once; otherwise open the SSH menu. An incomplete setup remains selectable from the menu. e or exit leaves the current menu.
 install verifies prerequisites (including optional bind-dig installation), initializes missing config, and publishes the main script only after preparation succeeds.
@@ -7278,7 +7291,7 @@ Monitored hostnames are NEVER forwarded through separate DNS routes.
 probe is a read-only DNS response inspector. Main Menu IN option can save selected successful observations as policy checks with explicit confirmation.
 Install and first run initialize missing config/settings.conf, config/checks.tsv and config/extra-providers.tsv without overwriting existing files.
 Quick Setup checks for Entware bind-dig and offers to install it with permission if missing. A separate onboarding completion record is written only after successful setup (including Monitoring Only or deliberately inactive operation). Run dependencies to check/install dig separately.
-Extracting the package does not enable cron or startup hooks; choose monitoring or automatic failover in the menu.
+Install creates a shared services-start hook for the independent WebUI. It does not enable cron, DNS monitoring, or automatic failover.
 Main Menu toggles Automatic DNS Failover; policy review and scheduling are integrated.
 Unattended failover requires a persistent, operator-approved DNS policy.
 Unexpected answer data/count is monitored as resolver-health failure. Automatic WAN switching still requires corroboration, a safe independently verified destination, and approved policy. An uncorroborated or universally stale DNS policy cannot authorize a switch.
