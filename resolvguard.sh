@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.2
-readonly SCRIPT_VERSTAG="26111616"
+readonly SCRIPT_VERSTAG="26111617"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -3723,6 +3723,42 @@ _BootstrapExistingWebUI_() (
   _Say_ 'ResolvGuard WebUI installed and mounted in Merlin WAN menu.'
 )
 
+# Repair an ASP that was omitted by an old script-only updater. This must run
+# from the NEW installed script on a subsequent ordinary invocation, regardless
+# of whether DNS monitoring is enabled. It deliberately does not run during
+# uninstall, a channel switch to a DIFFERENT branch, or an amtm offline probe.
+# In unattended contexts, never delay or alter a DNS check's result: spawn a
+# best-effort repair with a dedicated /tmp log. The bootstrap's nonblocking
+# flock serializes simultaneous manual, cron and startup attempts.
+_MaybeRepairWebUIOnInvocation_() {
+  local hook
+  [ "$ROOT" = "$INSTALL_ROOT" ] && _IsInstallationComplete_ || return 0
+  # Both the volatile Merlin mount AND the persistent services-start hook
+  # must be present. A manually mounted page with no boot hook also needs
+  # repair, or it will disappear on the next reboot.
+  hook="$HOOK_DIR/services-start"
+  if _VerifyWebUIAsset_ "$INSTALL_ROOT/ResolvGuard.asp" &&
+     _IsInstalledWebUIMounted_ &&
+     [ -f "$hook" ] && [ ! -L "$hook" ] &&
+     grep -Fqx '# RESOLVGUARD BEGIN' "$hook" &&
+     _CheckOwnedStartupHook_ >/dev/null 2>&1; then
+    return 0
+  fi
+  case "${1:-normal}" in
+    background)
+      ( _BootstrapExistingWebUI_ ) > /tmp/resolvguard-webui-selfheal.log 2>&1 &
+      ;;
+    *)
+      if [ -t 0 ] && [ -t 1 ]; then
+        _BootstrapExistingWebUI_ || :
+      else
+        ( _BootstrapExistingWebUI_ ) > /tmp/resolvguard-webui-selfheal.log 2>&1 &
+      fi
+      ;;
+  esac
+  return 0
+}
+
 _InstallResolvGuard_() (
   # The EXIT trap runs after shell function-local variables may have gone out
   # of scope on BusyBox ash. This function already runs in a subshell, so
@@ -7236,6 +7272,26 @@ case "${1:-menu}" in
   *) if [ "$ROOT" = "$INSTALL_ROOT" ]; then
       _IsInstallationComplete_ || _InstallResolvGuard_ || exit 1
      fi ;;
+esac
+
+# When an older stable updater replaces only resolvguard.sh, it cannot invoke
+# code introduced by the new script. On the NEXT installed execution (manual
+# or cron), self-heal the missing ASP and Merlin mount using the installed
+# script's channel. The installed SCRIPT_BRANCH -> UPDATE_CHANNEL mapping
+# selects raw dev/ResolvGuard.asp or raw main/ResolvGuard.asp, never the source
+# branch of an earlier channel-switch command.
+# Keep uninstall, recovery, WebUI unmount, and amtm offline capability probing
+# free of implicit WebUI downloads or mount operations.
+case "${1:-menu}" in
+  scheduled-check) _MaybeRepairWebUIOnInvocation_ background ;;
+  configure|quick-setup|dependencies|deps|schedule|policy|validate|enroll|pools|discover|check|probe|status)
+    _MaybeRepairWebUIOnInvocation_ ;;
+  amtmupdate)
+    [ "${2:-update}" = check ] || _MaybeRepairWebUIOnInvocation_ ;;
+  develop)
+    [ "$UPDATE_CHANNEL" != development ] || _MaybeRepairWebUIOnInvocation_ ;;
+  stable)
+    [ "$UPDATE_CHANNEL" != stable ] || _MaybeRepairWebUIOnInvocation_ ;;
 esac
 
 case "${1:-menu}" in
