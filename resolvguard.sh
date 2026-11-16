@@ -24,7 +24,7 @@ readonly SCRIPT_VERSION=0.2.1
 readonly SCRIPT_VERSTAG="26111602"
 readonly SCRIPT_NAME="ResolvGuard"
 ## Set to "master" for Production Releases ##
-SCRIPT_BRANCH="dev"
+SCRIPT_BRANCH="master"
 
 # Run install from a staged download, or from the final script path. A normal
 # first launch uses the same installation path before opening the SSH menu.
@@ -4316,7 +4316,438 @@ _ReconcileBootState_() {
   return 1
 }
 
+# RESOLVGUARD WEBUI INLINE BEGIN (read-only; generated from reviewed v1.1 controller)
+# All controller functions and variables execute in a subshell to avoid
+# altering the DNS monitor's globals, options, locks, and exit traps.
+_RGWebUI_() (
+  umask 077
+  RG_ROOT=${RG_WEBUI_ROOT:-$ROOT}
+  RG_RUNTIME=${RG_WEBUI_RUNTIME:-$RUNTIME}
+  RG_WEB=${RG_WEBUI_WWW:-/www/user}
+  RG_MENU=${RG_WEBUI_MENU:-/www/require/modules/menuTree.js}
+  RG_MENU_TMP=${RG_WEBUI_MENU_TMP:-/tmp/menuTree.js}
+  RG_LOCK=${RG_WEBUI_LOCK:-/tmp/addonwebui.lock}
+  RG_SERVERS=${RG_WEBUI_SERVERS:-/tmp/resolv.dnsmasq}
+  RG_DATA="$RG_RUNTIME/webui"
+  RG_ASSETS="$RG_ROOT/webui"
+  RG_TITLE=ResolvGuard
+  RG_MARKER='ResolvGuard WebUI Integration v1'
+
+  say() { printf '%s\n' "$*"; }
+  err() { printf 'ResolvGuard WebUI: %s\n' "$*" >&2; }
+  # HTML/JSON receives no private WAN credentials; never publish config/settings.conf.
+  # Print JSON-quoted string with minimal, portable escaping.
+  jsonq() {
+    printf '%s' "$1" | LC_ALL=C awk '
+    BEGIN { printf "\"" }
+    {
+      if (NR>1) printf "\\n"
+      for (i=1;i<=length($0);i++) {
+        c=substr($0,i,1)
+        if (c=="\\") printf "\\\\"
+        else if (c=="\"") printf "\\\""
+        else if (c==sprintf("%c",9)) printf "\\t"
+        else if (c==sprintf("%c",13)) printf "\\r"
+        else if (c=="<") printf "\\u003c"
+        else if (c==">") printf "\\u003e"
+        else if (c=="&") printf "\\u0026"
+        else printf "%s", c
+      }
+    }
+    END { printf "\"" }
+    '
+  }
+  number() { case "$1" in ''|*[!0-9]*) printf '0';; *) printf '%s' "$1";; esac; }
+  safe_pool() { case "$1" in preferred|filtered1|filtered2|backup[0-9]*|wanpool[0-9]*) printf '%s' "$1" ;; *) printf unknown ;; esac; }
+  mode_name() {
+    if [ ! -f "$RG_ROOT/state/monitoring-enabled" ]; then printf inactive
+    elif [ ! -f "$RG_ROOT/state/automatic-failover-enabled" ]; then printf monitoring
+    elif [ ! -f "$RG_ROOT/state/policy-approval" ]; then printf hold
+    else printf automatic; fi
+  }
+  # Derive exactly the domain-scoped exception type already disclosed by installer.
+  # Unrecognized resolver formats are not labelled as verified bypass rules.
+  exceptions() {
+    [ -f "$RG_SERVERS" ] && [ ! -L "$RG_SERVERS" ] || return 0
+    LC_ALL=C awk '
+      /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+      {
+        line=$0; sub(/^[[:space:]]+/,"",line); sub(/[[:space:]]+$/, "",line)
+        sub(/[[:space:]]+#.*$/, "",line); sub(/[[:space:]]+$/, "",line)
+        if (substr(line,1,8)!="server=/") next
+        item=substr(line,9); idx=index(item,"/"); if(idx<2)next
+        d=substr(item,1,idx-1); ip=substr(item,idx+1)
+        sub(/[.]$/, "", d)
+        if (d !~ /^[A-Za-z0-9-]+([.][A-Za-z0-9-]+)+$/ || d ~ /[.][.]/ || ip=="" || index(ip,"/") || ip !~ /^[0-9a-fA-F:.]+$/) next
+        print d"|"ip
+      }
+    ' "$RG_SERVERS"
+  }
+  # Import only the completed cron cycle. No probing and no read of current pending
+  # cycle; caller invokes this after SCHEDULE UTC END was written.
+  extract_cycle() {
+    [ -f "$RG_RUNTIME/scheduled.log" ] && [ ! -L "$RG_RUNTIME/scheduled.log" ] || return 1
+    LC_ALL=C awk '
+     /^SCHEDULE UTC: / {buf=""; start=$3; active=0; next}
+     /^SCHEDULE UTC END: / { if ($0 ~ /result=/) {last=buf; last_start=start; last_end=$4; last_rc=$5} next }
+     { if (start!="") buf=buf $0 "\n" }
+     END { if(last_start!="") {print "CYCLE|"last_start"|"last_end"|"last_rc; printf "%s",last} }
+    ' "$RG_RUNTIME/scheduled.log"
+  }
+
+  publish() {
+    [ -d "$RG_RUNTIME" ] && [ ! -L "$RG_RUNTIME" ] || { err 'runtime unavailable or unsafe'; return 1; }
+    if [ -e "$RG_DATA" ] && { [ -L "$RG_DATA" ] || [ ! -d "$RG_DATA" ]; }; then
+      err 'refusing unsafe webui runtime directory'; return 1
+    fi
+    mkdir -p "$RG_DATA" || return 1
+    chmod 700 "$RG_DATA" || :
+    exec 8> "$RG_DATA/publish.lock" || return 1
+    flock -x 8 || return 1
+    cycle="$RG_DATA/cycle-$$"
+    observations="$RG_DATA/observations-$$"
+    trap 'rm -f "$cycle" "$observations" "$RG_DATA"/status-"$$".tmp "$RG_DATA"/history-"$$".tmp "$RG_DATA"/events-"$$".tmp "$RG_DATA"/last-end.new."$$"' EXIT HUP INT TERM
+    extract_cycle > "$cycle" || :
+    # First publish can precede the first cron cycle. Do not invent green state.
+    header=$(sed -n '1p' "$cycle")
+    case "$header" in CYCLE\|*) ;; *) header='CYCLE|||result=unknown' ;; esac
+    start=$(printf '%s\n' "$header" | cut -d'|' -f2)
+    done_at=$(printf '%s\n' "$header" | cut -d'|' -f3)
+    result=$(printf '%s\n' "$header" | cut -d'|' -f4 | sed 's/^result=//')
+    # Per-resolver state: consider failure on any monitored policy check within
+    # the latest complete cycle. Last-pass-only summaries could mask failures.
+    awk '
+      NR==1 {next}
+      {
+        line=$0; sub(/^[[:space:]]+/, "", line)
+        n=split(line,p,/[[:space:]]+/)
+        if(n<3)next
+        if (p[1]!="PASS" && p[1]!="FAIL")next
+        if(p[2]!~/^[a-zA-Z][a-zA-Z0-9_-]*$/)next
+        id=p[2]; if(!(id in seen)){seen[id]=1;ids[++k]=id}
+        if(p[1]=="FAIL") fail[id]++
+        else pass[id]++
+      }
+      END {for(i=1;i<=k;i++){id=ids[i];state=fail[id]?"fail":(pass[id]?"ok":"unknown");print id"|"state"|"pass[id]+0"|"fail[id]+0}}
+    ' "$cycle" > "$observations"
+    # Use the saved enrolled preferred identities; no invented provider names.
+    providers="$RG_ROOT/state/preferred-providers.tsv"
+    current_pool=preferred
+    if [ -f "$RG_ROOT/state/active-pool" ] && [ ! -L "$RG_ROOT/state/active-pool" ]; then
+      current_pool=$(sed -n '1p' "$RG_ROOT/state/active-pool")
+    fi
+    current_pool=$(safe_pool "$current_pool")
+    mode=$(mode_name)
+    interval=1
+    if [ -f "$RG_ROOT/config/settings.conf" ] && [ ! -L "$RG_ROOT/config/settings.conf" ]; then
+      setting=$(grep '^SCHEDULE_INTERVAL_MINUTES=' "$RG_ROOT/config/settings.conf" | tail -n 1 | cut -d= -f2 | tr -dc '0-9')
+      case "$setting" in 1|2|3|5|10|15|30|60) interval=$setting;; esac
+    fi
+    epoch=$(date -u +%s 2>/dev/null || printf 0)
+    # Make one append per completed cycle by remembering its exact END timestamp.
+    old_end=''
+    [ -f "$RG_DATA/last-end" ] && old_end=$(cat "$RG_DATA/last-end")
+    if [ -n "$done_at" ] && [ "$done_at" != "$old_end" ]; then
+      [ ! -L "$RG_DATA/history.tsv" ] || { err 'unsafe history'; return 1; }
+      if [ -f "$providers" ] && [ ! -L "$providers" ]; then
+        awk -F'|' 'NR==FNR {state[$1]=$2; next}
+          $1~/^wan[0-9]+$/ {print $1"|"(state[$1]!=""?state[$1]:"unknown")}
+        ' "$observations" "$providers" | while IFS='|' read -r id status; do
+          printf '%s|%s|%s\n' "$done_at" "$id" "$status"
+        done >> "$RG_DATA/history.tsv"
+      fi
+      # Preserve the newest 40,320 rows; trim only every 60 completed cycles
+      # instead of rewriting the entire file every minute.
+      old_trim_count=0
+      [ -f "$RG_DATA/trim-count" ] && old_trim_count=$(cat "$RG_DATA/trim-count")
+      case "$old_trim_count" in ''|*[!0-9]*) old_trim_count=0 ;; esac
+      old_trim_count=$((old_trim_count+1))
+      if [ "$old_trim_count" -ge 60 ]; then
+        old_trim_count=0
+        if [ -f "$RG_DATA/history.tsv" ]; then
+          tail -n 40320 "$RG_DATA/history.tsv" > "$RG_DATA/history-$$.tmp" &&
+            mv "$RG_DATA/history-$$.tmp" "$RG_DATA/history.tsv"
+        fi
+      fi
+      printf '%s\n' "$old_trim_count" > "$RG_DATA/trim-count.new.$$" &&
+        mv "$RG_DATA/trim-count.new.$$" "$RG_DATA/trim-count"
+      if [ ! -L "$RG_DATA/events.tsv" ]; then
+        grep -E '^(DNS FAILOVER:|DNS FAILBACK:|DNS FILTERED|DNS RESOLVER|DNS RECOVERED:|FAST CONFIRM FAILED:|AUTOMATIC SWITCHING DISABLED:)' "$cycle" 2>/dev/null |
+          while IFS= read -r message; do
+            # Prevent literal line delimiters from corrupting event records.
+            message=$(printf '%s' "$message" | tr '|' '/')
+            printf '%s|%s\n' "$done_at" "$message"
+          done >> "$RG_DATA/events.tsv"
+        tail -n 200 "$RG_DATA/events.tsv" > "$RG_DATA/events-$$.tmp" && mv "$RG_DATA/events-$$.tmp" "$RG_DATA/events.tsv"
+      fi
+      printf '%s\n' "$done_at" > "$RG_DATA/last-end.new.$$" && mv "$RG_DATA/last-end.new.$$" "$RG_DATA/last-end"
+    fi
+    # JSON is computed in volatile files and atomically published to the WebUI.
+    tmp="$RG_DATA/status-$$.tmp"
+    (
+      printf '{"schema":1,"source":"router","generatedEpoch":%s,' "$(number "$epoch")"
+      printf '"lastStart":'; jsonq "$start"; printf ',"lastEnd":';jsonq "$done_at"
+      printf ',"cycleResult":';jsonq "$result"
+      printf ',"pool":';jsonq "$current_pool"
+      printf ',"mode":';jsonq "$mode"
+      printf ',"scheduleMinutes":%s' "$(number "$interval")"
+      printf ',"exceptionsReadable":%s' "$( [ -f "$RG_SERVERS" ] && [ ! -L "$RG_SERVERS" ] && printf true || printf false )"
+      printf ',"pendingTransaction":%s,"recoveryHold":%s,' \
+        "$( [ -e "$RG_ROOT/state/pending-transaction" ] && printf true || printf false )" \
+        "$( [ -e "$RG_ROOT/state/recovery-attention" ] && printf true || printf false )"
+      printf '"resolvers":['
+      sep=''
+      runtime_providers="$RG_RUNTIME/providers.tsv"
+      if [ -f "$runtime_providers" ] && [ ! -L "$runtime_providers" ]; then
+        # Runtime roster: id|address|tls_hostname|DoT_port.
+        while IFS='|' read -r id ip tls dotport extra; do
+          case "$id" in wan[0-9]*|google[0-9]*|backup[0-9]*|[a-zA-Z]*[0-9]) ;; *) continue ;; esac
+          # The loop below never accepts arbitrary HTML; values are JSON-escaped.
+          state=unknown; pass=0; fail=0
+          row=$(awk -F'|' -v k="$id" '$1==k {print;exit}' "$observations")
+          if [ -n "$row" ]; then
+            state=$(printf '%s' "$row" | cut -d'|' -f2)
+            pass=$(printf '%s' "$row" | cut -d'|' -f3)
+            fail=$(printf '%s' "$row" | cut -d'|' -f4)
+          fi
+          printf '%s{"id":' "$sep";jsonq "$id"; printf ',"ip":';jsonq "$ip"
+          printf ',"tls":';jsonq "$tls";printf ',"port":';jsonq "$dotport"
+          printf ',"state":';jsonq "$state";printf ',"policyPass":%s,"policyFail":%s}' "$(number "$pass")" "$(number "$fail")"
+          sep=,
+        done < "$runtime_providers"
+      elif [ -f "$providers" ] && [ ! -L "$providers" ]; then
+        while IFS='|' read -r id ip tls legacy_port dotport extra; do
+          case "$id" in wan[0-9]*) ;; *) continue ;; esac
+          state=unknown; pass=0; fail=0
+          row=$(awk -F'|' -v k="$id" '$1==k {print;exit}' "$observations")
+          if [ -n "$row" ]; then
+            state=$(printf '%s' "$row" | cut -d'|' -f2)
+            pass=$(printf '%s' "$row" | cut -d'|' -f3)
+            fail=$(printf '%s' "$row" | cut -d'|' -f4)
+          fi
+          printf '%s{"id":' "$sep";jsonq "$id"; printf ',"ip":';jsonq "$ip"
+          printf ',"tls":';jsonq "$tls";printf ',"port":';jsonq "$dotport"
+          printf ',"state":';jsonq "$state";printf ',"policyPass":%s,"policyFail":%s}' "$(number "$pass")" "$(number "$fail")"
+          sep=,
+        done < "$providers"
+      fi
+      printf '],"exceptions":['
+      sep=''
+      exceptions | while IFS='|' read -r domain upstream; do
+        printf '%s{"domain":' "$sep";jsonq "$domain";printf ',"upstream":';jsonq "$upstream";printf '}'
+        sep=,
+      done
+      printf '],"events":['
+      sep=''
+      if [ -f "$RG_DATA/events.tsv" ] && [ ! -L "$RG_DATA/events.tsv" ]; then
+        tail -n 24 "$RG_DATA/events.tsv" | while IFS='|' read -r at event; do
+          printf '%s{"at":' "$sep";jsonq "$at";printf ',"message":';jsonq "$event";printf '}'
+          sep=,
+        done
+      fi
+      printf ']}'
+    ) > "$tmp" || return 1
+    mv "$tmp" "$RG_DATA/status.htm" || return 1
+    # History is aggregated in one awk process; avoid forking an awk per row.
+    # Worst-of-bucket states prevent masking real failures. The underlying RAM
+    # history still retains one observation per resolver per completed cycle.
+    tmp="$RG_DATA/history-$$.tmp"
+    (
+      printf '{"schema":1,"buckets":['
+      if [ -f "$RG_DATA/history.tsv" ] && [ ! -L "$RG_DATA/history.tsv" ]; then
+        awk -F'|' '
+          function emit(bucket,id,state,n,fail,unknown) {
+            if (commas++) printf ","
+            printf "{\"at\":\"%s\",\"id\":\"%s\",\"state\":\"%s\",\"samples\":%d,\"failures\":%d,\"unknowns\":%d}",bucket,id,state,n,fail,unknown
+          }
+          $1 ~ /^[0-9]{4}-/ { }
+          NF==3 && $1 ~ /^[0-9][0-9][0-9][0-9]-/ && $2 ~ /^wan[0-9]+$/ && $3 ~ /^(ok|fail|unknown)$/ {
+            # yyyy-mm-ddThh:mm:ssZ, all timestamps from ResolvGuard UTC cron.
+            t=substr($1,1,13)
+            half=substr($1,15,2)+0 < 30 ? "00" : "30"
+            bucket=t ":" half ":00Z"
+            key=bucket SUBSEP $2
+            if (!(key in seen)) { seen[key]=1; keys[++count]=key; bs[key]=bucket; ids[key]=$2 }
+            n[key]++; if($3=="fail") f[key]++; else if($3=="unknown") u[key]++
+          }
+          END {
+            # Deterministic chronological ordering is inherited from append-only
+            # observations. Sort not required for chronological record history.
+            for (i=1;i<=count;i++) {
+              key=keys[i]; state=f[key]>0?"fail":(u[key]>0?"unknown":"ok")
+              emit(bs[key],ids[key],state,n[key],f[key],u[key])
+            }
+          }
+        ' "$RG_DATA/history.tsv"
+      fi
+      printf ']}'
+    ) > "$tmp" || return 1
+    mv "$tmp" "$RG_DATA/history.htm" || return 1
+    rm -f "$cycle" "$observations"
+    trap - EXIT HUP INT TERM
+    return 0
+  }
+
+  # Only the page bearing our own marker + title can be reused or removed.
+  find_slot() {
+    i=1
+    while [ "$i" -le 20 ]; do
+      page="user${i}.asp"
+      title="$RG_WEB/user${i}.title"
+      if [ -f "$title" ] && [ "$(cat "$title")" = "$RG_TITLE" ]; then
+        if [ -f "$RG_WEB/$page" ] && grep -Fq "$RG_MARKER" "$RG_WEB/$page"; then
+          say "$page"; return 0
+        fi
+        err 'ResolvGuard-titled page has an unexpected body; refusing to replace'; return 1
+      fi
+      i=$((i+1))
+    done
+    i=1
+    while [ "$i" -le 20 ]; do
+      if [ ! -e "$RG_WEB/user${i}.asp" ] && [ ! -e "$RG_WEB/user${i}.title" ]; then
+        say "user${i}.asp"; return 0
+      fi
+      i=$((i+1))
+    done
+    err 'all Merlin user page slots occupied'; return 1
+  }
+  lock_menu() {
+    [ -d "$RG_WEB" ] && [ -d "$(dirname "$RG_MENU")" ] || return 1
+    exec 9> "$RG_LOCK" || return 1
+    flock -x 9 || return 1
+  }
+  unlock_menu() { flock -u 9 || :; }
+  # Caller owns /tmp/addonwebui.lock, shared with MerlinAU and other add-ons.
+  rewrite_menu() {
+    action="$1";page="$2"
+    if [ ! -f "$RG_MENU_TMP" ]; then
+      [ -f "$RG_MENU" ] || return 1
+      cp -p "$RG_MENU" "$RG_MENU_TMP" || return 1
+    fi
+    staged="$RG_MENU_TMP.resolvguard.$$"
+    # Drop only the exact ResolvGuard tab (including the old Administration
+    # location); preserve every other existing addon and firmware menu entry.
+    awk -v target="$page" -v action="$action" '
+      index($0,"tabName: \"ResolvGuard\"") && $0 ~ /url: \"user[0-9]+[.]asp\"/ {next}
+      {print}
+      action=="add" && index($0,"url: \"Advanced_WAN_Content.asp\"") {
+        print "{url: \""target"\", tabName: \"ResolvGuard\"},"; inserted=1
+      }
+      END {if(action=="add" && !inserted)exit 4}
+    ' "$RG_MENU_TMP" > "$staged" || { rm -f "$staged"; return 1; }
+    cp -p "$RG_MENU_TMP" "$RG_MENU_TMP.bak.resolvguard.$$" || { rm -f "$staged"; return 1; }
+    mv "$staged" "$RG_MENU_TMP" || return 1
+    umount "$RG_MENU" 2>/dev/null || :
+    if ! mount -o bind "$RG_MENU_TMP" "$RG_MENU"; then
+      # An attempted rollback is safer than leaving the firmware menu detached.
+      mv "$RG_MENU_TMP.bak.resolvguard.$$" "$RG_MENU_TMP" || :
+      mount -o bind "$RG_MENU_TMP" "$RG_MENU" 2>/dev/null || :
+      err 'menu bind mount failed; prior menu restored where possible'
+      return 1
+    fi
+    rm -f "$RG_MENU_TMP.bak.resolvguard.$$"
+  }
+
+  mount_page() {
+    [ -f "$RG_ASSETS/ResolvGuard.asp" ] && [ ! -L "$RG_ASSETS/ResolvGuard.asp" ] || { err 'ASP missing or symlink'; return 1; }
+    lock_menu || { err 'unable to acquire MerlinAU-compatible WebUI lock'; return 1; }
+    page=$(find_slot) || { unlock_menu; return 1; }
+    # Do not alter the existing live page when firmware lacks the WAN anchor.
+    menu_source="$RG_MENU_TMP"
+    [ -f "$menu_source" ] || menu_source="$RG_MENU"
+    if ! grep -F 'url: "Advanced_WAN_Content.asp"' "$menu_source" >/dev/null 2>&1; then
+      err 'WAN Internet Connection menu anchor not found; old page/menu left unchanged'
+      unlock_menu
+      return 1
+    fi
+    [ -f "$RG_ASSETS/dashboard.htm" ] && [ ! -L "$RG_ASSETS/dashboard.htm" ] || {
+      err 'embedded dashboard asset missing or unsafe'; unlock_menu; return 1;
+    }
+    # The firmware WebUI is volatile; persistent source is in /jffs/addons.
+    cp "$RG_ASSETS/ResolvGuard.asp" "$RG_WEB/$page" || { unlock_menu; return 1; }
+    printf '%s\n' "$RG_TITLE" > "$RG_WEB/${page%.asp}.title" || { unlock_menu; return 1; }
+    dir="$RG_WEB/ResolvGuard"
+    if [ -L "$dir" ] || { [ -e "$dir" ] && [ ! -d "$dir" ]; }; then
+      err 'unsafe asset directory';unlock_menu; return 1
+    fi
+    mkdir -p "$dir" "$RG_DATA" || { unlock_menu; return 1; }
+    # Link read-only public JSON snapshots, never config/settings or secrets.
+    for name in status.htm history.htm dashboard.htm; do
+      if [ -e "$dir/$name" ] && [ ! -L "$dir/$name" ]; then
+        err 'refusing to replace non-owned web asset';unlock_menu; return 1
+      fi
+      case "$name" in
+        dashboard.htm) source_file="$RG_ASSETS/dashboard.htm" ;;
+        *) source_file="$RG_DATA/$name" ;;
+      esac
+      ln -sf "$source_file" "$dir/$name" || { unlock_menu; return 1; }
+    done
+    rewrite_menu add "$page"
+    rc=$?
+    unlock_menu
+    if [ "$rc" -eq 0 ]; then say "Mounted ResolvGuard at /$page (JSON: /ext/ResolvGuard/status.htm)";fi
+    return "$rc"
+  }
+
+  unmount_page() {
+    lock_menu || { err 'unable to acquire WebUI lock'; return 1; }
+    # Do not accidentally allocate a free slot on uninstall.
+    found=''
+    for n in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+      if [ -f "$RG_WEB/user$n.title" ] && [ "$(cat "$RG_WEB/user$n.title")" = "$RG_TITLE" ]; then
+        if [ -f "$RG_WEB/user$n.asp" ] && grep -Fq "$RG_MARKER" "$RG_WEB/user$n.asp"; then
+          found="user$n.asp";break
+        else
+          err 'owned title but mismatched HTML; refusing cleanup';unlock_menu; return 1
+        fi
+      fi
+    done
+    if [ -n "$found" ]; then
+      rewrite_menu remove "$found" || { unlock_menu; return 1; }
+      rm -f "$RG_WEB/$found" "$RG_WEB/${found%.asp}.title" || { unlock_menu; return 1; }
+    fi
+    for name in status.htm history.htm dashboard.htm; do
+      case "$name" in
+        dashboard.htm) source_file="$RG_ASSETS/dashboard.htm" ;;
+        *) source_file="$RG_DATA/$name" ;;
+      esac
+      if [ -L "$RG_WEB/ResolvGuard/$name" ] && [ "$(readlink "$RG_WEB/ResolvGuard/$name")" = "$source_file" ]; then
+        rm -f "$RG_WEB/ResolvGuard/$name"
+      fi
+    done
+    rmdir "$RG_WEB/ResolvGuard" 2>/dev/null || :
+    unlock_menu
+    say 'ResolvGuard WebUI unmounted (production DNS untouched)'
+  }
+
+  case "${1:-help}" in
+    publish) publish ;;
+    mount) mount_page ;;
+    unmount) unmount_page ;;
+    startup)
+      i=0
+      while [ "$i" -lt 6 ]; do
+        if [ -d "$RG_WEB" ] && [ -f "$RG_MENU" ] && mount_page; then
+          publish || :
+          exit 0
+        fi
+        i=$((i+1));sleep 10
+      done
+      err 'startup mount deferred; run webui mount manually'
+      exit 1 ;;
+    status)
+      if [ -f "$RG_DATA/status.htm" ]; then cat "$RG_DATA/status.htm";printf '\n'
+      else err 'no completed snapshot; run publish after a scheduled check';exit 1;fi ;;
+    *) say 'Usage: sh resolvguard.sh webui [mount|unmount|publish|startup|status]' ;;
+  esac
+
+)
+# RESOLVGUARD WEBUI INLINE END
 _ScheduleStartup_() {
+  # Start optional UI mounting in background; never block DNS boot recovery.
+  if [ -f "$ROOT/webui/ResolvGuard.asp" ] && [ ! -L "$ROOT/webui/ResolvGuard.asp" ]; then
+    ( _RGWebUI_ startup > /tmp/resolvguard-webui-startup.log 2>&1 ) &
+  fi
   [ -r "$SCHEDULE_MARKER" ] || { _Say_ 'Startup: schedule not enabled; nothing to do'; return 0; }
   _RegisterScheduleCron_ || return 1
   # No writes to production DNS or automatic health checks during boot.
@@ -4354,6 +4785,10 @@ _RunScheduledCheck_() {
   else outcome=$?
   fi
   _Say_ "SCHEDULE UTC END: $(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || _Say_ 'clock-unavailable') result=$outcome"
+  # Publish only after a completed scheduled evaluation; never alter DNS outcomes.
+  if [ -f "$ROOT/webui/ResolvGuard.asp" ] && [ ! -L "$ROOT/webui/ResolvGuard.asp" ]; then
+    _RGWebUI_ publish >/dev/null 2>&1 || :
+  fi
   return "$outcome"
 }
 
@@ -5607,6 +6042,13 @@ _UninstallLocked_() {
   else
     _UninstallNeverEnrolled_ || return 1
   fi
+  # Remove only ResolvGuard-owned WebUI resources before deleting the add-on.
+  if [ -f "$ROOT/webui/ResolvGuard.asp" ] && [ ! -L "$ROOT/webui/ResolvGuard.asp" ]; then
+    _RGWebUI_ unmount || {
+      _Fail_ 'WebUI cleanup failed; installation retained for inspection'
+      return 1
+    }
+  fi
   rm -rf "$ROOT" || {
     _Fail_ 'Failed to remove add-on files; inspect the remaining installation'
     return 1
@@ -6378,6 +6820,7 @@ case "${1:-menu}" in
   policy) _ManagePolicy_ "${2:-status}" ;;
   startup) _ScheduleStartup_ ;;
   scheduled-check) _RunScheduledCheck_ ;;
+  webui) _RGWebUI_ "${2:-status}" ;;
   validate) (
     PROVIDERS="$RUNTIME/providers-validation-$$.tsv"
     trap 'rm -f "$RUNTIME/providers-validation-$$.tsv"' EXIT HUP INT TERM
@@ -6393,7 +6836,7 @@ case "${1:-menu}" in
   help|-h|--help)
     cat <<HELP
 ResolvGuard v$SCRIPT_VERSION (WAN DNS-over-TLS monitoring and failover)
-Usage: sh $ROOT/resolvguard.sh [install|menu|quick-setup|dependencies|configure|uninstall|discover|validate|enroll|pools|check|status|restore|probe <hostname-or-URL> [BOTH|TYPE] [provider-id|all] [summary|full]|schedule [status|enable|disable|logs]|startup|policy [status|approve|revoke]|amtmupdate [check|status|update]|develop|stable]
+Usage: sh $ROOT/resolvguard.sh [install|menu|quick-setup|dependencies|configure|uninstall|discover|validate|enroll|pools|check|status|restore|probe <hostname-or-URL> [BOTH|TYPE] [provider-id|all] [summary|full]|schedule [status|enable|disable|logs]|startup|webui [mount|unmount|publish|status]|policy [status|approve|revoke]|amtmupdate [check|status|update]|develop|stable]
 
 No arguments: if installation is needed, install and offer Quick Setup once; otherwise open the SSH menu. An incomplete setup remains selectable from the menu. e or exit leaves the current menu.
 install verifies prerequisites (including optional bind-dig installation), initializes missing config, and publishes the main script only after preparation succeeds.
