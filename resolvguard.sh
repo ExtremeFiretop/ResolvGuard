@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.0
-readonly SCRIPT_VERSTAG="26111516"
+readonly SCRIPT_VERSTAG="26111522"
 readonly SCRIPT_NAME="ResolvGuard"
 ## Set to "master" for Production Releases ##
 SCRIPT_BRANCH="dev"
