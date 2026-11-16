@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.2
-readonly SCRIPT_VERSTAG="26111614"
+readonly SCRIPT_VERSTAG="26111615"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -3669,6 +3669,59 @@ _EnsureInstalledWebUIAsset_() (
   mv "$stage" "$target" && _VerifyWebUIAsset_ "$target" "$SCRIPT_VERSION" "$SCRIPT_VERSTAG" "$channel"
 )
 
+# Determine whether Merlin is actually serving our current installed ASP.
+# Checking the persistent file alone is insufficient: /www and the WAN menu
+# are volatile and can be absent after a legacy script-only update.
+_IsInstalledWebUIMounted_() (
+  target="$INSTALL_ROOT/ResolvGuard.asp"
+  [ -f "$target" ] && [ ! -L "$target" ] || exit 1
+  [ -f /www/require/modules/menuTree.js ] &&
+    grep -Fq 'tabName: "ResolvGuard"' /www/require/modules/menuTree.js || exit 1
+  [ -f /jffs/scripts/service-event ] &&
+    grep -Fq '# RESOLVGUARD WEBUI MANUAL BEGIN' /jffs/scripts/service-event || exit 1
+  for title in /www/user/user*.title; do
+    [ -f "$title" ] || continue
+    [ "$(cat "$title" 2>/dev/null)" = ResolvGuard ] || continue
+    page="${title%.title}.asp"
+    [ -f "$page" ] && cmp -s "$target" "$page" && exit 0
+  done
+  exit 1
+)
+
+# Best-effort migration for installs previously updated by a script-only
+# updater. The ASP is independently downloaded from the current raw branch,
+# then the authenticated Merlin page is registered. Failure must never block
+# the existing SSH menu, scheduled DNS checks or recovery mechanisms.
+_BootstrapExistingWebUI_() (
+  [ "$ROOT" = "$INSTALL_ROOT" ] && _IsInstallationComplete_ || exit 0
+  bootstrap_lock="$RUNTIME/webui-bootstrap.lock"
+  if [ -L "$bootstrap_lock" ] ||
+     { [ -e "$bootstrap_lock" ] && [ ! -f "$bootstrap_lock" ]; }; then
+    _Say_ 'NOTICE: unexpected WebUI bootstrap lock; skipped for safety'
+    exit 1
+  fi
+  exec 7> "$bootstrap_lock" || exit 1
+  # Another normal menu, boot hook, or installer can finish this in parallel.
+  flock -n 7 || exit 0
+
+  if ! _EnsureInstalledWebUIAsset_; then
+    _Say_ 'NOTICE: WebUI asset bootstrap failed; DNS monitoring and CLI remain available'
+    exit 1
+  fi
+  _IsInstalledWebUIMounted_ && exit 0
+  if [ ! -d /www/user ] || [ ! -f /www/require/modules/menuTree.js ]; then
+    _Say_ 'NOTICE: Merlin WebUI not ready; mounting deferred until next startup or menu'
+    exit 1
+  fi
+  if ! _RGWebUI_ mount > /tmp/resolvguard-webui-bootstrap-mount.log 2>&1; then
+    _Say_ 'NOTICE: WebUI mounting failed; see /tmp/resolvguard-webui-bootstrap-mount.log'
+    exit 1
+  fi
+  _RGWebUI_ publish > /tmp/resolvguard-webui-bootstrap-publish.log 2>&1 ||
+    _Say_ 'NOTICE: WebUI mounted, but the initial snapshot is not yet available'
+  _Say_ 'ResolvGuard WebUI installed and mounted in Merlin WAN menu.'
+)
+
 _InstallResolvGuard_() (
   # The EXIT trap runs after shell function-local variables may have gone out
   # of scope on BusyBox ash. This function already runs in a subshell, so
@@ -3687,7 +3740,9 @@ _InstallResolvGuard_() (
   if _IsInstallationComplete_; then
     _InstallPrerequisites_ || exit 1
     _InitializeMissingConfiguration_ || exit 1
-    _EnsureInstalledWebUIAsset_ || exit 1
+    # Repair AND mount the WebUI after an older script-only channel update.
+    # Mount failure is visual only; never block existing DNS functionality.
+    _BootstrapExistingWebUI_ || :
     _Say_ 'ResolvGuard is already installed; existing configuration preserved.'
     _InstallLauncher_ || :
     exit 0
@@ -5053,10 +5108,17 @@ _RGWebUI_() (
 )
 # RESOLVGUARD WEBUI INLINE END
 _ScheduleStartup_() {
-  # Start optional UI mounting in background; never block DNS boot recovery.
-  if [ -f "$ROOT/ResolvGuard.asp" ] && [ ! -L "$ROOT/ResolvGuard.asp" ]; then
-    ( _RGWebUI_ startup > /tmp/resolvguard-webui-startup.log 2>&1 ) &
-  fi
+  # Background migration/registration even on legacy script-only upgrades.
+  # Retry while boot is bringing up networking and /www, never block DNS recovery.
+  (
+    attempt=0
+    while [ "$attempt" -lt 6 ]; do
+      if _BootstrapExistingWebUI_; then exit 0; fi
+      attempt=$((attempt+1))
+      sleep 10
+    done
+    exit 1
+  ) > /tmp/resolvguard-webui-startup.log 2>&1 &
   [ -r "$SCHEDULE_MARKER" ] || { _Say_ 'Startup: schedule not enabled; nothing to do'; return 0; }
   _RegisterScheduleCron_ || return 1
   # No writes to production DNS or automatic health checks during boot.
@@ -7172,6 +7234,8 @@ case "${1:-menu}" in
     if ! _IsInstallationComplete_; then
       _InstallResolvGuard_ || exit 1
       _StartFirstRunSetup_
+    else
+      _BootstrapExistingWebUI_ || :
     fi
     _MainMenu_ ;;
   configure) _ShowConfigurationMenu_ ;;
