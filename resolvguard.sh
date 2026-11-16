@@ -20,8 +20,8 @@ CONFIG_SCHEMA=5
 set -u
 
 ## Set version for each Production Release ##
-readonly SCRIPT_VERSION=0.2.1
-readonly SCRIPT_VERSTAG="26111602"
+readonly SCRIPT_VERSION=0.2.2
+readonly SCRIPT_VERSTAG="26111612"
 readonly SCRIPT_NAME="ResolvGuard"
 ## Set to "master" for Production Releases ##
 SCRIPT_BRANCH="dev"
