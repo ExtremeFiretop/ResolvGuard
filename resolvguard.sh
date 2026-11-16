@@ -21,8 +21,9 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.2
-readonly SCRIPT_VERSTAG="26111612"
+readonly SCRIPT_VERSTAG="26111613"
 readonly SCRIPT_NAME="ResolvGuard"
+# RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
 SCRIPT_BRANCH="dev"
 
@@ -3601,6 +3602,78 @@ _InstallPrerequisites_() {
   return 0
 }
 
+# The WebUI is one release asset installed beside resolvguard.sh. The HTML
+# includes its own dashboard CSS/JS; only live JSON feeds remain under /ext.
+_WebUIBuildMarker_() {
+  case "$3" in
+    development) printf '%s_%s' "$1" "$2" ;;
+    stable) printf '%s' "$1" ;;
+    *) return 1 ;;
+  esac
+}
+_WebUIAssetURL_() {
+  case "$1" in
+    development) printf '%s/refs/heads/dev/ResolvGuard.asp' "$SCRIPT_URL_BASE" ;;
+    stable) printf '%s/v%s/ResolvGuard.asp' "$RELEASE_URL_BASE" "$2" ;;
+    *) return 1 ;;
+  esac
+}
+_VerifyWebUIAsset_() {
+  local candidate marker
+  candidate="$1"
+  [ -f "$candidate" ] && [ ! -L "$candidate" ] && [ -s "$candidate" ] || return 1
+  [ "$(wc -c < "$candidate")" -le 262144 ] || return 1
+  marker="$(_WebUIBuildMarker_ "$2" "$3" "$4")" || return 1
+  grep -Fx "<!-- ResolvGuard WebUI build $marker -->" "$candidate" >/dev/null 2>&1 &&
+    grep -F '<template id="rg_inline_dashboard">' "$candidate" >/dev/null 2>&1 &&
+    grep -F 'function rgRequestManualCheck()' "$candidate" >/dev/null 2>&1 &&
+    grep -F 'id="runHealthCheck"' "$candidate" >/dev/null 2>&1 &&
+    grep -F 'rgLoadEmbedded();' "$candidate" >/dev/null 2>&1 &&
+    ! grep -F '/ext/ResolvGuard/dashboard.htm' "$candidate" >/dev/null 2>&1
+}
+_FetchWebUIAsset_() {
+  local dest version tag channel url
+  dest="$1";version="$2";tag="$3";channel="$4"
+  [ ! -e "$dest" ] && [ ! -L "$dest" ] || return 1
+  # Source checkout supports local/offline testing. Normal one-script installs
+  # download the companion ASP from the pinned release or the dev branch.
+  if [ -f "$SOURCE_DIR/ResolvGuard.asp" ] && [ ! -L "$SOURCE_DIR/ResolvGuard.asp" ] &&
+     [ "$SOURCE_DIR/ResolvGuard.asp" != "$dest" ] &&
+     _VerifyWebUIAsset_ "$SOURCE_DIR/ResolvGuard.asp" "$version" "$tag" "$channel"; then
+    cp "$SOURCE_DIR/ResolvGuard.asp" "$dest" || return 1
+  else
+    url="$(_WebUIAssetURL_ "$channel" "$version")" || return 1
+    _FetchHTTPS_ "$url" "$dest" || return 1
+  fi
+  if ! _VerifyWebUIAsset_ "$dest" "$version" "$tag" "$channel"; then
+    rm -f "$dest"
+    _Fail_ 'Downloaded WebUI ASP failed build, content or size verification'
+    return 1
+  fi
+  chmod 644 "$dest" || return 1
+}
+
+# For an already complete installation, repair a missing single-file WebUI
+# without touching DNS state or changing a preexisting unexpected file.
+_EnsureInstalledWebUIAsset_() (
+  target="$INSTALL_ROOT/ResolvGuard.asp"
+  channel="$UPDATE_CHANNEL"
+  if [ -f "$target" ] && [ ! -L "$target" ] &&
+     _VerifyWebUIAsset_ "$target" "$SCRIPT_VERSION" "$SCRIPT_VERSTAG" "$channel"; then
+    exit 0
+  fi
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    _Fail_ 'Existing WebUI ASP does not match the installed build; use the updater'
+    exit 1
+  fi
+  stage="$INSTALL_ROOT/.ResolvGuard.asp.install.$$"
+  [ ! -e "$stage" ] && [ ! -L "$stage" ] || exit 1
+  trap 'rm -f "$stage"' EXIT HUP INT TERM
+  _FetchWebUIAsset_ "$stage" "$SCRIPT_VERSION" "$SCRIPT_VERSTAG" "$channel" || exit 1
+  [ ! -e "$target" ] && [ ! -L "$target" ] || exit 1
+  mv "$stage" "$target" && _VerifyWebUIAsset_ "$target" "$SCRIPT_VERSION" "$SCRIPT_VERSTAG" "$channel"
+)
+
 _InstallResolvGuard_() (
   # The EXIT trap runs after shell function-local variables may have gone out
   # of scope on BusyBox ash. This function already runs in a subshell, so
@@ -3609,6 +3682,9 @@ _InstallResolvGuard_() (
   source_lock="$INSTALL_ROOT/.install-in-progress"
   stage="$INSTALL_ROOT/.resolvguard.install.$$"
   marker_stage="$STATE_DIR/.installation-complete.$$"
+  asp_target="$INSTALL_ROOT/ResolvGuard.asp"
+  asp_stage="$INSTALL_ROOT/.ResolvGuard.asp.install.$$"
+  asp_installed=0
   new_install=0
   created_marker=0
   owned_lock=0
@@ -3616,6 +3692,7 @@ _InstallResolvGuard_() (
   if _IsInstallationComplete_; then
     _InstallPrerequisites_ || exit 1
     _InitializeMissingConfiguration_ || exit 1
+    _EnsureInstalledWebUIAsset_ || exit 1
     _Say_ 'ResolvGuard is already installed; existing configuration preserved.'
     _InstallLauncher_ || :
     exit 0
@@ -3653,7 +3730,10 @@ _InstallResolvGuard_() (
   _ShowInstallStage_ 1 'Checking router prerequisites and DNS dependency'
   _InstallationCleanup_() {
     cleanup_rc=$?
-    rm -f "$stage" "$marker_stage" 2>/dev/null || :
+    rm -f "$stage" "$marker_stage" "$asp_stage" 2>/dev/null || :
+    if [ "$cleanup_rc" -ne 0 ] && [ "$asp_installed" = 1 ]; then
+      rm -f "$asp_target" || :
+    fi
     if [ "$cleanup_rc" -ne 0 ] && [ "$created_marker" = 1 ]; then
       rm -f "$INSTALL_MARKER" || :
     fi
@@ -3706,6 +3786,19 @@ _InstallResolvGuard_() (
       _Fail_ 'Main script target appeared during installation; refusing to overwrite'; exit 1;
     }
   fi
+  # No completed installation marker until the single WebUI page is safely
+  # present. Never overwrite a preexisting unknown asset during fresh install.
+  if [ -e "$asp_target" ] || [ -L "$asp_target" ]; then
+    [ -f "$asp_target" ] && [ ! -L "$asp_target" ] &&
+      _VerifyWebUIAsset_ "$asp_target" "$SCRIPT_VERSION" "$SCRIPT_VERSTAG" "$UPDATE_CHANNEL" || {
+      _Fail_ 'Incomplete install contains unexpected WebUI ASP; inspect it before retrying';exit 1;
+    }
+  else
+    _FetchWebUIAsset_ "$asp_stage" "$SCRIPT_VERSION" "$SCRIPT_VERSTAG" "$UPDATE_CHANNEL" || exit 1
+    [ ! -e "$asp_target" ] && [ ! -L "$asp_target" ] || exit 1
+    mv "$asp_stage" "$asp_target" || { _Fail_ 'Could not publish WebUI ASP';exit 1; }
+    asp_installed=1
+  fi
   mv "$marker_stage" "$INSTALL_MARKER" || { _Fail_ 'Cannot record installation readiness'; exit 1; }
   created_marker=1
   if [ "$SOURCE_FILE" != "$target" ]; then
@@ -3716,6 +3809,14 @@ _InstallResolvGuard_() (
   fi
   _IsInstallationComplete_ || { _Fail_ 'Installation verification failed'; exit 1; }
   printf '  %sResolvGuard installed successfully:%s %s\n' "$RG_GREEN" "$RG_RESET" "$target"
+  # Native WebUI is optional at this stage: its asset is installed and
+  # verified, while firmware's /www tree may not be ready until startup.
+  if _RGWebUI_ mount >/tmp/resolvguard-webui-install-mount.log 2>&1; then
+    _RGWebUI_ publish >/dev/null 2>&1 || :
+    _Say_ '  ResolvGuard WebUI mounted under WAN.'
+  else
+    _Say_ '  NOTICE: WebUI asset installed; page mount will retry at router startup.'
+  fi
   _InstallProgressPause_
   _ShowInstallStage_ 4 'Preparing the optional command launcher'
   _InstallLauncher_ || _Say_ 'NOTICE: Optional launcher could not be installed.'
@@ -4540,7 +4641,7 @@ _RGWebUI_() (
   RG_LOCK=${RG_WEBUI_LOCK:-/tmp/addonwebui.lock}
   RG_SERVERS=${RG_WEBUI_SERVERS:-/tmp/resolv.dnsmasq}
   RG_DATA="$RG_RUNTIME/webui"
-  RG_ASSETS="$RG_ROOT/webui"
+  RG_ASSETS="$RG_ROOT"
   RG_TITLE=ResolvGuard
   RG_MARKER='ResolvGuard WebUI Integration v1'
 
@@ -4871,9 +4972,6 @@ _RGWebUI_() (
       unlock_menu
       return 1
     fi
-    [ -f "$RG_ASSETS/dashboard.htm" ] && [ ! -L "$RG_ASSETS/dashboard.htm" ] || {
-      err 'embedded dashboard asset missing or unsafe'; unlock_menu; return 1;
-    }
     # The firmware WebUI is volatile; persistent source is in /jffs/addons.
     cp "$RG_ASSETS/ResolvGuard.asp" "$RG_WEB/$page" || { unlock_menu; return 1; }
     printf '%s\n' "$RG_TITLE" > "$RG_WEB/${page%.asp}.title" || { unlock_menu; return 1; }
@@ -4883,16 +4981,18 @@ _RGWebUI_() (
     fi
     mkdir -p "$dir" "$RG_DATA" || { unlock_menu; return 1; }
     # Link read-only public JSON snapshots, never config/settings or secrets.
-    for name in status.htm history.htm manual.htm dashboard.htm; do
+    for name in status.htm history.htm manual.htm; do
       if [ -e "$dir/$name" ] && [ ! -L "$dir/$name" ]; then
         err 'refusing to replace non-owned web asset';unlock_menu; return 1
       fi
-      case "$name" in
-        dashboard.htm) source_file="$RG_ASSETS/dashboard.htm" ;;
-        *) source_file="$RG_DATA/$name" ;;
-      esac
+      source_file="$RG_DATA/$name"
       ln -sf "$source_file" "$dir/$name" || { unlock_menu; return 1; }
     done
+    # Retire only the legacy link pointing to our old two-file installation.
+    if [ -L "$dir/dashboard.htm" ] &&
+       [ "$(readlink "$dir/dashboard.htm")" = "$RG_ROOT/webui/dashboard.htm" ]; then
+      rm -f "$dir/dashboard.htm" || { unlock_menu;return 1; }
+    fi
     rewrite_menu add "$page"
     rc=$?
     unlock_menu
@@ -4917,15 +5017,16 @@ _RGWebUI_() (
       rewrite_menu remove "$found" || { unlock_menu; return 1; }
       rm -f "$RG_WEB/$found" "$RG_WEB/${found%.asp}.title" || { unlock_menu; return 1; }
     fi
-    for name in status.htm history.htm manual.htm dashboard.htm; do
-      case "$name" in
-        dashboard.htm) source_file="$RG_ASSETS/dashboard.htm" ;;
-        *) source_file="$RG_DATA/$name" ;;
-      esac
+    for name in status.htm history.htm manual.htm; do
+      source_file="$RG_DATA/$name"
       if [ -L "$RG_WEB/ResolvGuard/$name" ] && [ "$(readlink "$RG_WEB/ResolvGuard/$name")" = "$source_file" ]; then
         rm -f "$RG_WEB/ResolvGuard/$name"
       fi
     done
+    if [ -L "$RG_WEB/ResolvGuard/dashboard.htm" ] &&
+       [ "$(readlink "$RG_WEB/ResolvGuard/dashboard.htm")" = "$RG_ROOT/webui/dashboard.htm" ]; then
+      rm -f "$RG_WEB/ResolvGuard/dashboard.htm" || { unlock_menu;return 1; }
+    fi
     rmdir "$RG_WEB/ResolvGuard" 2>/dev/null || :
     unlock_menu
     say 'ResolvGuard WebUI unmounted (production DNS untouched)'
@@ -4958,7 +5059,7 @@ _RGWebUI_() (
 # RESOLVGUARD WEBUI INLINE END
 _ScheduleStartup_() {
   # Start optional UI mounting in background; never block DNS boot recovery.
-  if [ -f "$ROOT/webui/ResolvGuard.asp" ] && [ ! -L "$ROOT/webui/ResolvGuard.asp" ]; then
+  if [ -f "$ROOT/ResolvGuard.asp" ] && [ ! -L "$ROOT/ResolvGuard.asp" ]; then
     ( _RGWebUI_ startup > /tmp/resolvguard-webui-startup.log 2>&1 ) &
   fi
   [ -r "$SCHEDULE_MARKER" ] || { _Say_ 'Startup: schedule not enabled; nothing to do'; return 0; }
@@ -4999,7 +5100,7 @@ _RunScheduledCheck_() {
   fi
   _Say_ "SCHEDULE UTC END: $(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || _Say_ 'clock-unavailable') result=$outcome"
   # Publish only after a completed scheduled evaluation; never alter DNS outcomes.
-  if [ -f "$ROOT/webui/ResolvGuard.asp" ] && [ ! -L "$ROOT/webui/ResolvGuard.asp" ]; then
+  if [ -f "$ROOT/ResolvGuard.asp" ] && [ ! -L "$ROOT/ResolvGuard.asp" ]; then
     _RGWebUI_ publish >/dev/null 2>&1 || :
   fi
   return "$outcome"
@@ -5916,6 +6017,18 @@ _ApplyVerifiedUpdate_() (
       rm -rf "$stage"; _Fail_ 'Release asset is not marked as stable'; exit 1;
     }
   fi
+  # Download and verify the matching ASP before taking commit locks. Older
+  # releases without WebUI support are allowed for explicit channel downgrades.
+  update_webui=0
+  if grep -Fx '# RESOLVGUARD WEBUI ASSET ResolvGuard.asp' "$newscript" >/dev/null 2>&1; then
+    update_webui=1
+    newasp="$stage/ResolvGuard.asp"
+    asp_url="$(_WebUIAssetURL_ "$RELEASE_CHANNEL" "$RELEASE_VERSION")" || exit 1
+    _FetchHTTPS_ "$asp_url" "$newasp" || { rm -rf "$stage";exit 1; }
+    _VerifyWebUIAsset_ "$newasp" "$RELEASE_VERSION" "$RELEASE_VERSTAG" "$RELEASE_CHANNEL" || {
+      rm -rf "$stage";_Fail_ 'WebUI build/content mismatch; update left untouched';exit 1;
+    }
+  fi
   _AcquireConfigLock_ || {
     rm -rf "$stage"
     _Fail_ 'Configuration commit in progress; script replacement deferred'
@@ -5927,91 +6040,131 @@ _ApplyVerifiedUpdate_() (
   staged="$ROOT/.resolvguard.sh.update.$$"
   tempbackup="$STATE_DIR/.updater-previous.sh.$$"
   backup="$STATE_DIR/updater-previous.sh"
+  asp_target="$ROOT/ResolvGuard.asp"
+  asp_staged="$ROOT/.ResolvGuard.asp.update.$$"
+  asp_tempbackup="$STATE_DIR/.updater-previous.asp.$$"
+  asp_had_old=0
+  asp_published=0
+  script_published=0
 
-  # The replacement is staged beside the installed script so the final move
-  # stays on the same filesystem. The old script is retained only until the
-  # new installation has been verified (or a failed installation restored).
-  for path in "$staged" "$tempbackup"; do
+  # Both replacements are staged on the same JFFS filesystem. Preserve the
+  # installed versions only until both new files verify; no lasting backup.
+  for path in "$staged" "$tempbackup" "$asp_staged" "$asp_tempbackup"; do
     if [ -e "$path" ] || [ -L "$path" ]; then
       rm -rf "$stage"
-      _Fail_ 'Update destination staging path occupied'
+      _Fail_ 'Update staging or temporary rollback path occupied'
       exit 1
     fi
   done
-
-  # Previous builds saved a persistent updater-previous.sh. Accept an ordinary
-  # legacy file so that a successful update can retire it, but refuse unsafe
-  # state entries rather than deleting unknown files or following symlinks.
-  if [ -L "$backup" ]; then
-    rm -rf "$stage"
-    _Fail_ 'Existing updater backup is a symbolic link'
-    exit 1
+  if [ -L "$backup" ] || { [ -e "$backup" ] && [ ! -f "$backup" ]; }; then
+    rm -rf "$stage";_Fail_ 'Unsafe legacy updater script backup';exit 1
   fi
-
-  if [ -e "$backup" ] && [ ! -f "$backup" ]; then
-    rm -rf "$stage"
-    _Fail_ 'Existing updater backup is not a regular file'
-    exit 1
+  if [ -e "$asp_target" ] || [ -L "$asp_target" ]; then
+    [ -f "$asp_target" ] && [ ! -L "$asp_target" ] || {
+      rm -rf "$stage";_Fail_ 'Unsafe installed WebUI ASP';exit 1;
+    }
+    asp_had_old=1
   fi
-
   if ! cp "$newscript" "$staged" || ! chmod 755 "$staged" ||
      ! cp "$installed" "$tempbackup" || ! chmod 600 "$tempbackup"; then
     rm -f "$staged" "$tempbackup"
     rm -rf "$stage"
-    _Fail_ 'Cannot stage new script or temporarily preserve old script'
+    _Fail_ 'Cannot stage new script and temporary rollback copy'
     exit 1
   fi
+  if [ "$update_webui" = 1 ]; then
+    if ! cp "$newasp" "$asp_staged" || ! chmod 644 "$asp_staged"; then
+      rm -f "$staged" "$tempbackup" "$asp_staged"
+      rm -rf "$stage";_Fail_ 'Cannot stage WebUI ASP';exit 1
+    fi
+    if [ "$asp_had_old" = 1 ] &&
+       { ! cp "$asp_target" "$asp_tempbackup" || ! chmod 600 "$asp_tempbackup"; }; then
+      rm -f "$staged" "$tempbackup" "$asp_staged" "$asp_tempbackup"
+      rm -rf "$stage";_Fail_ 'Cannot preserve previous WebUI ASP';exit 1
+    fi
+  fi
 
+  rollback_update() {
+    rollback_ok=1
+    if [ "$script_published" = 1 ]; then
+      if ! cp "$tempbackup" "$staged" || ! chmod 755 "$staged" ||
+         ! mv -f "$staged" "$installed" || ! cmp -s "$installed" "$tempbackup"; then
+        rollback_ok=0
+      fi
+    fi
+    if [ "$asp_published" = 1 ]; then
+      if [ "$asp_had_old" = 1 ]; then
+        if ! cp "$asp_tempbackup" "$asp_staged" || ! chmod 644 "$asp_staged" ||
+           ! mv -f "$asp_staged" "$asp_target" || ! cmp -s "$asp_target" "$asp_tempbackup"; then
+          rollback_ok=0
+        fi
+      elif ! rm -f "$asp_target"; then
+        rollback_ok=0
+      fi
+    fi
+    if [ "$rollback_ok" = 1 ]; then
+      rm -f "$staged" "$asp_staged" "$tempbackup" "$asp_tempbackup"
+      rm -rf "$stage"
+      _Fail_ 'Update failed; previous script and ASP restored (where applicable)'
+    else
+      _Fail_ "CRITICAL: update rollback incomplete; preserved copies at $tempbackup and $asp_tempbackup"
+      _Fail_ 'Inspect the installed script/ASP before retrying; DNS state was not modified'
+    fi
+  }
+
+  if [ "$update_webui" = 1 ]; then
+    if ! mv -f "$asp_staged" "$asp_target"; then
+      rollback_update
+      exit 1
+    fi
+    asp_published=1
+    if ! cmp -s "$asp_target" "$newasp" ||
+       ! _VerifyWebUIAsset_ "$asp_target" "$RELEASE_VERSION" "$RELEASE_VERSTAG" "$RELEASE_CHANNEL"; then
+      rollback_update
+      exit 1
+    fi
+  fi
   if ! mv -f "$staged" "$installed"; then
-    rm -f "$staged"
+    rollback_update
+    exit 1
+  fi
+  script_published=1
+  if ! cmp -s "$installed" "$newscript" || ! sh -n "$installed"; then
+    rollback_update
+    exit 1
+  fi
+
+  if ! rm -f "$tempbackup" "$asp_tempbackup"; then
     rm -rf "$stage"
-
-    # Preserve the temporary copy when replacement fails unexpectedly: the
-    # installed script may no longer be identical to the previous version.
-    if cmp -s "$installed" "$tempbackup"; then
-      rm -f "$tempbackup" || :
-      _Fail_ 'Atomic script replacement failed; original installation retained'
-    else
-      _Fail_ "CRITICAL: script replacement failed; previous script retained at $tempbackup"
-    fi
+    _Fail_ 'Update verified but temporary rollback cleanup failed; inspect state directory'
     exit 1
   fi
-
-  # A mismatch after replacement must restore the previous script before any
-  # rollback file is deleted. Keep that file if restoration cannot be proven.
-  if ! cmp -s "$installed" "$newscript"; then
-    if cp "$tempbackup" "$staged" && chmod 755 "$staged" &&
-       mv -f "$staged" "$installed" && cmp -s "$installed" "$tempbackup"; then
-      rm -f "$tempbackup" || _Fail_ "Temporary rollback cleanup failed: $tempbackup"
-      rm -rf "$stage"
-      _Fail_ 'Update verification failed; previous script restored and verified'
-    else
-      rm -f "$staged"
-      rm -rf "$stage"
-      _Fail_ "CRITICAL: update verification and rollback failed; prior script retained at $tempbackup"
-    fi
-    exit 1
-  fi
-
-  # No permanent previous-version backup is retained after success. Clean up
-  # the temporary rollback file and the legacy persistent file (if any).
-  # A failed removal is reported as incomplete maintenance, never as a clean
-  # success, even though the newly installed script already passed verification.
-  if ! rm -f "$tempbackup"; then
-    rm -rf "$stage"
-    _Fail_ "Update installed and verified, but temporary rollback cleanup failed: $tempbackup"
-    exit 1
-  fi
-
   if [ -f "$backup" ] && ! rm -f "$backup"; then
-    rm -rf "$stage"
-    _Fail_ "Update installed and verified, but legacy backup cleanup failed: $backup"
-    exit 1
+    rm -rf "$stage";_Fail_ 'Update verified but legacy backup cleanup failed';exit 1
+  fi
+  if ! rm -rf "$stage"; then
+    _Fail_ 'Update verified but download staging cleanup failed';exit 1
   fi
 
-  if ! rm -rf "$stage"; then
-    _Fail_ "Update installed and verified, but download staging cleanup failed: $stage"
-    exit 1
+  # Remount to pick up the newly installed root ASP on the native WAN page.
+  # Firmware UI may not be ready; a failure is reported rather than risking
+  # a DNS-affecting rollback for a purely visual mount operation.
+  if [ "$update_webui" = 1 ]; then
+    if /bin/sh "$installed" webui mount >/tmp/resolvguard-webui-update-mount.log 2>&1; then
+      # Remove old prototype assets only after a successful remount.
+      legacy="$ROOT/webui"
+      if [ -d "$legacy" ] && [ ! -L "$legacy" ]; then
+        for old in ResolvGuard.asp dashboard.htm; do
+          if [ -f "$legacy/$old" ] && [ ! -L "$legacy/$old" ]; then
+            rm -f "$legacy/$old" || _Say_ "NOTICE: legacy file remains: $legacy/$old"
+          fi
+        done
+        rmdir "$legacy" 2>/dev/null || :
+      fi
+    else
+      _Say_ 'NOTICE: WebUI ASP installed; native page remount deferred. Run: sh /jffs/addons/ResolvGuard.d/resolvguard.sh webui mount'
+      _Say_ 'NOTICE: legacy WebUI files retained until the new page mounts successfully.'
+    fi
   fi
 
   if [ "$RELEASE_CHANNEL" = development ]; then
@@ -6256,7 +6409,10 @@ _UninstallLocked_() {
     _UninstallNeverEnrolled_ || return 1
   fi
   # Remove only ResolvGuard-owned WebUI resources before deleting the add-on.
-  if [ -f "$ROOT/webui/ResolvGuard.asp" ] && [ ! -L "$ROOT/webui/ResolvGuard.asp" ]; then
+  if { [ -f "$ROOT/ResolvGuard.asp" ] && [ ! -L "$ROOT/ResolvGuard.asp" ]; } ||
+     { [ -f "$ROOT/webui/ResolvGuard.asp" ] && [ ! -L "$ROOT/webui/ResolvGuard.asp" ]; } ||
+     { [ -f /jffs/scripts/service-event ] &&
+       grep -Fq '# RESOLVGUARD WEBUI MANUAL BEGIN' /jffs/scripts/service-event; }; then
     _RGWebUI_ unmount || {
       _Fail_ 'WebUI cleanup failed; installation retained for inspection'
       return 1
