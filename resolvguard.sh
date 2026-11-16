@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.0
-readonly SCRIPT_VERSTAG="26111520"
+readonly SCRIPT_VERSTAG="26111516"
 readonly SCRIPT_NAME="ResolvGuard"
 ## Set to "master" for Production Releases ##
 SCRIPT_BRANCH="dev"
@@ -654,6 +654,15 @@ _RunAuthenticatedDoTQuery_() {
   local id hostname record_type output provider ip tls_name tls_port extra status
   id="$1"; hostname="$2"; record_type="$3"; output="$4"
 
+  # Health policy must see answer records only. The interactive Inspector
+  # intentionally retains authority and additional information for diagnosis.
+  # Both modes retain +stats for the exact upstream IP/port/TLS marker.
+  case "${5:-health}" in
+    health) set -- +noall +comments +answer +stats ;;
+    inspection) set -- +noall +comments +answer +authority +additional +stats ;;
+    *) return 1 ;;
+  esac
+
   provider="$(_GetProviderInfo_ "$id")" || return 1
   IFS='|' read -r id ip tls_name tls_port extra <<EOF_RG_DIRECT_DOT
 $provider
@@ -667,7 +676,7 @@ EOF_RG_DIRECT_DOT
   if "$DIG" "@$ip" -p "$tls_port" "$hostname" "$record_type" \
       +tls "+tls-ca=$CA_FILE" "+tls-hostname=$tls_name" \
       "+time=$TIMEOUT_SECONDS" +tries=1 \
-      +noall +comments +answer +authority +additional +stats > "$output" 2>&1; then
+      "$@" > "$output" 2>&1; then
     status=0
   else
     status=$?
@@ -687,6 +696,24 @@ EOF_RG_DIRECT_DOT
     grep -Fx ";; SERVER: $ip#$tls_port($ip) (TLS)" "$output" >/dev/null 2>&1 || return 1
 
   return 0
+}
+
+# Only DNS ANSWER SECTION resource records can satisfy health policies.
+# Other sections may contain valid records of the requested type, but they
+# are not the answer to the policy query. Keep this independent of the dig
+# presentation flags as a fail-closed guard if verbose output is encountered.
+_HasDNSAnswerRecord_() {
+  local response record_type expected_value
+  response="$1"; record_type="$2"; expected_value="$3"
+
+  printf '%s\n' "$response" | awk -v qt="$record_type" -v expected="$expected_value" '
+    /^;; ANSWER SECTION:$/ { in_answer=1; next }
+    /^;; / { in_answer=0; next }
+    /^;/ { next }
+    in_answer && NF>=5 && $2 ~ /^[0-9]+$/ && $3 == "IN" && $4 == qt &&
+      (expected == "-" || $5 == expected) { found=1; exit }
+    END { exit found ? 0 : 1 }
+  '
 }
 
 # Short configuration commits and actual WAN mutations share the config lock.
@@ -1172,7 +1199,7 @@ _ProbeDNSRecord_() {
   # A certificate failure may return dig exit status 0: validate the full
   # authenticated transport response before consulting DNS policy fields.
   response_file="$RUNTIME/health-response-$$.txt"
-  if ! _RunAuthenticatedDoTQuery_ "$id" "$qname" "$qtype" "$response_file"; then
+  if ! _RunAuthenticatedDoTQuery_ "$id" "$qname" "$qtype" "$response_file" health; then
     _PrintHealthCheckResult_ FAIL "$id $qname $qtype: authenticated DoT error/timeout"
     rm -f "$response_file"
     return 1
@@ -1199,10 +1226,8 @@ _ProbeDNSRecord_() {
     AT_LEAST_1)
       # DNS ANSWER includes aliases such as CNAME, so a nonzero header count
       # does not prove the requested A, AAAA or other record type was returned.
-      if [ "$actual_count" -eq 0 ] || ! printf '%s\n' "$output" | awk -v qt="$qtype" '
-          $1 !~ /^;/ && $4 == qt { found = 1 }
-          END { exit found ? 0 : 1 }
-        '; then
+      if [ "$actual_count" -eq 0 ] ||
+         ! _HasDNSAnswerRecord_ "$output" "$qtype" '-'; then
         _PrintHealthCheckResult_ FAIL "$id $qname $qtype: no $qtype answer record (expected at least 1; policy mismatch)"
         return 1
       fi
@@ -1215,9 +1240,7 @@ _ProbeDNSRecord_() {
       ;;
   esac
   if [ "$want_value" != '-' ]; then
-    if ! printf '%s\n' "$output" | awk -v qt="$qtype" -v expected="$want_value" '
-      $1 !~ /^;/ && $4 == qt && $5 == expected {found=1}
-      END {exit found ? 0 : 1}'; then
+    if ! _HasDNSAnswerRecord_ "$output" "$qtype" "$want_value"; then
       _PrintHealthCheckResult_ FAIL "$id $qname $qtype: expected answer $want_value absent (policy mismatch)"
       return 1
     fi
@@ -1279,7 +1302,7 @@ _InspectDNSResponse_() {
   local answers capturefile source_ip code_colour count_colour ttl_colour policy_colour first_value
   id="$1"; hostname="$2"; rr="$3"; display="$4"; capturefile="${5:-}"; source_ip="${6:-$id}"
   file="$RUNTIME/inspection-$$.txt"
-  if ! _RunAuthenticatedDoTQuery_ "$id" "$hostname" "$rr" "$file"; then
+  if ! _RunAuthenticatedDoTQuery_ "$id" "$hostname" "$rr" "$file" inspection; then
     printf '    %-6s %-10s %7s %7s  %s\n' "$rr" 'QUERY ERROR' '-' '-' '-'
     _Say_ '      ERROR: Authenticated DoT query failed, timed out or had no verified response.'
     [ "$display" = full ] && cat "$file"
