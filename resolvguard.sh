@@ -4316,6 +4316,217 @@ _ReconcileBootState_() {
   return 1
 }
 
+# RESOLVGUARD WEBUI MANUAL CHECK BEGIN
+# Manual WebUI checks reuse the policy/authenticated-DoT probe engine but never
+# the DNS health watchdog/failover state machine. All work runs in subshells.
+_RGManual_() (
+  umask 077
+  RG_M_DATA="${RUNTIME}/webui"
+  RG_M_HOOK=/jffs/scripts/service-event
+  RG_M_LOCK=/tmp/addonwebui.lock
+  RG_M_BEG='# RESOLVGUARD WEBUI MANUAL BEGIN'
+  RG_M_END='# RESOLVGUARD WEBUI MANUAL END'
+
+  message() { printf '%s\n' "ResolvGuard WebUI manual: $*" >&2; }
+  quote() {
+    printf '%s' "$1" | LC_ALL=C awk '
+      BEGIN{printf "\""}
+      {
+        if(NR>1)printf "\\n"
+        for(i=1;i<=length($0);i++) {
+          c=substr($0,i,1)
+          if(c=="\\")printf "\\\\"
+          else if(c=="\"")printf "\\\""
+          else if(c==sprintf("%c",9))printf "\\t"
+          else if(c==sprintf("%c",13))printf "\\r"
+          else if(c=="<")printf "\\u003c"
+          else if(c==">")printf "\\u003e"
+          else if(c=="&")printf "\\u0026"
+          else printf "%s",c
+        }
+      }
+      END{printf "\""}
+    '
+  }
+  epoch() { date +%s 2>/dev/null || printf '0'; }
+  atomic() {
+    # All published documents are bounded, validated JSON in volatile /tmp.
+    [ -d "$RG_M_DATA" ] && [ ! -L "$RG_M_DATA" ] || return 1
+    [ ! -L "$RG_M_DATA/manual.htm" ] || return 1
+    staged="$RG_M_DATA/.manual-$$.new"
+    [ ! -e "$staged" ] && [ ! -L "$staged" ] || return 1
+    cat > "$staged" && mv -f "$staged" "$RG_M_DATA/manual.htm"
+  }
+  error_result() {
+    completed=$(epoch)
+    {
+      printf '{"schema":1,"requestId":';quote "$RG_M_ID"
+      printf ',"status":"error","startedEpoch":%s,"completedEpoch":%s,"message":' "$RG_M_STARTED" "$completed"
+      quote "$1"
+      printf ',"checks":[],"resolvers":[]}\n'
+    } | atomic
+    message "$1"
+    return 1
+  }
+  hook_body() {
+    printf '%s\n' "$RG_M_BEG" \
+      'if [ "$1" = "start" ] && [ "$2" = "ResolvGuardManualCheck" ]; then' \
+      '  /bin/sh /jffs/addons/ResolvGuard.d/resolvguard.sh webui manual-run >/tmp/resolvguard-webui-manual.log 2>&1 &' \
+      'fi' \
+      "$RG_M_END"
+  }
+  update_hook() {
+    action="$1"
+    [ "$ROOT" = /jffs/addons/ResolvGuard.d ] || { message 'expected installed ResolvGuard path';return 1; }
+    [ ! -L "$RG_M_HOOK" ] && { [ ! -e "$RG_M_HOOK" ] || [ -f "$RG_M_HOOK" ]; } || {
+      message 'unsafe service-event file';return 1;
+    }
+    [ -d /jffs/scripts ] && [ ! -L /jffs/scripts ] || { message 'scripts directory missing or unsafe';return 1; }
+    exec 9> "$RG_M_LOCK" || return 1
+    flock -x 9 || return 1
+    count_begin=0;count_end=0
+    if [ -f "$RG_M_HOOK" ]; then
+      count_begin=$(grep -Fxc "$RG_M_BEG" "$RG_M_HOOK" || :)
+      count_end=$(grep -Fxc "$RG_M_END" "$RG_M_HOOK" || :)
+    fi
+    if [ "$count_begin" -gt 1 ] || [ "$count_end" != "$count_begin" ]; then
+      message 'ambiguous existing service-event markers';return 1
+    fi
+    if [ "$count_begin" = 1 ]; then
+      actual=$(sed -n '/^# RESOLVGUARD WEBUI MANUAL BEGIN$/,/^# RESOLVGUARD WEBUI MANUAL END$/p' "$RG_M_HOOK")
+      expected=$(hook_body)
+      if [ "$actual" != "$expected" ]; then
+        message 'owned service-event block differs from expected; refusing modification';return 1
+      fi
+      [ "$action" = install ] && return 0
+    elif [ "$action" = remove ]; then
+      return 0
+    fi
+    staged=/jffs/scripts/.service-event-resolvguard-manual-$$
+    [ ! -e "$staged" ] && [ ! -L "$staged" ] || return 1
+    if [ -f "$RG_M_HOOK" ]; then
+      if [ "$action" = remove ]; then
+        sed '/^# RESOLVGUARD WEBUI MANUAL BEGIN$/,/^# RESOLVGUARD WEBUI MANUAL END$/d' "$RG_M_HOOK" > "$staged" || return 1
+      else
+        cat "$RG_M_HOOK" > "$staged" || return 1
+        printf '\n' >> "$staged"
+        hook_body >> "$staged" || return 1
+      fi
+    else
+      printf '#!/bin/sh\n\n' > "$staged" || return 1
+      hook_body >> "$staged" || return 1
+    fi
+    chmod 755 "$staged" && mv -f "$staged" "$RG_M_HOOK" || { rm -f "$staged";return 1; }
+    return 0
+  }
+  run() {
+    [ "$ROOT" = /jffs/addons/ResolvGuard.d ] || { message 'not running from installed add-on';return 1; }
+    [ -d "$RUNTIME" ] && [ ! -L "$RUNTIME" ] || { message 'runtime directory unavailable';return 1; }
+    if [ -e "$RG_M_DATA" ] && { [ -L "$RG_M_DATA" ] || [ ! -d "$RG_M_DATA" ]; }; then
+      message 'unsafe WebUI runtime directory';return 1
+    fi
+    mkdir -p "$RG_M_DATA" || return 1
+    chmod 700 "$RG_M_DATA" || :
+    [ ! -L "$RG_M_DATA/manual.lock" ] || return 1
+    exec 7> "$RG_M_DATA/manual.lock" || return 1
+    if ! flock -n 7; then
+      message 'manual health check already running; request ignored'
+      return 1
+    fi
+    RG_M_STARTED=$(epoch)
+    RG_M_ID="${RG_M_STARTED}-$$"
+    { printf '{"schema":1,"requestId":';quote "$RG_M_ID"
+      printf ',"status":"running","startedEpoch":%s,"completedEpoch":0,"message":"Direct authenticated DoT policy probes running","checks":[],"resolvers":[]}\n' "$RG_M_STARTED"
+    } | atomic || return 1
+
+    RG_INSPECT_CONFIG_HELD=0
+    RG_INSPECT_DIR=''
+    trap '_CleanupInspectorSession_' EXIT HUP INT TERM
+    _RequireProbeDependencies_ >/dev/null 2>&1 || { error_result 'Authenticated DoT probe dependency unavailable'; return 1; }
+    attempt=0
+    until _AcquireConfigLock_; do
+      attempt=$((attempt+1))
+      [ "$attempt" -lt 6 ] || { error_result 'Configuration busy; manual check deferred';return 1; }
+      sleep 1
+    done
+    RG_INSPECT_CONFIG_HELD=1
+    [ ! -L "$RUNTIME/inspectors" ] || { error_result 'Unsafe inspector directory';return 1; }
+    mkdir -p "$RUNTIME/inspectors" || { error_result 'Unable to prepare inspector directory';return 1; }
+    RG_INSPECT_DIR="$RUNTIME/inspectors/$$"
+    [ ! -e "$RG_INSPECT_DIR" ] && [ ! -L "$RG_INSPECT_DIR" ] && mkdir "$RG_INSPECT_DIR" || {
+      error_result 'Unable to reserve inspector session';return 1;
+    }
+    PROVIDERS="$RG_INSPECT_DIR/providers.tsv"
+    _ValidateConfiguration_ >/dev/null 2>&1 || { error_result 'Current DNS monitoring policy/configuration failed validation';return 1; }
+    [ -f "$CHECKS" ] && [ ! -L "$CHECKS" ] && cp "$CHECKS" "$RG_INSPECT_DIR/checks.tsv" || {
+      error_result 'Unable to snapshot the approved DNS checks';return 1;
+    }
+    if ! _ReleaseConfigLock_; then
+      error_result 'Could not release configuration admission lock';return 1
+    fi
+    RG_INSPECT_CONFIG_HELD=0
+
+    RG_HEALTH_COLOR_ENABLED=0
+    RG_HEALTH_SHOW_RESOLVERS=0
+    outcomes="$RG_INSPECT_DIR/outcomes.tsv"
+    : > "$outcomes" || { error_result 'Unable to create check results';return 1; }
+    passed=0;failed=0
+    while IFS='|' read -r id ip tls port extra; do
+      [ -n "$id" ] || continue
+      while IFS='|' read -r name typ rcode count expected extra; do
+        case "$name" in ''|\#*) continue;; esac
+        # Each call is read-only and authenticates the exact configured TLS peer.
+        details=$(_ProbeDNSRecord_ "$id" "$name" "$typ" "$rcode" "$count" "$expected" 2>&1)
+        rc=$?
+        details=$(printf '%s' "$details" | tr '\n|' '  ' | cut -c 1-360)
+        if [ "$rc" -eq 0 ]; then result=PASS;passed=$((passed+1))
+        else result=FAIL;failed=$((failed+1)); fi
+        printf '%s|%s|%s|%s|%s\n' "$id" "$name" "$typ" "$result" "$details" >> "$outcomes" || {
+          error_result 'Unable to save the check details';return 1;
+        }
+      done < "$RG_INSPECT_DIR/checks.tsv"
+    done < "$PROVIDERS"
+    [ $((passed+failed)) -gt 0 ] || { error_result 'No DNS policy observations were completed';return 1; }
+    complete=$(epoch)
+    {
+      printf '{"schema":1,"requestId":';quote "$RG_M_ID"
+      printf ',"status":"complete","startedEpoch":%s,"completedEpoch":%s' "$RG_M_STARTED" "$complete"
+      printf ',"passed":%s,"failed":%s,"checks":[' "$passed" "$failed"
+      sep=''
+      while IFS='|' read -r id name typ result details; do
+        printf '%s{"id":' "$sep";quote "$id"
+        printf ',"hostname":';quote "$name"
+        printf ',"type":';quote "$typ"
+        printf ',"result":';quote "$result"
+        printf ',"detail":';quote "$details"
+        printf '}'
+        sep=,
+      done < "$outcomes"
+      printf '],"resolvers":['
+      sep=''
+      while IFS='|' read -r id ip tls port extra; do
+        counts=$(awk -F'|' -v key="$id" '$1==key {if($4=="PASS")p++;else if($4=="FAIL")f++} END{printf "%d|%d",p+0,f+0}' "$outcomes")
+        good=${counts%%|*};bad=${counts#*|}
+        printf '%s{"id":' "$sep";quote "$id"
+        printf ',"ip":';quote "$ip"
+        printf ',"tls":';quote "$tls"
+        printf ',"port":';quote "$port"
+        printf ',"passed":%s,"failed":%s}' "$good" "$bad"
+        sep=,
+      done < "$PROVIDERS"
+      printf ']}\n'
+    } | atomic || { error_result 'Unable to atomically publish manual results';return 1; }
+    return 0
+  }
+  case "${1:-}" in
+    run) run ;;
+    status) [ -f "$RG_M_DATA/manual.htm" ] && [ ! -L "$RG_M_DATA/manual.htm" ] && cat "$RG_M_DATA/manual.htm" || { message 'no manual health check result yet';return 1; } ;;
+    hook-install) update_hook install ;;
+    hook-remove) update_hook remove ;;
+    *) message 'Usage: webui [manual-run|manual-status]';return 2 ;;
+  esac
+)
+# RESOLVGUARD WEBUI MANUAL CHECK END
 # RESOLVGUARD WEBUI INLINE BEGIN (read-only; generated from reviewed v1.1 controller)
 # All controller functions and variables execute in a subshell to avoid
 # altering the DNS monitor's globals, options, locks, and exit traps.
@@ -4672,7 +4883,7 @@ _RGWebUI_() (
     fi
     mkdir -p "$dir" "$RG_DATA" || { unlock_menu; return 1; }
     # Link read-only public JSON snapshots, never config/settings or secrets.
-    for name in status.htm history.htm dashboard.htm; do
+    for name in status.htm history.htm manual.htm dashboard.htm; do
       if [ -e "$dir/$name" ] && [ ! -L "$dir/$name" ]; then
         err 'refusing to replace non-owned web asset';unlock_menu; return 1
       fi
@@ -4706,7 +4917,7 @@ _RGWebUI_() (
       rewrite_menu remove "$found" || { unlock_menu; return 1; }
       rm -f "$RG_WEB/$found" "$RG_WEB/${found%.asp}.title" || { unlock_menu; return 1; }
     fi
-    for name in status.htm history.htm dashboard.htm; do
+    for name in status.htm history.htm manual.htm dashboard.htm; do
       case "$name" in
         dashboard.htm) source_file="$RG_ASSETS/dashboard.htm" ;;
         *) source_file="$RG_DATA/$name" ;;
@@ -4722,12 +4933,12 @@ _RGWebUI_() (
 
   case "${1:-help}" in
     publish) publish ;;
-    mount) mount_page ;;
-    unmount) unmount_page ;;
+    mount) mount_page && _RGManual_ hook-install ;;
+    unmount) _RGManual_ hook-remove && unmount_page ;;
     startup)
       i=0
       while [ "$i" -lt 6 ]; do
-        if [ -d "$RG_WEB" ] && [ -f "$RG_MENU" ] && mount_page; then
+        if [ -d "$RG_WEB" ] && [ -f "$RG_MENU" ] && mount_page && _RGManual_ hook-install; then
           publish || :
           exit 0
         fi
@@ -4738,7 +4949,9 @@ _RGWebUI_() (
     status)
       if [ -f "$RG_DATA/status.htm" ]; then cat "$RG_DATA/status.htm";printf '\n'
       else err 'no completed snapshot; run publish after a scheduled check';exit 1;fi ;;
-    *) say 'Usage: sh resolvguard.sh webui [mount|unmount|publish|startup|status]' ;;
+    manual-run) _RGManual_ run ;;
+    manual-status) _RGManual_ status ;;
+    *) say 'Usage: sh resolvguard.sh webui [mount|unmount|publish|startup|status|manual-run|manual-status]' ;;
   esac
 
 )
