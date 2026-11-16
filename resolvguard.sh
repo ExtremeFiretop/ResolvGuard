@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.2
-readonly SCRIPT_VERSTAG="26111613"
+readonly SCRIPT_VERSTAG="26111614"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -3602,29 +3602,24 @@ _InstallPrerequisites_() {
   return 0
 }
 
-# The WebUI is one release asset installed beside resolvguard.sh. The HTML
+# The WebUI is a GitHub raw-repository companion file installed beside resolvguard.sh. The HTML
 # includes its own dashboard CSS/JS; only live JSON feeds remain under /ext.
-_WebUIBuildMarker_() {
-  case "$3" in
-    development) printf '%s_%s' "$1" "$2" ;;
-    stable) printf '%s' "$1" ;;
-    *) return 1 ;;
-  esac
-}
 _WebUIAssetURL_() {
   case "$1" in
     development) printf '%s/refs/heads/dev/ResolvGuard.asp' "$SCRIPT_URL_BASE" ;;
-    stable) printf '%s/v%s/ResolvGuard.asp' "$RELEASE_URL_BASE" "$2" ;;
+    stable) printf '%s/refs/heads/main/ResolvGuard.asp' "$SCRIPT_URL_BASE" ;;
     *) return 1 ;;
   esac
 }
+# No ASP build tag synchronization: update downloads the current ASP from the
+# selected channel whenever a script update is applied. Preserve the extra
+# arguments accepted by historical callers, but do not inspect their values.
 _VerifyWebUIAsset_() {
-  local candidate marker
+  local candidate
   candidate="$1"
   [ -f "$candidate" ] && [ ! -L "$candidate" ] && [ -s "$candidate" ] || return 1
   [ "$(wc -c < "$candidate")" -le 262144 ] || return 1
-  marker="$(_WebUIBuildMarker_ "$2" "$3" "$4")" || return 1
-  grep -Fx "<!-- ResolvGuard WebUI build $marker -->" "$candidate" >/dev/null 2>&1 &&
+  grep -Fx '<!-- ResolvGuard WebUI Integration v1 -->' "$candidate" >/dev/null 2>&1 &&
     grep -F '<template id="rg_inline_dashboard">' "$candidate" >/dev/null 2>&1 &&
     grep -F 'function rgRequestManualCheck()' "$candidate" >/dev/null 2>&1 &&
     grep -F 'id="runHealthCheck"' "$candidate" >/dev/null 2>&1 &&
@@ -3647,7 +3642,7 @@ _FetchWebUIAsset_() {
   fi
   if ! _VerifyWebUIAsset_ "$dest" "$version" "$tag" "$channel"; then
     rm -f "$dest"
-    _Fail_ 'Downloaded WebUI ASP failed build, content or size verification'
+    _Fail_ 'Downloaded WebUI ASP failed identity, content or size verification'
     return 1
   fi
   chmod 644 "$dest" || return 1
@@ -3663,7 +3658,7 @@ _EnsureInstalledWebUIAsset_() (
     exit 0
   fi
   if [ -e "$target" ] || [ -L "$target" ]; then
-    _Fail_ 'Existing WebUI ASP does not match the installed build; use the updater'
+    _Fail_ 'Existing WebUI ASP failed integrity validation; refusing to overwrite it'
     exit 1
   fi
   stage="$INSTALL_ROOT/.ResolvGuard.asp.install.$$"
@@ -6017,8 +6012,8 @@ _ApplyVerifiedUpdate_() (
       rm -rf "$stage"; _Fail_ 'Release asset is not marked as stable'; exit 1;
     }
   fi
-  # Download and verify the matching ASP before taking commit locks. Older
-  # releases without WebUI support are allowed for explicit channel downgrades.
+  # Always download and verify the current ASP whenever the target script
+  # declares WebUI support. Older releases without it may still be selected.
   update_webui=0
   if grep -Fx '# RESOLVGUARD WEBUI ASSET ResolvGuard.asp' "$newscript" >/dev/null 2>&1; then
     update_webui=1
@@ -6026,7 +6021,7 @@ _ApplyVerifiedUpdate_() (
     asp_url="$(_WebUIAssetURL_ "$RELEASE_CHANNEL" "$RELEASE_VERSION")" || exit 1
     _FetchHTTPS_ "$asp_url" "$newasp" || { rm -rf "$stage";exit 1; }
     _VerifyWebUIAsset_ "$newasp" "$RELEASE_VERSION" "$RELEASE_VERSTAG" "$RELEASE_CHANNEL" || {
-      rm -rf "$stage";_Fail_ 'WebUI build/content mismatch; update left untouched';exit 1;
+      rm -rf "$stage";_Fail_ 'WebUI asset identity/content invalid; update left untouched';exit 1;
     }
   fi
   _AcquireConfigLock_ || {
