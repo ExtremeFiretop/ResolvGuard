@@ -24,7 +24,7 @@ readonly SCRIPT_VERSION=0.2.1
 readonly SCRIPT_VERSTAG="26111602"
 readonly SCRIPT_NAME="ResolvGuard"
 ## Set to "master" for Production Releases ##
-SCRIPT_BRANCH="master"
+SCRIPT_BRANCH="dev"
 
 # Run install from a staged download, or from the final script path. A normal
 # first launch uses the same installation path before opening the SSH menu.
