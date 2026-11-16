@@ -1,6 +1,6 @@
 # ResolvGuard — Intelligent DNS Monitoring & Failover for Asuswrt-Merlin
 
-## v0.2.0
+## v0.2.1 (development candidate)
 
 **Your DNS provider can be online and still return the wrong answer. ResolvGuard helps you catch that.**
 
@@ -112,13 +112,13 @@ For example, a health check can specify:
 
 | Field | Example |
 | --- | --- |
-| Hostname | `example.com` |
+| Hostname | `a.root-servers.net` |
 | Record type | `A` |
 | Expected response | `NOERROR` |
-| Expected answer count | `ANY` |
+| Expected answer count | `AT_LEAST_1` (at least one A record) |
 | Expected data | `-` (no specific value required) |
 
-Checks can also validate other supported record types, expected response codes, and specific answer data. This is especially useful when an application depends on a particular DNS response rather than simple resolver reachability.
+Checks can also validate other supported record types, expected response codes, and specific answer data. `ANY` ignores the number of answers; an integer requires that exact count. This is especially useful when an application depends on a particular DNS response rather than simple resolver reachability.
 
 ## Useful SSH commands
 
@@ -127,7 +127,7 @@ You can perform common tasks without opening the menu:
 ```sh
 sh /jffs/addons/ResolvGuard.d/resolvguard.sh status                # Show DNS and protection status
 sh /jffs/addons/ResolvGuard.d/resolvguard.sh check                 # Run a DNS health check now
-sh /jffs/addons/ResolvGuard.d/resolvguard.sh probe example.com A   # Inspect an A-record response
+sh /jffs/addons/ResolvGuard.d/resolvguard.sh probe a.root-servers.net A   # Inspect an A-record response
 sh /jffs/addons/ResolvGuard.d/resolvguard.sh schedule status       # Show scheduled monitoring status
 sh /jffs/addons/ResolvGuard.d/resolvguard.sh schedule enable       # Enable scheduled monitoring
 sh /jffs/addons/ResolvGuard.d/resolvguard.sh schedule logs         # View recent monitoring results

@@ -20,8 +20,8 @@ CONFIG_SCHEMA=5
 set -u
 
 ## Set version for each Production Release ##
-readonly SCRIPT_VERSION=0.2.0
-readonly SCRIPT_VERSTAG="26111513"
+readonly SCRIPT_VERSION=0.2.1
+readonly SCRIPT_VERSTAG="26111602"
 readonly SCRIPT_NAME="ResolvGuard"
 ## Set to "master" for Production Releases ##
 SCRIPT_BRANCH="master"
@@ -297,9 +297,8 @@ readonly UPDATE_CHANNEL
 readonly UPDATE_MANIFEST_URL="${SCRIPT_URL_REPO}/version.txt"
 readonly UPDATE_DEV_SCRIPT_URL="${SCRIPT_URL_REPO}/resolvguard.sh"
 
-WAN_PORT_START=53054
 umask 077
-mkdir -p "$RUNTIME/pids" "$RUNTIME/states" "$RUNTIME/configs" || exit 1
+mkdir -p "$RUNTIME/states" || exit 1
 chmod 700 "$RUNTIME" || exit 1
 
 _Say_() { printf '%s\n' "$*"; }
@@ -521,8 +520,11 @@ _ParseWANUpstreams_() {
   ' "$WAN_STUBBY_CONFIG"
 }
 
+# Runtime provider inventory is ID|IP|TLS-name|TLS-port. Existing saved preferred
+# snapshots retain their historical five-field format; the obsolete fourth
+# (localhost probe port) is never used or allocated for direct DoT.
 _PrepareProviders_() {
-  local tmp raw id ip host localport tlsport extra n
+  local tmp raw id ip host tlsport extra n
   tmp="$PROVIDERS.new.$$"
   raw="$RUNTIME/discovered-$$"
   : > "$tmp" || return 1
@@ -532,7 +534,11 @@ _PrepareProviders_() {
       rm -f "$tmp"
       return 1
     fi
-    cp "$PREF_PROVIDERS" "$tmp" || { rm -f "$tmp"; return 1; }
+    # Ignore only the legacy local listener port. Preserve every saved server
+    # address, TLS identity, TLS port and original order.
+    awk -F'|' 'BEGIN {OFS="|"} {print $1,$2,$3,$5}' "$PREF_PROVIDERS" > "$tmp" || {
+      rm -f "$tmp"; return 1;
+    }
   else
     _ParseWANUpstreams_ > "$raw" || { rm -f "$tmp" "$raw"; return 1; }
     n=0
@@ -545,12 +551,13 @@ _PrepareProviders_() {
       fi
       _IsValidDomain_ "$host" || { _Fail_ "Invalid WAN TLS identity for $ip"; rm -f "$tmp" "$raw"; return 1; }
       _IsValidTLSPort_ "$tlsport" || { _Fail_ "Invalid WAN TLS port for $ip"; rm -f "$tmp" "$raw"; return 1; }
-      if awk -F'|' -v i="$ip" -v h="$host" -v p="$tlsport" '$2==i && $3==h && $5==p {found=1} END{exit !found}' "$tmp"; then
+      if awk -F'|' -v i="$ip" -v h="$host" -v p="$tlsport" '$2==i && $3==h && $4==p {found=1} END{exit !found}' "$tmp"; then
         continue
       fi
-      n=$((n+1)); localport=$((WAN_PORT_START+n-1))
-      _IsValidPort_ "$localport" || { _Fail_ 'WAN probe port range exhausted'; rm -f "$tmp" "$raw"; return 1; }
-      printf 'wan%s|%s|%s|%s|%s\n' "$n" "$ip" "$host" "$localport" "$tlsport" >> "$tmp"
+      n=$((n+1))
+      printf 'wan%s|%s|%s|%s\n' "$n" "$ip" "$host" "$tlsport" >> "$tmp" || {
+        rm -f "$tmp" "$raw"; return 1;
+      }
     done < "$raw"
     rm -f "$raw"
   fi
@@ -558,16 +565,11 @@ _PrepareProviders_() {
     while IFS='|' read -r id ip host tlsport extra; do
       case "$id" in ''|\#*) continue;; esac
       tlsport="${tlsport:-853}"
-      if awk -F'|' -v i="$ip" -v h="$host" -v p="$tlsport" '$2==i && $3==h && $5==p {found=1} END{exit !found}' "$tmp"; then
+      if awk -F'|' -v i="$ip" -v h="$host" -v p="$tlsport" '$2==i && $3==h && $4==p {found=1} END{exit !found}' "$tmp"; then
         _Say_ "NOTICE: extra resolver $id duplicates an existing endpoint; skipping" >&2
         continue
       fi
-      localport="$WAN_PORT_START"
-      while awk -F'|' -v p="$localport" '$4==p {found=1} END{exit !found}' "$tmp"; do
-        localport=$((localport + 1))
-        _IsValidPort_ "$localport" || { _Fail_ 'Local probe port range exhausted'; rm -f "$tmp"; return 1; }
-      done
-      printf '%s|%s|%s|%s|%s\n' "$id" "$ip" "$host" "$localport" "$tlsport" >> "$tmp" || {
+      printf '%s|%s|%s|%s\n' "$id" "$ip" "$host" "$tlsport" >> "$tmp" || {
         rm -f "$tmp"; return 1;
       }
     done < "$EXTRA_PROVIDERS"
@@ -580,7 +582,6 @@ _IsValidTLSPort_() { case "$1" in ''|*[!0-9]*) return 1;; esac; [ "$1" -ge 1 ] &
 _GetProviderInfo_() {
   awk -F'|' -v name="$1" '$1==name {print; found=1; exit} END {if(!found) exit 1}' "$PROVIDERS"
 }
-_GetProviderPort_() { _GetProviderInfo_ "$1" | awk -F'|' '{print $4}'; }
 
 _DiscoverResolvers_() {
   local enabled profile
@@ -592,12 +593,12 @@ _DiscoverResolvers_() {
   }
   _Say_ "WAN DNS Privacy (NVRAM): enabled=$enabled profile=$profile"
   _Say_ 'NOTE: ResolvGuard-managed probes always use authenticated TLS even if WAN is opportunistic.'
-  _Say_ 'Discovered providers (id|upstream|TLS_name|localhost_port|upstream_TLS_port):'
+  _Say_ 'Discovered providers (id|upstream|TLS_name|upstream_TLS_port):'
   cat "$PROVIDERS"
 }
 
 _ValidateConfiguration_() {
-  local count id ip hostname port tlsport extra duplicates qname qtype rcode answers expected
+  local count id ip hostname tlsport extra duplicates qname qtype rcode answers expected
   _PrepareProviders_ || return 1
   [ -r "$CHECKS" ] && [ -r "$EXTRA_PROVIDERS" ] || {
     _Fail_ 'Missing DNS health checks or backup resolver configuration'; return 1;
@@ -621,16 +622,14 @@ _ValidateConfiguration_() {
     _Fail_ 'Duplicate backup resolver IDs'; return 1;
   }
   count=0
-  while IFS='|' read -r id ip hostname port tlsport extra; do
+  while IFS='|' read -r id ip hostname tlsport extra; do
     case "$id" in ''|\#*) continue;; esac
     _IsValidID_ "$id" && _IsValidIP_ "$ip" && _IsValidDomain_ "$hostname" &&
-      _IsValidPort_ "$port" && _IsValidTLSPort_ "$tlsport" && [ -z "${extra:-}" ] || {
+      _IsValidTLSPort_ "$tlsport" && [ -z "${extra:-}" ] || {
       _Fail_ "Invalid resolver: $id"; return 1;
     }
     duplicates="$(awk -F'|' -v i="$id" '$1==i {n++} END{print n+0}' "$PROVIDERS")"
     [ "$duplicates" -eq 1 ] || { _Fail_ "Duplicate resolver ID: $id"; return 1; }
-    duplicates="$(awk -F'|' -v p="$port" '$4==p {n++} END{print n+0}' "$PROVIDERS")"
-    [ "$duplicates" -eq 1 ] || { _Fail_ "Duplicate local probe port: $port"; return 1; }
     count=$((count+1))
   done < "$PROVIDERS"
   [ "$count" -gt 0 ] || { _Fail_ 'No valid upstream resolvers'; return 1; }
@@ -647,88 +646,79 @@ _ValidateConfiguration_() {
   _Say_ 'Configuration validated.'
 }
 
-_MakeStubbyConfig_() {
-  local id ip tls port tlsport cfg
-  id="$1"; ip="$2"; tls="$3"; port="$4"; tlsport="$5"
-  cfg="${6:-${RG_PROBE_DIR:-$RUNTIME}/configs/$id.yml}"
-  cat > "$cfg" <<YAML
-resolution_type: GETDNS_RESOLUTION_STUB
-dns_transport_list:
-  - GETDNS_TRANSPORT_TLS
-tls_authentication: GETDNS_AUTHENTICATION_REQUIRED
-tls_ca_file: "$CA_FILE"
-edns_client_subnet_private: 1
-timeout: 5000
-idle_timeout: 9000
-listen_addresses:
-  - 127.0.0.1@$port
-upstream_recursive_servers:
-  - address_data: $ip
-    tls_port: $tlsport
-    tls_auth_name: "$tls"
-YAML
+# Use the existing Entware dig binary for direct, per-upstream authenticated DoT.
+# Require an actual response over the expected TLS server, not just dig's exit
+# status: some BIND 9.20 builds return 0 for certificate failures without a
+# DNS response. No fallback to plaintext DNS is permitted.
+_RunAuthenticatedDoTQuery_() {
+  local id hostname record_type output provider ip tls_name tls_port extra status
+  id="$1"; hostname="$2"; record_type="$3"; output="$4"
+
+  # Health policy must see answer records only. The interactive Inspector
+  # intentionally retains authority and additional information for diagnosis.
+  # Both modes retain +stats for the exact upstream IP/port/TLS marker.
+  case "${5:-health}" in
+    health) set -- +noall +comments +answer +stats ;;
+    inspection) set -- +noall +comments +answer +authority +additional +stats ;;
+    *) return 1 ;;
+  esac
+
+  provider="$(_GetProviderInfo_ "$id")" || return 1
+  IFS='|' read -r id ip tls_name tls_port extra <<EOF_RG_DIRECT_DOT
+$provider
+EOF_RG_DIRECT_DOT
+  [ -z "${extra:-}" ] && _IsValidIP_ "$ip" &&
+    _IsValidDomain_ "$tls_name" && _IsValidTLSPort_ "$tls_port" &&
+    [ -r "$CA_FILE" ] && [ -x "$DIG" ] || return 1
+
+  # Always target a literal address. Never resolve TLS names through the
+  # router's production DNS or silently retry over UDP/TCP port 53.
+  if "$DIG" "@$ip" -p "$tls_port" "$hostname" "$record_type" \
+      +tls "+tls-ca=$CA_FILE" "+tls-hostname=$tls_name" \
+      "+time=$TIMEOUT_SECONDS" +tries=1 \
+      "$@" > "$output" 2>&1; then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -eq 0 ] || return 1
+
+  # Reject TLS failures even when dig reports success. The server identity
+  # marker is checked exactly, including IP, port and transport (TLS).
+  if grep -E '^;; (TLS |Connection to |communications error|no servers could be reached|connection timed out|couldn.t get an answer)' "$output" >/dev/null 2>&1; then
+    return 1
+  fi
+
+  grep -Fx ';; Got answer:' "$output" >/dev/null 2>&1 &&
+    grep -Eq '^;; ->>HEADER<<- opcode: QUERY, status: [A-Z][A-Z0-9_]*, id: [0-9]+' "$output" &&
+    grep -Eq '^;; flags: qr([[:space:]]|;)' "$output" &&
+    grep -Eq 'QUERY: 1, ANSWER: [0-9]+' "$output" &&
+    grep -Fx ";; SERVER: $ip#$tls_port($ip) (TLS)" "$output" >/dev/null 2>&1 || return 1
+
+  return 0
 }
 
-_IsOwnedProcess_() {
-  local p config
-  p="$1"; config="$2"
-  [ -n "$p" ] && kill -0 "$p" 2>/dev/null && [ -r "/proc/$p/cmdline" ] || return 1
-  tr '\000' '\n' < "/proc/$p/cmdline" | grep -Fx "$config" >/dev/null 2>&1
-}
+# Only DNS ANSWER SECTION resource records can satisfy health policies.
+# Other sections may contain valid records of the requested type, but they
+# are not the answer to the policy query. Keep this independent of the dig
+# presentation flags as a fail-closed guard if verbose output is encountered.
+_HasDNSAnswerRecord_() {
+  local response record_type expected_value
+  response="$1"; record_type="$2"; expected_value="$3"
 
-_StartProbeInstances_() {
-  local id ip tls port tlsport extra cfg desired pidfile pid selected
-  _RequireProbeDependencies_ || return 1
-  selected="${1:-}"
-  while IFS='|' read -r id ip tls port tlsport extra; do
-    case "$id" in ''|\#*) continue;; esac
-    [ -z "$selected" ] || [ "$selected" = "$id" ] || continue
-    cfg="${RG_PROBE_DIR:-$RUNTIME}/configs/$id.yml"
-    desired="$cfg.desired.$$"
-    pidfile="${RG_PROBE_DIR:-$RUNTIME}/pids/$id.pid"
-    _MakeStubbyConfig_ "$id" "$ip" "$tls" "$port" "$tlsport" "$desired"
-    "$STUBBY" -C "$desired" -i > "${RG_PROBE_DIR:-$RUNTIME}/$id.validate.log" 2>&1 || {
-      rm -f "$desired"; _Fail_ "Invalid Stubby config for $id; see ${RG_PROBE_DIR:-$RUNTIME}/$id.validate.log"; return 1;
-    }
-    if [ -f "$pidfile" ] && _IsOwnedProcess_ "$(cat "$pidfile")" "$cfg"; then
-      if cmp -s "$desired" "$cfg"; then
-        rm -f "$desired"
-        continue
-      fi
-      _Say_ "WAN upstream changed for $id; restarting owned test instance"
-      kill "$(cat "$pidfile")" 2>/dev/null || :
-      sleep 1
-      rm -f "$pidfile"
-    fi
-    mv "$desired" "$cfg"
-    "$STUBBY" -C "$cfg" > "${RG_PROBE_DIR:-$RUNTIME}/$id.log" 2>&1 &
-    pid=$!
-    echo "$pid" > "$pidfile"
-    sleep 1
-    if ! _IsOwnedProcess_ "$pid" "$cfg"; then
-      _Fail_ "Stubby failed to start: $id (local port $port); see ${RG_PROBE_DIR:-$RUNTIME}/$id.log"
-      return 1
-    fi
-    _Say_ "Started strict DoT instance $id on localhost:$port (upstream $ip:$tlsport)"
-  done < "$PROVIDERS"
-}
-_StopProbeInstances_() {
-  local pf id cfg pid
-  for pf in "${RG_PROBE_DIR:-$RUNTIME}"/pids/*.pid; do
-    [ -f "$pf" ] || continue
-    id="${pf##*/}"; id="${id%.pid}"
-    cfg="${RG_PROBE_DIR:-$RUNTIME}/configs/$id.yml"
-    pid="$(cat "$pf")"
-    if _IsOwnedProcess_ "$pid" "$cfg"; then
-      kill "$pid" 2>/dev/null && _Say_ "Stopped $id"
-    fi
-    rm -f "$pf"
-  done
+  printf '%s\n' "$response" | awk -v qt="$record_type" -v expected="$expected_value" '
+    /^;; ANSWER SECTION:$/ { in_answer=1; next }
+    /^;; / { in_answer=0; next }
+    /^;/ { next }
+    in_answer && NF>=5 && $2 ~ /^[0-9]+$/ && $3 == "IN" && $4 == qt &&
+      (expected == "-" || $5 == expected) { found=1; exit }
+    END { exit found ? 0 : 1 }
+  '
 }
 
 # Short configuration commits and actual WAN mutations share the config lock.
-# Probe cycles retain the WAN lock for their existing dedicated listeners, but
-# never hold the configuration lock while waiting for DNS or user input.
+# Probe cycles retain the WAN lock for failover serialization, but never hold
+# the configuration lock while waiting for DNS or user input.
 # Reuse the same conservative stale-owner/reclaim safeguards for both locks.
 _AcquireNamedLock_() {
   local lockpath owner previous acquire_guard outcome reclaimed
@@ -917,34 +907,28 @@ _AcquireWANLockForMaintenance_() {
 }
 
 # Called only while holding CONFIG_LOCK by maintenance operations.
-# Inspector admission takes CONFIG_LOCK briefly before reserving its slot, so
-# no new inspector can start between this check and uninstalling files.
+# Inspector admission briefly holds CONFIG_LOCK before making its private
+# session directory, so uninstall cannot race a new inspector session.
 _ActiveInspectorSessions_() {
-  local slot
+  local session
 
-  for slot in "$RUNTIME"/inspector-slots/slot-*; do
-    if [ ! -e "$slot" ] && [ ! -L "$slot" ]; then
-      continue
+  # Recognize both current direct-DoT sessions and pre-upgrade inspectors
+  # that may still own a legacy port slot during an upgrade transition.
+  for session in "$RUNTIME"/inspectors/* "$RUNTIME"/inspector-slots/slot-*; do
+    if [ -e "$session" ] || [ -L "$session" ]; then
+      return 0
     fi
-
-    return 0
   done
 
   return 1
 }
 
-# A private inspector cleans up only the processes and files it owns.
-# Never stop scheduler-owned listeners or release the scheduler WAN lock.
+# Inspector cleanup never touches the scheduler WAN lock or production Stubby.
 _CleanupInspectorSession_() {
-  _StopProbeInstances_ >/dev/null 2>&1 || :
   rm -f "$RUNTIME/inspection-$$.txt"
 
-  if [ -n "${RG_PROBE_DIR:-}" ]; then
-    rm -rf "$RG_PROBE_DIR"
-  fi
-
-  if [ -n "${RG_INSPECT_SLOT:-}" ]; then
-    _ReleaseNamedLock_ "$RG_INSPECT_SLOT" >/dev/null 2>&1 || :
+  if [ -n "${RG_INSPECT_DIR:-}" ]; then
+    rm -rf "$RG_INSPECT_DIR"
   fi
 
   if [ "${RG_INSPECT_CONFIG_HELD:-0}" = 1 ]; then
@@ -1056,7 +1040,7 @@ _CleanupPolicyLocks_() {
 # inventory already associates each temporary wanN/backupN ID with its actual
 # address, TLS port and authentication hostname. Never expose SPKI pins.
 _GetHealthResolverIdentity_() {
-  local requested_id id address hostname local_port tls_port extra
+  local requested_id id address hostname tls_port extra
 
   requested_id="$1"
   RG_HEALTH_RESOLVER_ADDRESS=''
@@ -1067,7 +1051,7 @@ _GetHealthResolverIdentity_() {
     return 1
   fi
 
-  while IFS='|' read -r id address hostname local_port tls_port extra; do
+  while IFS='|' read -r id address hostname tls_port extra; do
     if [ "$id" != "$requested_id" ]; then
       continue
     fi
@@ -1084,7 +1068,7 @@ _GetHealthResolverIdentity_() {
 # Highlight health-check outcomes in an interactive terminal without changing
 # the plain output used by cron, redirected commands or diagnostic logs.
 # Include the resolver IP directly in manual results so wanN IDs do not require
-# scrolling back to the Stubby startup messages.
+# consulting the provider inventory manually.
 _PrintHealthCheckResult_() {
   local result details displayed_details resolver_id
 
@@ -1210,14 +1194,18 @@ _PrintManualHealthSummary_() {
 }
 
 _ProbeDNSRecord_() {
-  local id qname qtype want_rcode want_count want_value port output actual_rcode actual_count
+  local id qname qtype want_rcode want_count want_value output actual_rcode actual_count response_file
   id="$1"; qname="$2"; qtype="$3"; want_rcode="$4"; want_count="$5"; want_value="$6"
-  port="$(_GetProviderPort_ "$id")" || return 1
-  if ! output="$("$DIG" @127.0.0.1 -p "$port" "$qname" "$qtype" \
-      +time="$TIMEOUT_SECONDS" +tries=1 +noall +comments +answer 2>&1)"; then
-    _PrintHealthCheckResult_ FAIL "$id $qname $qtype: dig timeout/error"
+  # A certificate failure may return dig exit status 0: validate the full
+  # authenticated transport response before consulting DNS policy fields.
+  response_file="$RUNTIME/health-response-$$.txt"
+  if ! _RunAuthenticatedDoTQuery_ "$id" "$qname" "$qtype" "$response_file" health; then
+    _PrintHealthCheckResult_ FAIL "$id $qname $qtype: authenticated DoT error/timeout"
+    rm -f "$response_file"
     return 1
   fi
+  output="$(cat "$response_file")"
+  rm -f "$response_file"
   actual_rcode="$(printf '%s\n' "$output" | sed -n 's/.*status: \([A-Z][A-Z0-9_]*\),.*/\1/p' | head -n 1)"
   actual_count="$(printf '%s\n' "$output" | awk '/^;; flags:/ { for(i=1;i<=NF;i++) if($i=="ANSWER:") {gsub(/,/,"",$(i+1)); print $(i+1); exit} }')"
   case "$actual_rcode:$actual_count" in
@@ -1238,10 +1226,8 @@ _ProbeDNSRecord_() {
     AT_LEAST_1)
       # DNS ANSWER includes aliases such as CNAME, so a nonzero header count
       # does not prove the requested A, AAAA or other record type was returned.
-      if [ "$actual_count" -eq 0 ] || ! printf '%s\n' "$output" | awk -v qt="$qtype" '
-          $1 !~ /^;/ && $4 == qt { found = 1 }
-          END { exit found ? 0 : 1 }
-        '; then
+      if [ "$actual_count" -eq 0 ] ||
+         ! _HasDNSAnswerRecord_ "$output" "$qtype" '-'; then
         _PrintHealthCheckResult_ FAIL "$id $qname $qtype: no $qtype answer record (expected at least 1; policy mismatch)"
         return 1
       fi
@@ -1254,9 +1240,7 @@ _ProbeDNSRecord_() {
       ;;
   esac
   if [ "$want_value" != '-' ]; then
-    if ! printf '%s\n' "$output" | awk -v qt="$qtype" -v expected="$want_value" '
-      $1 !~ /^;/ && $4 == qt && $5 == expected {found=1}
-      END {exit found ? 0 : 1}'; then
+    if ! _HasDNSAnswerRecord_ "$output" "$qtype" "$want_value"; then
       _PrintHealthCheckResult_ FAIL "$id $qname $qtype: expected answer $want_value absent (policy mismatch)"
       return 1
     fi
@@ -1314,15 +1298,13 @@ _GetInspectionAnswerRecords_() {
 }
 
 _InspectDNSResponse_() {
-  local id hostname rr display port file code count ttl policy_type
+  local id hostname rr display file code count ttl policy_type
   local answers capturefile source_ip code_colour count_colour ttl_colour policy_colour first_value
   id="$1"; hostname="$2"; rr="$3"; display="$4"; capturefile="${5:-}"; source_ip="${6:-$id}"
-  port="$(_GetProviderPort_ "$id")" || return 1
   file="$RUNTIME/inspection-$$.txt"
-  if ! "$DIG" @127.0.0.1 -p "$port" "$hostname" "$rr" \
-      "+time=$TIMEOUT_SECONDS" +tries=1 +noall +comments +answer +authority +additional > "$file" 2>&1; then
+  if ! _RunAuthenticatedDoTQuery_ "$id" "$hostname" "$rr" "$file" inspection; then
     printf '    %-6s %-10s %7s %7s  %s\n' "$rr" 'QUERY ERROR' '-' '-' '-'
-    _Say_ '      ERROR: DNS lookup timed out or dig failed.'
+    _Say_ '      ERROR: Authenticated DoT query failed, timed out or had no verified response.'
     [ "$display" = full ] && cat "$file"
     return 1
   fi
@@ -1412,8 +1394,7 @@ _InspectDNSResponse_() {
 }
 
 _InspectDNS_() (
-  local raw target requested type id ip tls port tlsport extra rc rr display
-  local capturefile
+  local raw target requested type id ip tls tlsport extra rc rr display capturefile
   raw="${1:-}"; type="${2:-BOTH}"; requested="${3:-all}"
   capturefile="${5:-}"
   case "${4:-summary}" in
@@ -1431,89 +1412,35 @@ _InspectDNS_() (
   esac
   case "$requested" in ALL|all|'') requested=all ;; esac
   _RequireProbeDependencies_ || return 1
-  # Admission is brief; two inspectors starting simultaneously may contend
-  # for milliseconds. Bounded retries avoid rejecting a normal menu action.
+
+  # Short admission lock prevents a concurrent uninstall from removing shared
+  # configuration before this inspector has acquired its private directory.
+  RG_INSPECT_CONFIG_HELD=0
+  RG_INSPECT_DIR=''
+  trap '_CleanupInspectorSession_' EXIT HUP INT TERM
   inspect_try=1
   while ! _AcquireConfigLock_; do
     if [ "$inspect_try" -ge 6 ]; then
       _Fail_ 'Configuration commit or maintenance in progress; inspector start deferred'
       return 1
     fi
-
     sleep 1
     inspect_try=$((inspect_try + 1))
   done
   RG_INSPECT_CONFIG_HELD=1
-  RG_PROBE_DIR=''
-  RG_INSPECT_SLOT=''
-  trap '_CleanupInspectorSession_' EXIT HUP INT TERM
-  # Give each inspector its own probe instances and nonoverlapping localhost
-  # ports. This avoids sharing scheduler Stubby processes, PIDs or provider
-  # lists, and needs no WAN lock for a read-only DNS query.
-  if [ -L "$RUNTIME/inspector-slots" ] || [ -L "$RUNTIME/inspectors" ]; then
-    return 1
-  fi
-
-  if ! mkdir -p "$RUNTIME/inspector-slots" "$RUNTIME/inspectors"; then
-    return 1
-  fi
-
-  RG_PROBE_DIR="$RUNTIME/inspectors/$$"
-  if [ -e "$RG_PROBE_DIR" ] || [ -L "$RG_PROBE_DIR" ]; then
-    return 1
-  fi
-
-  if ! mkdir "$RG_PROBE_DIR"; then
-    return 1
-  fi
-  if ! mkdir "$RG_PROBE_DIR/configs" "$RG_PROBE_DIR/pids"; then
-    return 1
-  fi
-  slot=0
-  while [ "$slot" -lt 32 ]; do
-    candidate="$RUNTIME/inspector-slots/slot-$slot"
-    if _AcquireNamedLock_ "$candidate"; then
-      RG_INSPECT_SLOT="$candidate"
-      break
-    fi
-    slot=$((slot+1))
-  done
-  if [ -z "$RG_INSPECT_SLOT" ]; then
-    _Fail_ 'All inspector probe port blocks are busy'
-    return 1
-  fi
-
+  if [ -L "$RUNTIME/inspectors" ]; then return 1; fi
+  mkdir -p "$RUNTIME/inspectors" || return 1
+  RG_INSPECT_DIR="$RUNTIME/inspectors/$$"
+  [ ! -e "$RG_INSPECT_DIR" ] && [ ! -L "$RG_INSPECT_DIR" ] || return 1
+  mkdir "$RG_INSPECT_DIR" || return 1
+  PROVIDERS="$RG_INSPECT_DIR/providers.tsv"
+  _PrepareProviders_ || return 1
   if ! _ReleaseConfigLock_; then
     _Fail_ 'Inspector could not release short admission lock'
     return 1
   fi
   RG_INSPECT_CONFIG_HELD=0
-  WAN_PORT_START=$((58000 + 64 * slot))
-  PROVIDERS="$RG_PROBE_DIR/providers.tsv"
-  _PrepareProviders_ || return 1
-  if [ "$(wc -l < "$PROVIDERS" | tr -d ' ')" -gt 64 ]; then
-    _Fail_ 'Too many configured resolvers for independent inspector port block'
-    return 1
-  fi
-  # Saved preferred providers already contain the scheduler's localhost ports.
-  # Rebase ALL inspector ports, including preferred entries, to this session's
-  # reserved block; changing WAN_PORT_START alone would be insufficient.
-  if ! awk -F'|' -v base="$WAN_PORT_START" '
-    BEGIN {
-      OFS = "|"
-    }
-    NF == 5 && $1 != "" {
-      $4 = base + NR - 1
-      print
-      next
-    }
-    {
-      exit 1
-    }
-  ' "$PROVIDERS" > "$RG_PROBE_DIR/providers-rebased.tsv"; then
-    _Fail_ 'Cannot allocate isolated inspector probe ports'; return 1
-  fi
-  mv "$RG_PROBE_DIR/providers-rebased.tsv" "$PROVIDERS" || return 1
+
   if [ "$requested" != all ]; then
     _IsValidID_ "$requested" && _GetProviderInfo_ "$requested" >/dev/null || {
       _Fail_ "Unknown configured provider: $requested (run discover)"; return 2;
@@ -1534,7 +1461,7 @@ _InspectDNS_() (
   _Say_ 'RCODE/answer data are OBSERVED; policy expectations are not evaluated.'
   _Say_ '--------------------------------------------------------'
   rc=0
-  while IFS='|' read -r id ip tls port tlsport extra; do
+  while IFS='|' read -r id ip tls tlsport extra; do
     [ -n "$id" ] || continue
     [ "$requested" = all ] || [ "$requested" = "$id" ] || continue
     _Say_ ''
@@ -1542,17 +1469,6 @@ _InspectDNS_() (
     printf '  %s%s:%s%s  (Strict DoT)\n' \
       "$RG_CYAN" "$ip" "$tlsport" "$RG_RESET"
     printf '  TLS authentication: %s%s%s\n' "$RG_CYAN" "$tls" "$RG_RESET"
-    if [ "$display" = full ]; then
-      _StartProbeInstances_ "$id" || {
-        _Say_ "    ERROR: Cannot start authenticated test resolver for $id"
-        rc=1; _StopProbeInstances_ >/dev/null 2>&1 || :; continue
-      }
-    else
-      if ! _StartProbeInstances_ "$id" >/dev/null; then
-        _Say_ "    ERROR: Cannot start authenticated test resolver for $id"
-        rc=1; _StopProbeInstances_ >/dev/null 2>&1 || :; continue
-      fi
-    fi
     _Say_ ''
     _Say_ '    TYPE   RCODE       ANSWERS     TTL  POLICY'
     _Say_ '    ------ ---------- ------- -------  ------'
@@ -1564,7 +1480,6 @@ _InspectDNS_() (
     else
       _InspectDNSResponse_ "$id" "$target" "$type" "$display" "$capturefile" "$ip" || rc=1
     fi
-    _StopProbeInstances_ >/dev/null 2>&1 || :
   done < "$PROVIDERS"
   _Say_ ''
   _Say_ 'Inspection completed without changing configuration, WAN DNS, or failure counters.'
@@ -1782,13 +1697,16 @@ _EnrollPreferredDNS_() {
   count="$(wc -l < "$parsed" | tr -d ' ')"
   expected="$(awk -F'|' '$1 ~ /^wan[0-9]+$/ {n++} END{print n+0}' "$PROVIDERS")"
   [ "$count" = "$expected" ] || { rm -f "$parsed"; _Fail_ 'WAN NVRAM and generated Stubby provider counts disagree'; return 1; }
-  if ! awk -F'|' 'NR==FNR {a[FNR]=$2"|"$5"|"$3; next}
+  if ! awk -F'|' 'NR==FNR {a[FNR]=$2"|"$4"|"$3; next}
       {if (tolower(a[FNR]) != tolower($1"|"$2"|"$3)) bad=1; n++}
       END {exit bad?1:0}' "$PROVIDERS" "$parsed"; then
     rm -f "$parsed"; _Fail_ 'WAN NVRAM and Stubby provider order differ'; return 1
   fi
   mkdir -p "$STATE_DIR" || { rm -f "$parsed"; return 1; }
-  (umask 077; printf '%s\n' "$raw" > "$PREF_RULELIST.new.$$";     awk -F'|' '$1 ~ /^wan[0-9]+$/ {print}' "$PROVIDERS" > "$PREF_PROVIDERS.new.$$") || return 1
+  # Durable schema-5 snapshots retain a numeric, historical listener-port
+  # column for safe rollback to older builds. Direct DoT does not bind or use
+  # these values, and its runtime inventory has no listener-port column.
+  (umask 077; printf '%s\n' "$raw" > "$PREF_RULELIST.new.$$";     awk -F'|' '$1 ~ /^wan[0-9]+$/ {printf "%s|%s|%s|%d|%s\n",$1,$2,$3,53053+substr($1,4),$4}' "$PROVIDERS" > "$PREF_PROVIDERS.new.$$") || return 1
   mv "$PREF_RULELIST.new.$$" "$PREF_RULELIST" || return 1
   mv "$PREF_PROVIDERS.new.$$" "$PREF_PROVIDERS" || return 1
   rm -f "$parsed"
@@ -1800,7 +1718,7 @@ _EnrollPreferredDNS_() {
 # rulelist and the active production Stubby config. Do not use previously saved
 # provider identities when validating a GUI change.
 _BuildLivePreferredProviders_() {
-  local raw output parsed live ip port name format extra n localport
+  local raw output parsed live ip port name format extra n
   raw="$1"; output="$2"
   parsed="$RUNTIME/sync-parsed-$$"; live="$RUNTIME/sync-live-$$"
   [ ! -e "$parsed" ] && [ ! -L "$parsed" ] &&
@@ -1828,10 +1746,10 @@ _BuildLivePreferredProviders_() {
         _Fail_ 'Only complete, validated IPv4/IPv6 Strict DoT resolver identities can be adopted'
         return 1
       }
-    n=$((n+1)); localport=$((WAN_PORT_START+n-1))
-    _IsValidPort_ "$localport" || {
-      rm -f "$parsed" "$live" "$output"; return 1; }
-    printf 'wan%s|%s|%s|%s|%s\n' "$n" "$ip" "$name" "$localport" "$port" >> "$output" || {
+    n=$((n+1))
+    # Keep numeric legacy snapshot metadata compatible with older releases.
+    # No localhost socket or temporary Stubby process uses this value.
+    printf 'wan%s|%s|%s|%s|%s\n' "$n" "$ip" "$name" "$((53053+n))" "$port" >> "$output" || {
       rm -f "$parsed" "$live" "$output"; return 1; }
   done < "$parsed"
   rm -f "$parsed" "$live"
@@ -1881,7 +1799,11 @@ _SyncPreferredWANLocked_() {
   fi
   changed=1
   if [ "$raw" = "$(cat "$PREF_RULELIST")" ] &&
-     cmp -s "$candidates" "$PREF_PROVIDERS"; then changed=0; fi
+     awk -F'|' '
+       NR==FNR {identity[FNR]=$1 "|" tolower($2) "|" tolower($3) "|" tolower($5); expected++; next}
+       {observed++; if (identity[FNR] != $1 "|" tolower($2) "|" tolower($3) "|" tolower($5)) mismatch=1}
+       END {exit (mismatch || observed!=expected || observed==0)?1:0}
+     ' "$PREF_PROVIDERS" "$candidates"; then changed=0; fi
   if [ "$changed" -eq 0 ] && [ ! -e "$PREFERRED_SYNC" ] && [ ! -L "$PREFERRED_SYNC" ]; then
     # A manual GUI return to the enrolled preferred pool clears stale tracking.
     if [ -e "$ACTIVE_POOL" ] || [ -e "$ACTIVE_RULELIST" ]; then
@@ -2105,13 +2027,13 @@ _BuildFilteredRulelistFromMembers_() {
 # Observe each active upstream independently. Confirmed DNS answer mismatches,
 # SERVFAIL and timeout are resolver failures, not infrastructure conditions.
 _ProbeWANMemberStatuses_() {
-  local pool destination members id ip tls port tport extra qname qtype rcode count value result state overall
+  local pool destination members id ip tls tport extra qname qtype rcode count value result state overall
   pool="$1"; destination="$2"; overall=0
   members="$RUNTIME/wan-members-$$"
   : > "$destination" || return 1
   _GetPoolMembers_ "$pool" > "$members" || { rm -f "$members" "$destination"; return 1; }
   [ -s "$members" ] || { rm -f "$members" "$destination"; return 1; }
-  while IFS='|' read -r id ip tls port tport extra; do
+  while IFS='|' read -r id ip tls tport extra; do
     state=PASS
     while IFS='|' read -r qname qtype rcode count value extra; do
       case "$qname" in ''|\#*) continue;; esac
@@ -2274,8 +2196,8 @@ _PrepareResolverPools_() {
   awk -F'|' '
     $1 ~ /^wan[0-9]+$/ {
       count++
-      key=$3"|"$5
-      if (!wanseen[key]++) {wn++; wan_tls[wn]=$3; wan_port[wn]=$5}
+      key=$3"|"$4
+      if (!wanseen[key]++) {wn++; wan_tls[wn]=$3; wan_port[wn]=$4}
     }
     END {
       if (wn > 1) for(i=1;i<=wn;i++)
@@ -2283,9 +2205,9 @@ _PrepareResolverPools_() {
     }
   ' "$PROVIDERS" >> "$tmp"
   awk -F'|' '
-    $1 !~ /^wan[0-9]+$/ && NF>=5 {
-      key=$3"|"$5
-      if (!seen[key]++) {n++; print "backup" n "|" $3 "|" $5}
+    $1 !~ /^wan[0-9]+$/ && NF==4 {
+      key=$3"|"$4
+      if (!seen[key]++) {n++; print "backup" n "|" $3 "|" $4}
     }
   ' "$PROVIDERS" >> "$tmp"
   mv "$tmp" "$POOLS"
@@ -2306,7 +2228,7 @@ _GetPoolMembers_() {
       printf '%s\n' "$filtered" | _ParseDNSRulelist_ > "$parsed" || return 1
       awk -F'|' 'NR==FNR {wanted[tolower($1 "|" $3 "|" $2)]++; next}
         $1 ~ /^wan[0-9]+$/ {
-          k=tolower($2 "|" $3 "|" $5)
+          k=tolower($2 "|" $3 "|" $4)
           if (wanted[k]>0) {print; wanted[k]--}
         }' "$parsed" "$PROVIDERS"
       rm -f "$parsed"
@@ -2316,19 +2238,19 @@ _GetPoolMembers_() {
   tport="$(awk -F'|' -v p="$pool" '$1==p {print $3; exit}' "$POOLS")"
   [ -n "$tls" ] || return 1
   case "$pool" in
-    wanpool*) awk -F'|' -v h="$tls" -v p="$tport" '$1 ~ /^wan[0-9]+$/ && $3==h && $5==p {print}' "$PROVIDERS" ;;
-    backup*) awk -F'|' -v h="$tls" -v p="$tport" '$1 !~ /^wan[0-9]+$/ && $3==h && $5==p {print}' "$PROVIDERS" ;;
+    wanpool*) awk -F'|' -v h="$tls" -v p="$tport" '$1 ~ /^wan[0-9]+$/ && $3==h && $4==p {print}' "$PROVIDERS" ;;
+    backup*) awk -F'|' -v h="$tls" -v p="$tport" '$1 !~ /^wan[0-9]+$/ && $3==h && $4==p {print}' "$PROVIDERS" ;;
     *) return 1;;
   esac
 }
 
 _ProbeResolverPool_() {
-  local pool members id ip tls port tport extra outcome rc qname qtype rcode answers expected
+  local pool members id ip tls tport extra outcome rc qname qtype rcode answers expected
   pool="$1"; members="$RUNTIME/pool-members-$$"
   _GetPoolMembers_ "$pool" > "$members" || return 1
   [ -s "$members" ] || { rm -f "$members"; return 1; }
   outcome=0
-  while IFS='|' read -r id ip tls port tport extra; do
+  while IFS='|' read -r id ip tls tport extra; do
     while IFS='|' read -r qname qtype rcode answers expected extra; do
       case "$qname" in ''|\#*) continue;; esac
       if _ProbeDNSRecord_ "$id" "$qname" "$qtype" "$rcode" "$answers" "$expected"; then :
@@ -2345,7 +2267,7 @@ _ProbeResolverPool_() {
 }
 
 _BuildBackupRulelist_() {
-  local pool parsed n id ip name localport tport extra members
+  local pool parsed n id ip name tport extra members
   pool="$1"; [ "$pool" != preferred ] || { cat "$PREF_RULELIST"; return; }
   case "$pool" in
     filtered1|filtered2) _GetFilteredRulelist_ "$pool"; return $? ;;
@@ -2367,7 +2289,7 @@ _BuildBackupRulelist_() {
   members="$RUNTIME/build-pool-$$"
   _GetPoolMembers_ "$pool" > "$members" || return 1
   [ -s "$members" ] || { rm -f "$members"; return 1; }
-  while IFS='|' read -r id ip name localport tport extra; do
+  while IFS='|' read -r id ip name tport extra; do
     _IsValidIP_ "$ip" && _IsValidTLSPort_ "$tport" && _IsValidDomain_ "$name" || return 1
     if [ "$n" = 4 ]; then printf '<%s>%s>%s>' "$ip" "$tport" "$name"
     else printf '<%s>%s>%s' "$ip" "$tport" "$name"; fi
@@ -3300,7 +3222,7 @@ _WriteMonitoringState_() {
 # A health-check cycle owns these temporary files and both locks only
 # while explicitly acquired. Keep cleanup limited to its own probe processes.
 _CleanupMonitorCycle_() {
-  _StopProbeInstances_ >/dev/null 2>&1 || :
+  rm -f "$RUNTIME/health-response-$$.txt"
 
   rm -f "$RUNTIME/member-first-$$" \
         "$RUNTIME/member-confirm-$$" \
@@ -3387,7 +3309,7 @@ _RunDNSHealthCheck_() (
   fi
   RG_CONFIG_HELD=0
   current="$(_GetActiveWANPool_)" || { _Fail_ 'Active WAN NVRAM list differs from enrolled state; refusing'; return 1; }
-  _StartProbeInstances_ || return 1
+  _RequireProbeDependencies_ || return 1
   _ReadMonitoringState_
   _Say_ "ROUTER WAN DoT pool=$current preferred=preferred failures=$failures recoveries=$recoveries"
   RG_HEALTH_PROBE_PHASE=active
@@ -3807,21 +3729,7 @@ _InstallResolvGuard_() (
 
 _RequireProbeDependencies_() {
   [ -x "$DIG" ] || { _Fail_ "DNS query tool unavailable: $DIG (install Entware dig)"; return 1; }
-  [ -x "$STUBBY" ] || { _Fail_ "Authenticated DoT probe engine unavailable: $STUBBY"; return 1; }
   [ -r "$CA_FILE" ] || { _Fail_ "TLS certificate authority bundle unavailable: $CA_FILE"; return 1; }
-}
-
-_StartPoolProbeInstances_() {
-  local pool members id ip tls port tlsport extra rc
-  pool="$1"; members="$RUNTIME/pool-starters-$$"
-  _GetPoolMembers_ "$pool" > "$members" || { rm -f "$members"; return 1; }
-  [ -s "$members" ] || { rm -f "$members"; return 1; }
-  rc=0
-  while IFS='|' read -r id ip tls port tlsport extra; do
-    _StartProbeInstances_ "$id" || { rc=1; break; }
-  done < "$members"
-  rm -f "$members"
-  return "$rc"
 }
 
 # Match an interrupted transaction to a pool we can still reconstruct.
@@ -5050,7 +4958,7 @@ _InstallBackupPreset_() (
   _CheckConfigurationSafety_ || return 1
   _PrepareProviders_ || return 1
   if awk -F'|' -v h="$RG_PRESET_HOST" -v port=853 -v a="$RG_PRESET_IP1" -v b="$RG_PRESET_IP2" \
-    '$1 ~ /^wan[0-9]+$/ && (($3==h && $5==port) || $2==a || $2==b) {found=1} END {exit !found}' "$PROVIDERS"; then
+    '$1 ~ /^wan[0-9]+$/ && (($3==h && $4==port) || $2==a || $2==b) {found=1} END {exit !found}' "$PROVIDERS"; then
     _Fail_ 'This provider is already enrolled in preferred WAN DNS; choose a different independent backup'
     return 1
   fi
@@ -5689,7 +5597,6 @@ _UninstallLocked_() {
     _Fail_ 'Integration cleanup failed; installation retained'
     return 1
   }
-  _StopProbeInstances_
 
   if [ "$never_enrolled" -eq 0 ]; then
     [ "$(_ReadWANRulelist_)" = "$(cat "$PREF_RULELIST")" ] &&
@@ -6211,7 +6118,13 @@ _RunQuickSetupWizard_() {
       }
     ' "$PROVIDERS" > "$configured"
 
-    if ! cmp -s "$verified" "$configured"; then
+    # Legacy saved snapshots have a fifth field; the active probe roster
+    # deliberately has four. Compare only the endpoint identities.
+    if ! awk -F'|' '
+      NR==FNR { expected[FNR]=$1 "|" tolower($2) "|" tolower($3) "|" $5; n++; next }
+      { seen++; if (expected[FNR] != $1 "|" tolower($2) "|" tolower($3) "|" $4) wrong=1 }
+      END {exit (wrong || n==0 || seen!=n)?1:0}
+    ' "$verified" "$configured"; then
       rm -f "$verified" "$configured"
       _Fail_ 'Configured Stubby and WAN preferred resolver lists differ; enrollment refused'
       return 1
