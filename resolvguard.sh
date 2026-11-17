@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.2
-readonly SCRIPT_VERSTAG="26111703"
+readonly SCRIPT_VERSTAG="26111704"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -4730,7 +4730,7 @@ _RGManual_() (
 # RESOLVGUARD WEBUI MANUAL CHECK END
 # RESOLVGUARD WEBUI CONFIG BRIDGE BEGIN
 # Native Merlin service-event is invoked by an authenticated start_apply.htm
-# POST. Only a small allowlisted, base64url-encoded data request is accepted;
+# POST. Only a small allowlisted ASCII data request is accepted;
 # never eval, source, or execute any user-supplied text. All writes delegate to
 # the same validation, configuration lock, and rollback functions as the CLI.
 _RGWebConfig_() (
@@ -4912,14 +4912,12 @@ _RGWebConfig_() (
       $1=="ResolvGuard_config_request" { n++; if (NF==2) v=$2; else bad=1 }
       END { if(n==1 && !bad) print v; else exit 1 }
     ' "$rg_shared") || { rg_notice 'missing or ambiguous namespaced request';return 1; }
-    case "$rg_token" in ''|*[!A-Za-z0-9_-]*) rg_notice 'invalid request encoding';return 1 ;; esac
-    [ "${#rg_token}" -le 768 ] || { rg_notice 'oversized config request';return 1; }
-    command -v base64 >/dev/null 2>&1 || { rg_notice 'base64 decoder unavailable';return 1; }
-    rg_b64=$(printf '%s' "$rg_token" | tr '_-' '/+')
-    case $((${#rg_b64} % 4)) in
-      0) :;; 2) rg_b64="${rg_b64}==";; 3) rg_b64="${rg_b64}=";; *) return 1 ;;
-    esac
-    rg_payload=$(printf '%s' "$rg_b64" | base64 -d 2>/dev/null) || return 1
+    # MerlinAU-style custom-settings transport carries the request through
+    # amng_custom JSON. The payload is bounded and allowlisted below; it has
+    # no reason to require a base64 applet or extra Entware dependency.
+    # Preserve raw separators; the shell never evaluates payload contents.
+    [ "${#rg_token}" -le 560 ] || { rg_notice 'oversized config request'; return 1; }
+    rg_payload="$rg_token"
     # ASCII-only data. No control characters, shell syntax, whitespace, or
     # line breaks may cross the firmware service event boundary.
     case "$rg_payload" in ''|*[!A-Za-z0-9_.:/\|\-]*) rg_notice 'invalid data characters';return 1 ;; esac

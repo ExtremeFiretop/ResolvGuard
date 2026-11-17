@@ -43,15 +43,13 @@ function rgRequestConfiguration(data) {
   var form=document.getElementById('rg_config_form');
   if(!form || typeof data!=='string' || data.length>560 || !/^[A-Za-z0-9_.:/|_-]+$/.test(data)) return false;
   if(!rgSharedCustomSettings || typeof rgSharedCustomSettings!=='object' || Array.isArray(rgSharedCustomSettings)) return false;
-  var token;
-  try {token=btoa(data).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');}
-  catch(e){return false;}
-  if(token.length>768) return false;
+  // The shell accepts only this validated, bounded ASCII data. MerlinAU's
+  // amng_custom mechanism can transport it directly, without a base64 tool.
   var merged=Object.create(null);
   Object.keys(rgSharedCustomSettings).forEach(function(key){
     if(key!=='ResolvGuard_config_request') merged[key]=rgSharedCustomSettings[key];
   });
-  merged.ResolvGuard_config_request=token;
+  merged.ResolvGuard_config_request=data;
   // No firmware redirect on a configuration save.
   form.elements.namedItem('current_page').value='';
   form.elements.namedItem('next_page').value='';
@@ -59,8 +57,15 @@ function rgRequestConfiguration(data) {
   form.elements.namedItem('amng_custom').value=JSON.stringify(merged);
   form.submit();
   // Keep subsequent saves from this open page in sync with the submitted key.
-  rgSharedCustomSettings.ResolvGuard_config_request=token;
+  rgSharedCustomSettings.ResolvGuard_config_request=data;
   return true;
+}
+// MerlinAU dismisses the ASUS apply overlay after handling its result.
+// A failed or timed-out ResolvGuard request must also release this overlay.
+function rgFinishConfiguration() {
+  try { if (typeof hideLoading === 'function') hideLoading(); } catch(e) {}
+  var overlay=document.getElementById('Loading');
+  if (overlay) overlay.style.display='none';
 }
 function initial() {
   if (typeof show_menu === 'function') show_menu();
@@ -787,7 +792,12 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
       if(!await loadConfig(previousRevision))
         configNotice('Router confirmed the save, but the new configuration snapshot is unavailable. Further edits are disabled until refreshed.',true);
       resetBackup();
-    }catch(e){configNotice(e.message,true);}finally{controlsBusy(false);}
+    }catch(e){configNotice(e.message,true);}finally{
+      controlsBusy(false);
+      // The firmware may keep its 'Complete' overlay after the action has
+      // already finished. Never leave a blocking spinner over the dashboard.
+      try { if(window.parent!==window && typeof window.parent.rgFinishConfiguration==='function') window.parent.rgFinishConfiguration(); }catch(e){}
+    }
   }
   $('backupReset').addEventListener('click',resetBackup);
   $('backupSave').addEventListener('click',()=>{
