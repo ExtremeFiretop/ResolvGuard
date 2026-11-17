@@ -2,7 +2,7 @@
 <!-- ResolvGuard WebUI Integration v3.0: self-contained dashboard in one ASP -->
 <!-- ResolvGuard WebUI Integration v1 -->
 <!-- ResolvGuard WebUI Config Transport v2 -->
-<!-- ResolvGuard WebUI v3.7.3: MerlinAU-aligned read-only loading and explicit firmware actions -->
+<!-- ResolvGuard WebUI v3.7.4: separate loading and write-busy states -->
 <html xmlns="http://www.w3.org/1999/xhtml">
 <head>
 <meta http-equiv="X-UA-Compatible" content="IE=Edge" />
@@ -700,7 +700,13 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     SYSLOG_HEALTH_INTERVAL_MINUTES:['Healthy syslog interval (minutes)',[0,15,30,60]]
   };
   function configNotice(msg,isError=false){const e=$('configFeedback');e.hidden=false;e.textContent=msg;e.classList.toggle('error',isError);}
-  function controlsBusy(b){state.configBusy=b;document.querySelectorAll('#backups button,#settingsRows button').forEach(e=>e.disabled=b||!state.config||!state.configFresh);}
+  // Loading a read-only snapshot must not mark the UI as performing a write.
+  // Otherwise the first load leaves every configuration button disabled.
+  function syncConfigControls(){
+    const disabled=state.configBusy||state.configLoading||!state.config||!state.configFresh;
+    document.querySelectorAll('#backups button,#settingsRows button').forEach(e=>e.disabled=disabled);
+  }
+  function controlsBusy(b){state.configBusy=Boolean(b);syncConfigControls();}
   function renderSettings(){
     const cfg=state.config;if(!cfg)return;
     var summary=cfg.monitoringEnabled?'Monitoring enabled'+(cfg.autoFailoverEnabled?' · Automatic failover authorization exists':' · Monitoring only'):'Monitoring disabled';
@@ -722,7 +728,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     $('backupGroups').innerHTML='<div class="card-title">Candidate alternate groups</div><p class="desc">Grouped by identical TLS hostname and port. These are configuration candidates, not proof of successful health checks.</p>'+
       (groups.size?[...groups].map(([key,ids])=>`<div class="rg-backup-info" style="padding:8px 0"><strong>${esc(key)}</strong><small>${esc(ids.join(', '))}</small></div>`).join(''):'<p class="desc">No alternate resolver groups configured.</p>');
     $('backupRows').innerHTML=rs.length?rs.map(r=>`<div class="rg-backup-row"><div class="rg-backup-info"><strong>${esc(r.id)} · ${esc(r.tls)}</strong><small>${esc(r.ip)}:${Number(r.port)} · Configured backup · Not automatically health-verified</small></div><div class="rg-actions" style="margin-top:0"><button type="button" class="btn rg-backup-edit" data-id="${esc(r.id)}">Edit</button><button type="button" class="btn rg-backup-delete" data-id="${esc(r.id)}">Remove</button></div></div>`).join(''):'<div class="empty">No ResolvGuard backup endpoints configured. Preferred WAN resolvers are managed in ASUS WAN settings.</div>';
-    controlsBusy(state.configBusy);
+    syncConfigControls();
   }
   // Reading a page or opening a tab must never issue an ASUS firmware apply.
   // The router publishes this RAM-only snapshot after installs, scheduled
@@ -730,7 +736,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
   // caching, preserving existing revision checks after a confirmed write.
   async function loadConfig(afterRevision=0){
     if(state.configLoading)return false;
-    state.configLoading=true;state.configFresh=false;controlsBusy(true);
+    state.configLoading=true;state.configFresh=false;syncConfigControls();
     try{
       const deadline=Date.now()+6000;
       let current=null;
@@ -755,7 +761,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
       configNotice(e.message||'Configuration is unavailable; changes disabled.',true);
       if(!state.config)$('settingsSummary').textContent='Configuration unavailable';
       return false;
-    }finally {state.configLoading=false;controlsBusy(state.configBusy);}
+    }finally {state.configLoading=false;syncConfigControls();}
   }
   function configPayload(parts){
     // All fields are ASCII data, not shell instructions. Values are revalidated
