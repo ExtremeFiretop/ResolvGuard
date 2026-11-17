@@ -203,16 +203,8 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
 .heartbeat.signal-degraded .ecg .ecg-trace { stroke:var(--amber); }
 .heartbeat.signal-hold .ecg .ecg-trace { stroke:var(--red); }
 .heartbeat.no-signal .ecg .ecg-trace { opacity:.28; }
-/* History segments remain 30-minute observations; the current segment shows
-   a per-check count and a measurable progress fill without fabricating per-minute data. */
 .history-row .history-live-count {font-size:10px;color:#98dabc;font-weight:650;white-space:nowrap}
 .history-row .history-live-count.pending {color:var(--amber)}
-.compact-heat .hcell.is-current {position:relative;overflow:hidden;isolation:isolate;
-  background:#223b3e;outline:1px solid #69cfaa70;outline-offset:0}
-.compact-heat .hcell.is-current::before {content:"";position:absolute;inset:0 auto 0 0;
-  width:var(--live-fill,0%);background:var(--live-color,#3e9b78);border-radius:inherit;z-index:-1}
-.compact-heat .hcell.is-current::after {content:"";position:absolute;inset:0 0 0 auto;
-  width:1px;background:#a1f7cd9c;pointer-events:none}
 @keyframes history-check-arrived {0%{box-shadow:0 0 0 0 #91efbb88}45%{box-shadow:0 0 0 3px #91efbb88}100%{box-shadow:0 0 0 0 #91efbb00}}
 .compact-heat .hcell.history-new {animation:history-check-arrived 1.1s ease-out}
 @media(prefers-reduced-motion:reduce){.compact-heat .hcell.history-new{animation:none}}
@@ -506,7 +498,6 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
   }
   function renderHeat(id,period){
     const d=state.snapshot,r=pref(d),minutes=period==='24'?30:60,slots=period==='24'?48:168,now=Date.now();
-    const expected=Math.max(1,Math.ceil(minutes/Math.max(1,Number(d?.scheduleMinutes||1))));
     $(id).innerHTML=r.length?r.map(res=>{
       const bins=Array.from({length:slots},()=>({total:0,fail:0,unknown:0,at:''}));
       for(const b of state.history){if(b.id!==res.id)continue;
@@ -523,12 +514,9 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
       return `<div class="history-row"><div class="history-name"><strong>${esc(res.tls)} <span style="color:#7e9ca5;font-weight:400">${esc(res.id)}</span></strong><span class="history-live-count ${pending?'pending':''}" data-history-count="${esc(res.id)}" title="${esc(caption)}">${currentCount} checks / ${minutes} min${pending?' · syncing…':''}</span></div><div class="compact-heat">${bins.map((b,j)=>{
         const cls=b.total?(b.fail?'fail':b.unknown?'unknown':'ok'):'unknown';
         const currentCell=j===slots-1;
-        const progress=Math.max(0,Math.min(100,Math.round(100*b.total/expected)));
-        const color=cls==='fail'?'#e99969':cls==='unknown'?'#637b80':'#3e9b78';
         const liveClass=currentCell?' is-current'+(state.historyAdvanced?' history-new':''):'';
-        const style=currentCell?` style="--live-fill:${progress}%;--live-color:${color}"`:'';
         const detail=b.total?`${b.total} observed check(s), ${b.fail} failures, ${b.unknown} unknown results`:'No sample in interval';
-        return `<button class="hcell ${cls}${liveClass}"${style} data-bin="${j}" data-period="${period}" data-resolver="${esc(res.id)}" title="${esc(detail)}" aria-label="${esc(res.id)}, ${esc(detail)}"></button>`;
+        return `<button class="hcell ${cls}${liveClass}" data-bin="${j}" data-period="${period}" data-resolver="${esc(res.id)}" title="${esc(detail)}" aria-label="${esc(res.id)}, ${esc(detail)}"></button>`;
       }).join('')}</div></div>`;
     }).join(''):'<div class="empty">No preferred resolver inventory yet.</div>';
   }
