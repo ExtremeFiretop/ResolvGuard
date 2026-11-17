@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.2
-readonly SCRIPT_VERSTAG="26111704"
+readonly SCRIPT_VERSTAG="26111705"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -5057,9 +5057,9 @@ _RGWebUI_() (
     [ -f "$RG_RUNTIME/scheduled.log" ] && [ ! -L "$RG_RUNTIME/scheduled.log" ] || return 1
     LC_ALL=C awk '
      /^SCHEDULE UTC: / {buf=""; start=$3; active=0; next}
-     /^SCHEDULE UTC END: / { if ($0 ~ /result=/) {last=buf; last_start=start; last_end=$4; last_rc=$5} next }
+     /^SCHEDULE UTC END: / { if ($0 ~ /result=/) {last=buf; last_start=start; last_end=$4; last_rc=$5; last_router=$6} next }
      { if (start!="") buf=buf $0 "\n" }
-     END { if(last_start!="") {print "CYCLE|"last_start"|"last_end"|"last_rc; printf "%s",last} }
+     END { if(last_start!="") {print "CYCLE|"last_start"|"last_end"|"last_rc"|"last_router; printf "%s",last} }
     ' "$RG_RUNTIME/scheduled.log"
   }
 
@@ -5082,6 +5082,13 @@ _RGWebUI_() (
     start=$(printf '%s\n' "$header" | cut -d'|' -f2)
     done_at=$(printf '%s\n' "$header" | cut -d'|' -f3)
     result=$(printf '%s\n' "$header" | cut -d'|' -f4 | sed 's/^result=//')
+    # Router wall clock captured with the completed cycle. It is for display
+    # only; retained monitoring/history timestamps stay unambiguously UTC.
+    router_end=$(printf '%s\n' "$header" | cut -d'|' -f5 | sed 's/^routerTime=//')
+    case "$router_end" in
+      ????-??-??T??:??:??[+-]????) : ;;
+      *) router_end='' ;;
+    esac
     # Per-resolver state: consider failure on any monitored policy check within
     # the latest complete cycle. Last-pass-only summaries could mask failures.
     awk '
@@ -5144,7 +5151,7 @@ _RGWebUI_() (
           while IFS= read -r message; do
             # Prevent literal line delimiters from corrupting event records.
             message=$(printf '%s' "$message" | tr '|' '/')
-            printf '%s|%s\n' "$done_at" "$message"
+            printf '%s|%s|%s\n' "$done_at" "$message" "$router_end"
           done >> "$RG_DATA/events.tsv"
         tail -n 200 "$RG_DATA/events.tsv" > "$RG_DATA/events-$$.tmp" && mv "$RG_DATA/events-$$.tmp" "$RG_DATA/events.tsv"
       fi
@@ -5155,6 +5162,7 @@ _RGWebUI_() (
     (
       printf '{"schema":1,"source":"router","generatedEpoch":%s,' "$(number "$epoch")"
       printf '"lastStart":'; jsonq "$start"; printf ',"lastEnd":';jsonq "$done_at"
+      printf ',"lastEndRouter":'; jsonq "$router_end"
       printf ',"cycleResult":';jsonq "$result"
       printf ',"pool":';jsonq "$current_pool"
       printf ',"mode":';jsonq "$mode"
@@ -5208,8 +5216,9 @@ _RGWebUI_() (
       printf '],"events":['
       sep=''
       if [ -f "$RG_DATA/events.tsv" ] && [ ! -L "$RG_DATA/events.tsv" ]; then
-        tail -n 24 "$RG_DATA/events.tsv" | while IFS='|' read -r at event; do
-          printf '%s{"at":' "$sep";jsonq "$at";printf ',"message":';jsonq "$event";printf '}'
+        tail -n 24 "$RG_DATA/events.tsv" | while IFS='|' read -r at event router_at; do
+          printf '%s{"at":' "$sep";jsonq "$at";printf ',"message":';jsonq "$event"
+          printf ',"routerAt":';jsonq "$router_at";printf '}'
           sep=,
         done
       fi
@@ -5463,7 +5472,9 @@ _RunScheduledCheck_() {
   if _RunDNSHealthCheck_ scheduled; then outcome=0
   else outcome=$?
   fi
-  _Say_ "SCHEDULE UTC END: $(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || _Say_ 'clock-unavailable') result=$outcome"
+  # Preserve UTC for history and give the WebUI the router's actual local
+  # clock and UTC offset at completion (independent of the viewing browser).
+  _Say_ "SCHEDULE UTC END: $(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || _Say_ 'clock-unavailable') result=$outcome routerTime=$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || _Say_ 'clock-unavailable')"
   # Publish only after a completed scheduled evaluation; never alter DNS outcomes.
   if [ -f "$ROOT/ResolvGuard.asp" ] && [ ! -L "$ROOT/ResolvGuard.asp" ]; then
     _RGWebUI_ publish >/dev/null 2>&1 || :
@@ -5601,9 +5612,17 @@ _ShowMenuState_() {
   fi
 }
 
+# An interactive SSH menu can remain open while the separate WebUI process
+# updates settings.conf. Refresh its in-memory values on each menu redraw;
+# merely waiting for input must not own a config/WAN lock or mask a web save.
+_RefreshMenuConfiguration_() {
+  [ -f "$SETTINGS" ] && [ ! -L "$SETTINGS" ] && [ -r "$SETTINGS" ] || return 1
+  . "$SETTINGS"
+}
 _ShowHeader_() {
   local section
   section="${1:-Main Menu}"
+  _RefreshMenuConfiguration_ || :
   _SetMenuPalette_
   if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ]; then
     printf '\033[2J\033[H'

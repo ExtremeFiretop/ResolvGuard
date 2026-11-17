@@ -336,6 +336,17 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
   const $ = id => document.getElementById(id);
   const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const fmtTime = v => {const d=Date.parse(v||'');return Number.isFinite(d)?new Date(d).toLocaleString():'No completed check';};
+  // UTC is retained for arithmetic; local wall-clock times come from the router.
+  // Never infer the router's time zone from the viewing browser's location.
+  function routerTimeLabel(stamp,short=false){
+    const t=String(stamp||'');
+    if(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4}$/.test(t))
+      return (short?t.slice(11,19):t.slice(0,10)+' '+t.slice(11,19))+' UTC'+t.slice(19);
+    return '';
+  }
+  function eventTimeLabel(event,short=false){
+    return routerTimeLabel(event?.routerAt,short)||String(event?.at||'Unknown').replace('T',' ').replace(/Z$/,' UTC');
+  }
   const since = v => {const d=Date.parse(v||'');if(!Number.isFinite(d))return 'No completed check';const sec=Math.max(0,Math.floor((Date.now()-d)/1000));return sec<60?sec+' seconds ago':Math.floor(sec/60)+' min ago';};
   const state={tab:'overview',period:'24',snapshot:null,history:[],lastEnd:'',lastFetch:0,polling:false,feedConnected:false,historyPending:'',historyBaseline:'',historyAttempts:0,historyAdvanced:false,manualBusy:false,manualPolling:null,manualPreviousId:'',manualRequestedAt:0,manualRunId:'',config:null,configBusy:false,configFresh:false,configLoading:false,editingBackupId:''};
   const hasRealChecks = d => (d?.resolvers||[]).some(r => r.policyPass+r.policyFail>0);
@@ -479,18 +490,18 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     $('poolPill').textContent='Active pool: '+(d?.pool||'unknown');
     $('modePill').textContent=({'monitoring':'Monitoring Only','automatic':'Auto Failover configured','inactive':'Monitoring inactive','hold':'Policy safety hold'})[d?.mode]||'Unknown mode';
     $('heartLabel').textContent=s.status==='healthy'?'Check complete · Healthy':s.status==='degraded'?'Check complete · Degraded':'Awaiting reliable check';
-    $('heartSub').textContent=d?.lastEnd?'Last completed '+fmtTime(d.lastEnd):'No completed cycle recorded';
+    $('heartSub').textContent=d?.lastEnd?'Last completed '+(routerTimeLabel(d.lastEndRouter)||String(d.lastEnd).replace('T',' ').replace(/Z$/,' UTC')):'No completed cycle recorded';
     $('statResolvers').textContent=d&&r.length?`${n} / ${r.length}`:'—';
     $('statResolversSub').textContent='Preferred members passing observed policy';
     const pol=r.reduce((z,x)=>z+x.policyPass,0),fail=r.reduce((z,x)=>z+x.policyFail,0);
     $('statPolicies').textContent=d&&pol+fail?`${pol} / ${pol+fail}`:'—';
     $('statPool').textContent=d?.pool||'unknown';
     $('statPoolSub').textContent='Read-only managed pool state';
-    $('statSeq').textContent=d?.lastEnd?'Completed '+fmtTime(d.lastEnd):'No completed check yet';
+    $('statSeq').textContent=d?.lastEnd?'Completed '+(routerTimeLabel(d.lastEndRouter)||String(d.lastEnd).replace('T',' ').replace(/Z$/,' UTC')):'No completed check yet';
     $('preferredCount').textContent=r.length?`${n}/${r.length} passing`:'Unenrolled / unknown';
     $('resolverList').innerHTML=r.length?r.map(x=>`<button class="resolve-row" data-resolver="${esc(x.id)}"><div class="res-left"><span class="status-glyph ${x.state==='fail'?'bad':''}">${x.state==='ok'?'✓':x.state==='fail'?'!':'?'}</span><div><div class="res-name">${esc(x.tls||x.id)}</div><div class="res-ip">${esc(x.id)} · ${esc(x.ip)}:${esc(x.port)}</div></div></div><div class="res-right"><span class="res-state ${x.state==='ok'?'green':x.state==='fail'?'red':'amber'}">${x.state==='ok'?'PASS':x.state==='fail'?'FAIL':'NOT OBSERVED'}</span><span>›</span></div></button>`).join(''):'<div class="empty">No preferred resolver roster available. Enroll preferred WAN DNS before monitoring.</div>';
     const ev=(d?.events||[]).slice(-5).reverse();
-    $('eventFeed').innerHTML=ev.length?ev.map(e=>`<div class="event"><div class="event-icon ${/FAIL|DEGRADED|EXCLUDED/i.test(e.message)?'warn':'info'}">${/FAIL|DEGRADED|EXCLUDED/i.test(e.message)?'!':'i'}</div><div class="event-main"><div class="event-title">${esc(e.message)}</div><div class="event-body">Recorded by ResolvGuard's completed scheduled check</div></div><span class="event-time">${esc(e.at.slice(11,19))}</span></div>`).join(''):'<div class="empty">No switching or recovery events recorded since this router boot.</div>';
+    $('eventFeed').innerHTML=ev.length?ev.map(e=>`<div class="event"><div class="event-icon ${/FAIL|DEGRADED|EXCLUDED/i.test(e.message)?'warn':'info'}">${/FAIL|DEGRADED|EXCLUDED/i.test(e.message)?'!':'i'}</div><div class="event-main"><div class="event-title">${esc(e.message)}</div><div class="event-body">Recorded by ResolvGuard's completed scheduled check</div></div><span class="event-time">${esc(eventTimeLabel(e,true))}</span></div>`).join(''):'<div class="empty">No switching or recovery events recorded since this router boot.</div>';
     renderHeat('overviewHeat','24');
   }
   function renderHeat(id,period){
@@ -531,7 +542,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     $('histAxis').innerHTML=state.period==='24'?'<span>24 hours ago</span><span>12 hours ago</span><span>Now</span>':'<span>7 days ago</span><span>3.5 days ago</span><span>Now</span>';
     renderHeat('fullHeat',state.period);
     const ev=(d?.events||[]).slice().reverse();
-    $('historyEvents').innerHTML=ev.length?ev.map(e=>`<div class="event"><div class="event-icon info">i</div><div class="event-main"><div class="event-title">${esc(e.message)}</div></div><span class="event-time">${esc(e.at)}</span></div>`).join(''):'<div class="empty">No logged recovery/failover events since the current boot.</div>';
+    $('historyEvents').innerHTML=ev.length?ev.map(e=>`<div class="event"><div class="event-icon info">i</div><div class="event-main"><div class="event-title">${esc(e.message)}</div></div><span class="event-time">${esc(eventTimeLabel(e))}</span></div>`).join(''):'<div class="empty">No logged recovery/failover events since the current boot.</div>';
   }
   function selectBin(id,period,index){
     const minutes=period==='24'?30:60,slots=period==='24'?48:168,start=Date.now()-(slots-index)*minutes*60000,end=start+minutes*60000;
