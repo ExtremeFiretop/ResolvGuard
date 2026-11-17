@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.2
-readonly SCRIPT_VERSTAG="26111702"
+readonly SCRIPT_VERSTAG="26111703"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -4786,6 +4786,10 @@ _RGWebConfig_() (
     [ ! -L "$rg_dir/config-snapshot.lock" ] &&
       { [ ! -e "$rg_dir/config-snapshot.lock" ] || [ -f "$rg_dir/config-snapshot.lock" ]; } || return 1
     exec 7> "$rg_dir/config-snapshot.lock" && flock -x 7 || return 1
+    # The result feed exists even before the first save. No flash write.
+    if [ ! -e "$rg_result" ] && [ ! -L "$rg_result" ]; then
+      rg_publish_result '' idle 'No configuration action completed yet' || :
+    fi
     rg_previous=0
     if [ -f "$rg_config" ] && [ ! -L "$rg_config" ]; then
       rg_previous=$(sed -n 's/^.*"revision":\([0-9][0-9]*\),.*$/\1/p' "$rg_config" | head -n 1)
@@ -4890,7 +4894,11 @@ _RGWebConfig_() (
     chmod 755 "$rg_stage" && mv -f "$rg_stage" "$rg_hook" || { rm -f "$rg_stage"; return 1; }
   }
   rg_apply() {
-    [ "$ROOT" = "$INSTALL_ROOT" ] && _IsInstallationComplete_ || return 1
+    rg_notice 'received firmware configuration event'
+    if [ "$ROOT" != "$INSTALL_ROOT" ] || ! _IsInstallationComplete_; then
+      rg_notice 'installed script or installation marker unavailable'
+      return 1
+    fi
     # Firmware delivers a fixed action name. The independent bounded payload
     # is persisted by start_apply.htm under this one namespaced custom key.
     rg_ready || return 1

@@ -1,8 +1,5 @@
 <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
-<!-- ResolvGuard WebUI Integration v3.0: self-contained dashboard in one ASP -->
 <!-- ResolvGuard WebUI Integration v1 -->
-<!-- ResolvGuard WebUI Config Transport v2 -->
-<!-- ResolvGuard WebUI v3.7.4: separate loading and write-busy states -->
 <html xmlns="http://www.w3.org/1999/xhtml">
 <head>
 <meta http-equiv="X-UA-Compatible" content="IE=Edge" />
@@ -32,9 +29,9 @@
 function rgRequestManualCheck() {
   var form=document.getElementById("rg_manual_form");
   if (!form || !form.elements.namedItem("action_script")) return false;
-  var page=window.location.pathname.split("/").pop();
-  form.elements.namedItem("current_page").value=page;
-  // MerlinAU sends service actions to a hidden iframe without requesting navigation.
+  // A no-navigation action: ASUS may redirect to current_page after applying.
+  form.elements.namedItem("current_page").value="";
+  // Submit only on an explicit click, never during dashboard initialization.
   form.elements.namedItem("next_page").value="";
   form.submit();
   return true;
@@ -55,8 +52,8 @@ function rgRequestConfiguration(data) {
     if(key!=='ResolvGuard_config_request') merged[key]=rgSharedCustomSettings[key];
   });
   merged.ResolvGuard_config_request=token;
-  var page=window.location.pathname.split('/').pop();
-  form.elements.namedItem('current_page').value=page;
+  // No firmware redirect on a configuration save.
+  form.elements.namedItem('current_page').value='';
   form.elements.namedItem('next_page').value='';
   form.elements.namedItem('action_script').value='start_ResolvGuardCfg';
   form.elements.namedItem('amng_custom').value=JSON.stringify(merged);
@@ -126,10 +123,11 @@ function rgDashboardLoaded() {
 </td></tr></tbody></table>
 </td></tr></table>
 </td><td width="10"></td></tr></table>
-<!-- The native ASUS page owns the authenticated service action submission.
-     The embedded dashboard cannot execute shell code or send arbitrary commands. -->
-<iframe name="rg_command_frame" id="rg_command_frame" title="ResolvGuard command response" style="display:none;width:0;height:0;border:0" aria-hidden="true"></iframe>
-<form id="rg_manual_form" name="form" method="post" action="start_apply.htm" target="rg_command_frame" style="display:none">
+<!-- The embedded dashboard cannot execute shell code or send arbitrary commands.
+     Use the exact hidden_frame identity expected by ASUS start_apply.htm
+     and MerlinAU; an arbitrary iframe name can trigger firmware redirects. -->
+<iframe name="hidden_frame" id="hidden_frame" title="ResolvGuard command response" style="display:none;width:0;height:0;border:0" aria-hidden="true"></iframe>
+<form id="rg_manual_form" method="post" action="start_apply.htm" target="hidden_frame" style="display:none">
   <input type="hidden" name="action_script" value="start_ResolvGuardManualCheck" />
   <input type="hidden" name="action_mode" value="apply" />
   <input type="hidden" name="action_wait" value="0" />
@@ -137,7 +135,7 @@ function rgDashboardLoaded() {
   <input type="hidden" name="next_page" value="" />
   <input type="hidden" name="modified" value="0" />
 </form>
-<form id="rg_config_form" method="post" action="start_apply.htm" target="rg_command_frame" style="display:none">
+<form id="rg_config_form" name="form" method="post" action="start_apply.htm" target="hidden_frame" style="display:none">
   <input type="hidden" name="action_script" value="" />
   <input type="hidden" name="amng_custom" value="" />
   <input type="hidden" name="action_mode" value="apply" />
