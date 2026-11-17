@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.2
-readonly SCRIPT_VERSTAG="26111619"
+readonly SCRIPT_VERSTAG="26111701"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -3640,13 +3640,8 @@ _FetchWebUIAsset_() {
     _Fail_ 'Downloaded WebUI ASP failed identity, content or size verification'
     return 1
   fi
-  # The transport protocol marker is independent of ASP build/version tags.
-  # The companion page must implement the fixed-action configuration interface.
-  grep -Fx '<!-- ResolvGuard WebUI Config Transport v2 -->' "$dest" >/dev/null 2>&1 || {
-    rm -f "$dest"
-    _Fail_ 'WebUI ASP does not support the fixed-action configuration transport'
-    return 1
-  }
+  # The ASP is an independent raw-branch companion. Feature support in its
+  # UI must never block installation of an otherwise valid dashboard.
   chmod 644 "$dest" || return 1
 }
 
@@ -3655,14 +3650,9 @@ _FetchWebUIAsset_() {
 _EnsureInstalledWebUIAsset_() (
   target="$INSTALL_ROOT/ResolvGuard.asp"
   channel="$UPDATE_CHANNEL"
-  marker='<!-- ResolvGuard WebUI Config Transport v2 -->'
   if [ -f "$target" ] && [ ! -L "$target" ] &&
      _VerifyWebUIAsset_ "$target" "$SCRIPT_VERSION" "$SCRIPT_VERSTAG" "$channel"; then
-    if grep -Fx "$marker" "$target" >/dev/null 2>&1; then
-      exit 0
-    fi
-    _Fail_ 'Existing WebUI ASP has an incompatible config transport; refusing to overwrite it'
-    exit 1
+    exit 0
   fi
   # Fresh-install and missing-file self-healing only. Do not migrate unshipped
   # development candidate assets or replace unexpected existing files.
@@ -3676,8 +3666,7 @@ _EnsureInstalledWebUIAsset_() (
   _FetchWebUIAsset_ "$stage" "$SCRIPT_VERSION" "$SCRIPT_VERSTAG" "$channel" || exit 1
   [ ! -e "$target" ] && [ ! -L "$target" ] || exit 1
   mv "$stage" "$target" || exit 1
-  if ! _VerifyWebUIAsset_ "$target" "$SCRIPT_VERSION" "$SCRIPT_VERSTAG" "$channel" ||
-     ! grep -Fx "$marker" "$target" >/dev/null 2>&1; then
+  if ! _VerifyWebUIAsset_ "$target" "$SCRIPT_VERSION" "$SCRIPT_VERSTAG" "$channel"; then
     _Fail_ 'Newly installed WebUI ASP failed verification'
     rm -f "$target" || :
     exit 1
@@ -3689,7 +3678,6 @@ _EnsureInstalledWebUIAsset_() (
 _IsInstalledWebUIMounted_() (
   target="$INSTALL_ROOT/ResolvGuard.asp"
   [ -f "$target" ] && [ ! -L "$target" ] || exit 1
-  grep -Fx '<!-- ResolvGuard WebUI Config Transport v2 -->' "$target" >/dev/null 2>&1 || exit 1
   [ -f /www/require/modules/menuTree.js ] &&
     grep -Fq 'tabName: "ResolvGuard"' /www/require/modules/menuTree.js || exit 1
   [ -f /jffs/scripts/service-event ] &&
