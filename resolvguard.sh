@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.2
-readonly SCRIPT_VERSTAG="26111617"
+readonly SCRIPT_VERSTAG="26111619"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -3640,6 +3640,13 @@ _FetchWebUIAsset_() {
     _Fail_ 'Downloaded WebUI ASP failed identity, content or size verification'
     return 1
   fi
+  # The transport protocol marker is independent of ASP build/version tags.
+  # The companion page must implement the fixed-action configuration interface.
+  grep -Fx '<!-- ResolvGuard WebUI Config Transport v2 -->' "$dest" >/dev/null 2>&1 || {
+    rm -f "$dest"
+    _Fail_ 'WebUI ASP does not support the fixed-action configuration transport'
+    return 1
+  }
   chmod 644 "$dest" || return 1
 }
 
@@ -3648,10 +3655,17 @@ _FetchWebUIAsset_() {
 _EnsureInstalledWebUIAsset_() (
   target="$INSTALL_ROOT/ResolvGuard.asp"
   channel="$UPDATE_CHANNEL"
+  marker='<!-- ResolvGuard WebUI Config Transport v2 -->'
   if [ -f "$target" ] && [ ! -L "$target" ] &&
      _VerifyWebUIAsset_ "$target" "$SCRIPT_VERSION" "$SCRIPT_VERSTAG" "$channel"; then
-    exit 0
+    if grep -Fx "$marker" "$target" >/dev/null 2>&1; then
+      exit 0
+    fi
+    _Fail_ 'Existing WebUI ASP has an incompatible config transport; refusing to overwrite it'
+    exit 1
   fi
+  # Fresh-install and missing-file self-healing only. Do not migrate unshipped
+  # development candidate assets or replace unexpected existing files.
   if [ -e "$target" ] || [ -L "$target" ]; then
     _Fail_ 'Existing WebUI ASP failed integrity validation; refusing to overwrite it'
     exit 1
@@ -3661,19 +3675,26 @@ _EnsureInstalledWebUIAsset_() (
   trap 'rm -f "$stage"' EXIT HUP INT TERM
   _FetchWebUIAsset_ "$stage" "$SCRIPT_VERSION" "$SCRIPT_VERSTAG" "$channel" || exit 1
   [ ! -e "$target" ] && [ ! -L "$target" ] || exit 1
-  mv "$stage" "$target" && _VerifyWebUIAsset_ "$target" "$SCRIPT_VERSION" "$SCRIPT_VERSTAG" "$channel"
+  mv "$stage" "$target" || exit 1
+  if ! _VerifyWebUIAsset_ "$target" "$SCRIPT_VERSION" "$SCRIPT_VERSTAG" "$channel" ||
+     ! grep -Fx "$marker" "$target" >/dev/null 2>&1; then
+    _Fail_ 'Newly installed WebUI ASP failed verification'
+    rm -f "$target" || :
+    exit 1
+  fi
 )
-
 # Determine whether Merlin is actually serving our current installed ASP.
 # Checking the persistent file alone is insufficient: /www and the WAN menu
 # are volatile and can be absent after a legacy script-only update.
 _IsInstalledWebUIMounted_() (
   target="$INSTALL_ROOT/ResolvGuard.asp"
   [ -f "$target" ] && [ ! -L "$target" ] || exit 1
+  grep -Fx '<!-- ResolvGuard WebUI Config Transport v2 -->' "$target" >/dev/null 2>&1 || exit 1
   [ -f /www/require/modules/menuTree.js ] &&
     grep -Fq 'tabName: "ResolvGuard"' /www/require/modules/menuTree.js || exit 1
   [ -f /jffs/scripts/service-event ] &&
     grep -Fq '# RESOLVGUARD WEBUI MANUAL BEGIN' /jffs/scripts/service-event || exit 1
+  _RGWebConfig_ hook-current >/dev/null 2>&1 || exit 1
   for title in /www/user/user*.title; do
     [ -f "$title" ] || continue
     [ "$(cat "$title" 2>/dev/null)" = ResolvGuard ] || continue
@@ -4719,7 +4740,260 @@ _RGManual_() (
   esac
 )
 # RESOLVGUARD WEBUI MANUAL CHECK END
-# RESOLVGUARD WEBUI INLINE BEGIN (read-only; generated from reviewed v1.1 controller)
+# RESOLVGUARD WEBUI CONFIG BRIDGE BEGIN
+# Native Merlin service-event is invoked by an authenticated start_apply.htm
+# POST. Only a small allowlisted, base64url-encoded data request is accepted;
+# never eval, source, or execute any user-supplied text. All writes delegate to
+# the same validation, configuration lock, and rollback functions as the CLI.
+_RGWebConfig_() (
+  umask 077
+  rg_dir="$RUNTIME/webui"
+  rg_hook=/jffs/scripts/service-event
+  rg_beg='# RESOLVGUARD WEBUI CONFIG BEGIN'
+  rg_end='# RESOLVGUARD WEBUI CONFIG END'
+  rg_lock=/tmp/addonwebui.lock
+  rg_result="$rg_dir/config-action.htm"
+  rg_config="$rg_dir/config.htm"
+  # Merlin ASUSWRT shared add-on transport, also used by MerlinAU.
+  # Only ResolvGuard_config_request is read; other add-ons' keys are untouched.
+  rg_shared="${RG_CUSTOM_SETTINGS_FILE:-/jffs/addons/custom_settings.txt}"
+  rg_notice() { printf '%s\n' "ResolvGuard WebUI config: $*" >&2; }
+  rg_quote() {
+    printf '%s' "$1" | LC_ALL=C awk '
+      BEGIN {printf "\""}
+      {if(NR>1)printf "\\n";
+       for(i=1;i<=length($0);i++) {
+         c=substr($0,i,1);
+         if(c=="\\") printf "\\\\";
+         else if(c=="\"") printf "\\\"";
+         else if(c==sprintf("%c",9)) printf "\\t";
+         else if(c==sprintf("%c",13)) printf "\\r";
+         else if(c=="<") printf "\\u003c";
+         else if(c==">") printf "\\u003e";
+         else if(c=="&") printf "\\u0026";
+         else printf "%s",c;
+       }}
+      END{printf "\""}'
+  }
+  rg_ready() {
+    [ -d "$RUNTIME" ] && [ ! -L "$RUNTIME" ] || return 1
+    [ ! -L "$rg_dir" ] && { [ ! -e "$rg_dir" ] || [ -d "$rg_dir" ]; } || return 1
+    mkdir -p "$rg_dir" || return 1
+    chmod 700 "$rg_dir" || return 1
+  }
+  rg_atomic() {
+    rg_target="$1"
+    [ ! -L "$rg_target" ] && { [ ! -e "$rg_target" ] || [ -f "$rg_target" ]; } || return 1
+    rg_tmp="$rg_target.new.$$"
+    [ ! -e "$rg_tmp" ] && [ ! -L "$rg_tmp" ] || return 1
+    if ! cat > "$rg_tmp" || ! chmod 600 "$rg_tmp" || ! mv -f "$rg_tmp" "$rg_target"; then
+      rm -f "$rg_tmp"; return 1
+    fi
+  }
+  rg_snapshot() {
+    rg_ready || return 1
+    [ -f "$SETTINGS" ] && [ ! -L "$SETTINGS" ] || return 1
+    [ -f "$EXTRA_PROVIDERS" ] && [ ! -L "$EXTRA_PROVIDERS" ] || return 1
+    # Serialize snapshots, including those triggered by SSH saves and cron.
+    [ ! -L "$rg_dir/config-snapshot.lock" ] &&
+      { [ ! -e "$rg_dir/config-snapshot.lock" ] || [ -f "$rg_dir/config-snapshot.lock" ]; } || return 1
+    exec 7> "$rg_dir/config-snapshot.lock" && flock -x 7 || return 1
+    rg_previous=0
+    if [ -f "$rg_config" ] && [ ! -L "$rg_config" ]; then
+      rg_previous=$(sed -n 's/^.*"revision":\([0-9][0-9]*\),.*$/\1/p' "$rg_config" | head -n 1)
+    fi
+    case "$rg_previous" in ''|*[!0-9]*) rg_previous=0 ;; esac
+    [ "${#rg_previous}" -le 9 ] || rg_previous=0
+    rg_revision=$((rg_previous+1))
+    rg_epoch=$(date +%s 2>/dev/null || printf 0)
+    (
+      printf '{"schema":1,"kind":"configuration","revision":%s,"generatedEpoch":%s,"settings":{' \
+        "$rg_revision" "$rg_epoch"
+      rg_sep=''
+      for rg_key in SCHEDULE_INTERVAL_MINUTES FAST_CONFIRM_SECONDS FAIL_THRESHOLD RECOVERY_THRESHOLD TIMEOUT_SECONDS BOOT_MIN_UPTIME_SECONDS SYSLOG_HEALTH_INTERVAL_MINUTES; do
+        rg_value=$(sed -n "s/^${rg_key}=//p" "$SETTINGS" | head -n 1)
+        case "$rg_value" in ''|*[!0-9]*) rg_value=0 ;; esac
+        rg_value=$(printf '%s\n' "$rg_value" | awk '{printf "%.0f",$1+0}')
+        printf '%s' "$rg_sep"; rg_quote "$rg_key"; printf ':'; printf '%s' "$rg_value"
+        rg_sep=,
+      done
+      printf '},"monitoringEnabled":%s,"autoFailoverEnabled":%s,"requiresPolicyReview":%s,' \
+        "$( [ -f "$SCHEDULE_MARKER" ] && [ ! -L "$SCHEDULE_MARKER" ] && printf true || printf false )" \
+        "$( [ -f "$AUTO_FAILOVER_MARKER" ] && [ ! -L "$AUTO_FAILOVER_MARKER" ] && printf true || printf false )" \
+        "$( [ -f "$AUTO_FAILOVER_MARKER" ] && [ ! -L "$AUTO_FAILOVER_MARKER" ] && printf true || printf false )"
+      printf '"backups":['
+      rg_sep=''
+      while IFS='|' read -r rg_id rg_ip rg_tls rg_port rg_extra; do
+        case "$rg_id" in ''|'#'*) continue ;; esac
+        [ -z "$rg_extra" ] && _IsValidID_ "$rg_id" && _IsValidIP_ "$rg_ip" && \
+          _IsValidDomain_ "$rg_tls" && _IsValidTLSPort_ "$rg_port" || continue
+        case "$rg_id" in wan[0-9]*) continue ;; esac
+        printf '%s{"id":' "$rg_sep"; rg_quote "$rg_id"
+        printf ',"ip":'; rg_quote "$rg_ip"
+        printf ',"tls":'; rg_quote "$rg_tls"
+        printf ',"port":%s}' "$rg_port"
+        rg_sep=,
+      done < "$EXTRA_PROVIDERS"
+      printf ']}\n'
+    ) | rg_atomic "$rg_config"
+  }
+  rg_publish_result() {
+    rg_id="$1"; rg_status="$2"; rg_message="$3"
+    rg_ready || return 1
+    (
+      printf '{"schema":1,"requestId":';rg_quote "$rg_id"
+      printf ',"status":';rg_quote "$rg_status"
+      printf ',"message":';rg_quote "$rg_message"
+      printf ',"completedEpoch":%s}\n' "$(date +%s 2>/dev/null || printf 0)"
+    ) | rg_atomic "$rg_result"
+  }
+  rg_hook_body() {
+    printf '%s\n' "$rg_beg" \
+      'case "$1:$2" in' \
+      '  start:ResolvGuardCfg)' \
+      '    /bin/sh /jffs/addons/ResolvGuard.d/resolvguard.sh webui config-run >/tmp/resolvguard-webui-config.log 2>&1 &' \
+      '    ;;' \
+      '  start:ResolvGuardCfgRefresh)' \
+      '    /bin/sh /jffs/addons/ResolvGuard.d/resolvguard.sh webui config-snapshot >/tmp/resolvguard-webui-config-refresh.log 2>&1 &' \
+      '    ;;' \
+      'esac' "$rg_end"
+  }
+  rg_hook_current() {
+    [ -f "$rg_hook" ] && [ ! -L "$rg_hook" ] || return 1
+    [ "$(grep -Fxc "$rg_beg" "$rg_hook" || :)" = 1 ] &&
+      [ "$(grep -Fxc "$rg_end" "$rg_hook" || :)" = 1 ] || return 1
+    rg_existing=$(sed -n '/^# RESOLVGUARD WEBUI CONFIG BEGIN$/,/^# RESOLVGUARD WEBUI CONFIG END$/p' "$rg_hook")
+    [ "$rg_existing" = "$(rg_hook_body)" ]
+  }
+  rg_hook_update() {
+    rg_verb="$1"
+    [ "$ROOT" = "$INSTALL_ROOT" ] || return 1
+    [ -d /jffs/scripts ] && [ ! -L /jffs/scripts ] || return 1
+    [ ! -L "$rg_hook" ] && { [ ! -e "$rg_hook" ] || [ -f "$rg_hook" ]; } || return 1
+    exec 9> "$rg_lock" && flock -x 9 || return 1
+    rg_nbeg=0;rg_nend=0
+    if [ -f "$rg_hook" ]; then
+      rg_nbeg=$(grep -Fxc "$rg_beg" "$rg_hook" || :)
+      rg_nend=$(grep -Fxc "$rg_end" "$rg_hook" || :)
+    fi
+    [ "$rg_nbeg" -le 1 ] && [ "$rg_nend" = "$rg_nbeg" ] || return 1
+    if [ "$rg_nbeg" = 1 ]; then
+      rg_actual=$(sed -n '/^# RESOLVGUARD WEBUI CONFIG BEGIN$/,/^# RESOLVGUARD WEBUI CONFIG END$/p' "$rg_hook")
+      if [ "$rg_actual" = "$(rg_hook_body)" ]; then
+        [ "$rg_verb" = install ] && return 0
+      else
+        rg_notice 'unknown config hook; refusing to replace'
+        return 1
+      fi
+    elif [ "$rg_verb" = remove ]; then
+      return 0
+    fi
+    rg_stage=/jffs/scripts/.service-event-resolvguard-config-$$
+    [ ! -e "$rg_stage" ] && [ ! -L "$rg_stage" ] || return 1
+    if [ -f "$rg_hook" ]; then
+      if [ "$rg_verb" = remove ]; then
+        sed '/^# RESOLVGUARD WEBUI CONFIG BEGIN$/,/^# RESOLVGUARD WEBUI CONFIG END$/d' "$rg_hook" > "$rg_stage" || return 1
+      else
+        cat "$rg_hook" > "$rg_stage" || return 1
+        printf '\n' >> "$rg_stage"
+        rg_hook_body >> "$rg_stage" || return 1
+      fi
+    else
+      printf '#!/bin/sh\n\n' > "$rg_stage" || return 1
+      rg_hook_body >> "$rg_stage" || return 1
+    fi
+    chmod 755 "$rg_stage" && mv -f "$rg_stage" "$rg_hook" || { rm -f "$rg_stage"; return 1; }
+  }
+  rg_apply() {
+    [ "$ROOT" = "$INSTALL_ROOT" ] && _IsInstallationComplete_ || return 1
+    # Firmware delivers a fixed action name. The independent bounded payload
+    # is persisted by start_apply.htm under this one namespaced custom key.
+    rg_ready || return 1
+    [ ! -L "$rg_dir/config-request.lock" ] &&
+      { [ ! -e "$rg_dir/config-request.lock" ] || [ -f "$rg_dir/config-request.lock" ]; } || return 1
+    exec 6> "$rg_dir/config-request.lock" && flock -x 6 || return 1
+    [ -f "$rg_shared" ] && [ ! -L "$rg_shared" ] || {
+      rg_notice 'shared firmware settings file not available'; return 1;
+    }
+    rg_token=$(LC_ALL=C awk '
+      $1=="ResolvGuard_config_request" { n++; if (NF==2) v=$2; else bad=1 }
+      END { if(n==1 && !bad) print v; else exit 1 }
+    ' "$rg_shared") || { rg_notice 'missing or ambiguous namespaced request';return 1; }
+    case "$rg_token" in ''|*[!A-Za-z0-9_-]*) rg_notice 'invalid request encoding';return 1 ;; esac
+    [ "${#rg_token}" -le 768 ] || { rg_notice 'oversized config request';return 1; }
+    command -v base64 >/dev/null 2>&1 || { rg_notice 'base64 decoder unavailable';return 1; }
+    rg_b64=$(printf '%s' "$rg_token" | tr '_-' '/+')
+    case $((${#rg_b64} % 4)) in
+      0) :;; 2) rg_b64="${rg_b64}==";; 3) rg_b64="${rg_b64}=";; *) return 1 ;;
+    esac
+    rg_payload=$(printf '%s' "$rg_b64" | base64 -d 2>/dev/null) || return 1
+    # ASCII-only data. No control characters, shell syntax, whitespace, or
+    # line breaks may cross the firmware service event boundary.
+    case "$rg_payload" in ''|*[!A-Za-z0-9_.:/\|\-]*) rg_notice 'invalid data characters';return 1 ;; esac
+    IFS='|' read -r rg_id rg_op rg_a rg_b rg_c rg_d rg_overflow <<EOF_RG_WEB_CONFIG
+$rg_payload
+EOF_RG_WEB_CONFIG
+    case "$rg_id" in ''|*[!0-9]*) return 1 ;; esac
+    [ "${#rg_id}" -ge 11 ] && [ "${#rg_id}" -le 18 ] && [ -z "$rg_overflow" ] || return 1
+    # The shared key persists until another form save replaces it. Prevent
+    # duplicate event delivery from reapplying an already processed request.
+    rg_seen="$rg_dir/config-last-request"
+    [ ! -L "$rg_seen" ] && { [ ! -e "$rg_seen" ] || [ -f "$rg_seen" ]; } || return 1
+    if [ -f "$rg_seen" ] && [ "$(cat "$rg_seen")" = "$rg_id" ]; then
+      rg_notice 'duplicate configuration event ignored'
+      return 1
+    fi
+    rg_result_status=error;rg_message='Configuration rejected; see router log'
+    case "$rg_op" in
+      setting)
+        if [ -z "$rg_c" ] && [ -z "$rg_d" ]; then
+        case "$rg_a" in
+          SCHEDULE_INTERVAL_MINUTES|FAST_CONFIRM_SECONDS|FAIL_THRESHOLD|RECOVERY_THRESHOLD|TIMEOUT_SECONDS|BOOT_MIN_UPTIME_SECONDS|SYSLOG_HEALTH_INTERVAL_MINUTES)
+            if _SetSetting_ "$rg_a" "$rg_b"; then rg_result_status=success;rg_message='Monitoring setting saved'; fi ;;
+        esac
+        fi ;;
+      backup-add|backup-edit)
+        if [ -n "$rg_a" ] && [ "${#rg_a}" -le 32 ] && [ "${#rg_b}" -le 48 ] && [ "${#rg_c}" -le 253 ] &&
+           _IsValidID_ "$rg_a" && _IsValidIP_ "$rg_b" && _IsValidDomain_ "$rg_c" && _IsValidTLSPort_ "$rg_d"; then
+          case "$rg_a" in wan[0-9]*) :;; *)
+            if [ "$rg_op" = backup-add ]; then rg_kind=add; else rg_kind=edit; fi
+            if _ChangeTSVFile_ "$EXTRA_PROVIDERS" provider "$rg_kind" "$rg_a" "$rg_a|$rg_b|$rg_c|$rg_d"; then
+              rg_result_status=success;rg_message='Backup resolver saved; review DNS policy before automatic failover'
+            fi;; esac
+        fi ;;
+      backup-delete)
+        if [ -z "$rg_b" ] && [ -z "$rg_c" ] && [ -z "$rg_d" ] && _IsValidID_ "$rg_a"; then
+          case "$rg_a" in wan[0-9]*) :;; *)
+            if _ChangeTSVFile_ "$EXTRA_PROVIDERS" provider del "$rg_a"; then
+              rg_result_status=success;rg_message='Backup resolver removed; review DNS policy before automatic failover'
+            fi ;; esac
+        fi ;;
+      preset)
+        if [ -z "$rg_b" ] && [ -z "$rg_c" ] && [ -z "$rg_d" ]; then
+          case "$rg_a" in GO|CS|QS)
+            if _InstallBackupPreset_ "$rg_a"; then rg_result_status=success;rg_message='Backup resolver pair saved; policy review required'; fi ;;
+          esac
+        fi ;;
+    esac
+    if [ "$rg_result_status" = success ]; then
+      rg_snapshot || rg_notice 'saved but snapshot publishing failed'
+    fi
+    rg_publish_result "$rg_id" "$rg_result_status" "$rg_message" || return 1
+    printf '%s\n' "$rg_id" | rg_atomic "$rg_seen" || return 1
+    [ "$rg_result_status" = success ]
+  }
+  case "${1:-}" in
+    snapshot) rg_snapshot ;;
+    hook-install) rg_hook_update install ;;
+    hook-remove) rg_hook_update remove ;;
+    hook-current) rg_hook_current ;;
+    apply) rg_apply ;;
+    *) return 1 ;;
+  esac
+)
+# RESOLVGUARD WEBUI CONFIG BRIDGE END
+
+# RESOLVGUARD WEBUI INLINE BEGIN (monitoring snapshots and authenticated configuration)
 # All controller functions and variables execute in a subshell to avoid
 # altering the DNS monitor's globals, options, locks, and exit traps.
 _RGWebUI_() (
@@ -4844,7 +5118,7 @@ _RGWebUI_() (
     interval=1
     if [ -f "$RG_ROOT/config/settings.conf" ] && [ ! -L "$RG_ROOT/config/settings.conf" ]; then
       setting=$(grep '^SCHEDULE_INTERVAL_MINUTES=' "$RG_ROOT/config/settings.conf" | tail -n 1 | cut -d= -f2 | tr -dc '0-9')
-      case "$setting" in 1|2|3|5|10|15|30|60) interval=$setting;; esac
+      case "$setting" in 1|2|5|10|15|20|30|60) interval=$setting;; esac
     fi
     epoch=$(date -u +%s 2>/dev/null || printf 0)
     # Make one append per completed cycle by remembering its exact END timestamp.
@@ -4986,6 +5260,7 @@ _RGWebUI_() (
       printf ']}'
     ) > "$tmp" || return 1
     mv "$tmp" "$RG_DATA/history.htm" || return 1
+    _RGWebConfig_ snapshot || err "unable to publish configuration snapshot"
     rm -f "$cycle" "$observations"
     trap - EXIT HUP INT TERM
     return 0
@@ -5072,7 +5347,7 @@ _RGWebUI_() (
     fi
     mkdir -p "$dir" "$RG_DATA" || { unlock_menu; return 1; }
     # Link read-only public JSON snapshots, never config/settings or secrets.
-    for name in status.htm history.htm manual.htm; do
+    for name in status.htm history.htm manual.htm config.htm config-action.htm; do
       if [ -e "$dir/$name" ] && [ ! -L "$dir/$name" ]; then
         err 'refusing to replace non-owned web asset';unlock_menu; return 1
       fi
@@ -5108,7 +5383,7 @@ _RGWebUI_() (
       rewrite_menu remove "$found" || { unlock_menu; return 1; }
       rm -f "$RG_WEB/$found" "$RG_WEB/${found%.asp}.title" || { unlock_menu; return 1; }
     fi
-    for name in status.htm history.htm manual.htm; do
+    for name in status.htm history.htm manual.htm config.htm config-action.htm; do
       source_file="$RG_DATA/$name"
       if [ -L "$RG_WEB/ResolvGuard/$name" ] && [ "$(readlink "$RG_WEB/ResolvGuard/$name")" = "$source_file" ]; then
         rm -f "$RG_WEB/ResolvGuard/$name"
@@ -5126,12 +5401,12 @@ _RGWebUI_() (
   case "${1:-help}" in
     publish) publish ;;
     bootstrap) _BootstrapExistingWebUI_ ;;
-    mount) mount_page && _RGManual_ hook-install ;;
-    unmount) _RGManual_ hook-remove && unmount_page ;;
+    mount) mount_page && _RGManual_ hook-install && _RGWebConfig_ hook-install ;;
+    unmount) _RGWebConfig_ hook-remove && _RGManual_ hook-remove && unmount_page ;;
     startup)
       i=0
       while [ "$i" -lt 6 ]; do
-        if [ -d "$RG_WEB" ] && [ -f "$RG_MENU" ] && mount_page && _RGManual_ hook-install; then
+        if [ -d "$RG_WEB" ] && [ -f "$RG_MENU" ] && mount_page && _RGManual_ hook-install && _RGWebConfig_ hook-install; then
           publish || :
           exit 0
         fi
@@ -5144,7 +5419,7 @@ _RGWebUI_() (
       else err 'no completed snapshot; run publish after a scheduled check';exit 1;fi ;;
     manual-run) _RGManual_ run ;;
     manual-status) _RGManual_ status ;;
-    *) say 'Usage: sh resolvguard.sh webui [bootstrap|mount|unmount|publish|startup|status|manual-run|manual-status]' ;;
+    *) say 'Usage: sh resolvguard.sh webui [bootstrap|mount|unmount|publish|startup|status|config-snapshot|manual-run|manual-status]' ;;
   esac
 
 )
@@ -5555,6 +5830,9 @@ _CommitConfigurationLocked_() {
   fi
   rm -f "$backup1" "$backup2" "$stage2"
   _Say_ 'Configuration: SAVED'
+  # Keep the WebUI's own configuration feed current for SSH changes as well.
+  # This is RAM-only, best-effort, and never changes whether the commit succeeded.
+  _RGWebConfig_ snapshot >/dev/null 2>&1 || :
   if [ -e "$AUTO_FAILOVER_MARKER" ]; then
     _Say_ 'DNS policy: REAPPROVAL REQUIRED'
   fi
@@ -6518,7 +6796,8 @@ _UninstallLocked_() {
   if { [ -f "$ROOT/ResolvGuard.asp" ] && [ ! -L "$ROOT/ResolvGuard.asp" ]; } ||
      { [ -f "$ROOT/webui/ResolvGuard.asp" ] && [ ! -L "$ROOT/webui/ResolvGuard.asp" ]; } ||
      { [ -f /jffs/scripts/service-event ] &&
-       grep -Fq '# RESOLVGUARD WEBUI MANUAL BEGIN' /jffs/scripts/service-event; }; then
+       { grep -Fq '# RESOLVGUARD WEBUI MANUAL BEGIN' /jffs/scripts/service-event ||
+         grep -Fq '# RESOLVGUARD WEBUI CONFIG BEGIN' /jffs/scripts/service-event; }; }; then
     _RGWebUI_ unmount || {
       _Fail_ 'WebUI cleanup failed; installation retained for inspection'
       return 1
@@ -7317,7 +7596,12 @@ case "${1:-menu}" in
   policy) _ManagePolicy_ "${2:-status}" ;;
   startup) _ScheduleStartup_ ;;
   scheduled-check) _RunScheduledCheck_ ;;
-  webui) _RGWebUI_ "${2:-status}" ;;
+  webui)
+    case "${2:-status}" in
+      config-run) _RGWebConfig_ apply ;;
+      config-snapshot) _RGWebConfig_ snapshot ;;
+      *) _RGWebUI_ "${2:-status}" ;;
+    esac ;;
   validate) (
     PROVIDERS="$RUNTIME/providers-validation-$$.tsv"
     trap 'rm -f "$RUNTIME/providers-validation-$$.tsv"' EXIT HUP INT TERM

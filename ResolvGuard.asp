@@ -1,7 +1,8 @@
 <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
-<!-- ResolvGuard WebUI build 0.2.2_26111614 -->
+<!-- ResolvGuard WebUI build 0.2.2_26111619 -->
 <!-- ResolvGuard WebUI Integration v3.0: self-contained dashboard in one ASP -->
 <!-- ResolvGuard WebUI Integration v1 -->
+<!-- ResolvGuard WebUI Config Transport v2 -->
 <html xmlns="http://www.w3.org/1999/xhtml">
 <head>
 <meta http-equiv="X-UA-Compatible" content="IE=Edge" />
@@ -34,6 +35,42 @@ function rgRequestManualCheck() {
   var page=window.location.pathname.split("/").pop();
   form.elements.namedItem("current_page").value=page;
   form.elements.namedItem("next_page").value=page;
+  form.submit();
+  return true;
+}
+// Use the same firmware-native custom settings transport as MerlinAU:
+// fixed service action name, separate namespaced data, preserve other add-ons.
+var rgSharedCustomSettings = <% get_custom_settings(); %>;
+function rgRequestConfiguration(data) {
+  var form=document.getElementById('rg_config_form');
+  if(!form || typeof data!=='string' || data.length>560 || !/^[A-Za-z0-9_.:/|_-]+$/.test(data)) return false;
+  if(!rgSharedCustomSettings || typeof rgSharedCustomSettings!=='object' || Array.isArray(rgSharedCustomSettings)) return false;
+  var token;
+  try {token=btoa(data).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');}
+  catch(e){return false;}
+  if(token.length>768) return false;
+  var merged=Object.create(null);
+  Object.keys(rgSharedCustomSettings).forEach(function(key){
+    if(key!=='ResolvGuard_config_request') merged[key]=rgSharedCustomSettings[key];
+  });
+  merged.ResolvGuard_config_request=token;
+  var page=window.location.pathname.split('/').pop();
+  form.elements.namedItem('current_page').value=page;
+  form.elements.namedItem('next_page').value=page;
+  form.elements.namedItem('action_script').value='start_ResolvGuardCfg';
+  form.elements.namedItem('amng_custom').value=JSON.stringify(merged);
+  form.submit();
+  // Keep subsequent saves from this open page in sync with the submitted key.
+  rgSharedCustomSettings.ResolvGuard_config_request=token;
+  return true;
+}
+function rgRequestConfigRefresh() {
+  var form=document.getElementById('rg_refresh_form');
+  if(!form || !form.elements.namedItem('action_script')) return false;
+  var page=window.location.pathname.split('/').pop();
+  form.elements.namedItem('current_page').value=page;
+  form.elements.namedItem('next_page').value=page;
+  form.elements.namedItem('action_script').value='start_ResolvGuardCfgRefresh';
   form.submit();
   return true;
 }
@@ -105,6 +142,23 @@ function rgDashboardLoaded() {
   <input type="hidden" name="action_script" value="start_ResolvGuardManualCheck" />
   <input type="hidden" name="action_mode" value="apply" />
   <input type="hidden" name="action_wait" value="0" />
+  <input type="hidden" name="current_page" value="" />
+  <input type="hidden" name="next_page" value="" />
+  <input type="hidden" name="modified" value="0" />
+</form>
+<form id="rg_refresh_form" method="post" action="start_apply.htm" target="rg_command_frame" style="display:none">
+  <input type="hidden" name="action_script" value="start_ResolvGuardCfgRefresh" />
+  <input type="hidden" name="action_mode" value="apply" />
+  <input type="hidden" name="action_wait" value="0" />
+  <input type="hidden" name="current_page" value="" />
+  <input type="hidden" name="next_page" value="" />
+  <input type="hidden" name="modified" value="0" />
+</form>
+<form id="rg_config_form" method="post" action="start_apply.htm" target="rg_command_frame" style="display:none">
+  <input type="hidden" name="action_script" value="" />
+  <input type="hidden" name="amng_custom" value="" />
+  <input type="hidden" name="action_mode" value="apply" />
+  <input type="hidden" name="action_wait" value="10" />
   <input type="hidden" name="current_page" value="" />
   <input type="hidden" name="next_page" value="" />
   <input type="hidden" name="modified" value="0" />
@@ -184,6 +238,9 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
 
 .manual-panel{border:1px solid #3b6570;background:linear-gradient(120deg,#172d34,#12232c);border-radius:14px;margin-bottom:20px;overflow:hidden;box-shadow:0 12px 30px #0002}
 .manual-panel[hidden]{display:none!important}.manual-head{padding:17px 20px;border-bottom:1px solid #31515a;display:flex;justify-content:space-between;align-items:flex-start;gap:12px}.manual-head strong{font-size:15px;color:#f0f8f5}.manual-help{font-size:12px;color:#a0c2c0;margin-top:5px}.manual-content{padding:15px 20px}.manual-foot{border-top:1px solid #29434a;padding:11px 20px;font-size:11px;color:#8aaeb0}.manual-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:9px}.manual-item{border:1px solid #36555b;background:#142b32;border-radius:9px;padding:11px}.manual-item strong{display:block;font-size:12px}.manual-item small{display:block;color:#9fbdc1;margin-top:5px;overflow-wrap:anywhere}.manual-status{font-weight:800;font-size:20px;margin:0 0 10px}.manual-log{margin-top:12px;max-height:290px;overflow:auto;border:1px solid #31515b;border-radius:9px}.manual-log details{border-bottom:1px solid #29434b;padding:9px 12px;font-size:12px}.manual-log details:last-child{border-bottom:0}.manual-log summary{cursor:pointer;color:#c5e8dd;font-weight:700}.manual-check{padding:8px 0 7px 10px;border-bottom:1px solid #223841;font-size:11px;overflow-wrap:anywhere}.manual-check:last-child{border:0}.manual-check .pass{color:#70e2b1}.manual-check .fail{color:#f7a677}.manual-inline-busy{display:inline-block;width:12px;height:12px;border-radius:50%;border:2px solid #527e77;border-top-color:#74f2bc;animation:rgmanual-spin .85s linear infinite;vertical-align:middle;margin-right:7px}@keyframes rgmanual-spin{to{transform:rotate(360deg)}}
+
+/* ResolvGuard settings and backup resolver controls */
+.rg-config-note{margin:2px 0 0;line-height:1.65}.rg-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:13px 17px}.rg-fields label,.rg-setting-row label{font-size:12px;font-weight:700;color:#b5ced2;display:flex;flex-direction:column;gap:6px}.rg-input{width:100%;font:inherit;color:#ecf7f3;background:#0d1d25;border:1px solid #385660;border-radius:9px;padding:10px;min-width:0}.rg-input:focus-visible{outline:2px solid var(--green);outline-offset:1px}.rg-input:disabled{opacity:.6}.rg-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:16px}.rg-divider{border-top:1px solid var(--line);margin:20px 0}.rg-backup-row,.rg-setting-row{padding:14px 18px;border-bottom:1px solid #243c44;display:flex;align-items:center;justify-content:space-between;gap:15px}.rg-backup-row:last-child,.rg-setting-row:last-child{border-bottom:0}.rg-backup-info strong{font-size:13px;display:block}.rg-backup-info small{color:var(--sub);display:block;overflow-wrap:anywhere;margin-top:5px}.rg-setting-row .rg-control{display:flex;align-items:center;gap:9px}.rg-setting-row .rg-input{width:110px}.rg-configuration-status{position:sticky;bottom:10px;z-index:50;padding:13px 16px;margin-top:14px;border:1px solid #3c7260;border-radius:10px;background:#17352f;color:#c4ffe5;box-shadow:0 10px 22px #0006}.rg-configuration-status.error{border-color:#8d5a53;background:#3c2426;color:#ffd1c6}.rg-configuration-status[hidden]{display:none!important}@media(max-width:820px){.rg-fields{grid-template-columns:1fr}.rg-backup-row,.rg-setting-row{align-items:flex-start;flex-direction:column}.rg-setting-row .rg-control{width:100%}}
 </style>
 <script>document.body.classList.add('rg-embedded');</script>
 <div class="app">
@@ -193,10 +250,12 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
   <button class="nav active" data-tab="overview" aria-current="page"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="8" height="8" rx="1.5"/><rect x="13" y="3" width="8" height="5" rx="1.5"/><rect x="13" y="10" width="8" height="11" rx="1.5"/><rect x="3" y="13" width="8" height="8" rx="1.5"/></svg> Overview</button>
   <button class="nav" data-tab="history"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18M6 17l5-6 4 3 6-8"/></svg> Health history</button>
   <button class="nav" data-tab="paths"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="5" cy="12" r="3"/><circle cx="19" cy="5" r="3"/><circle cx="19" cy="19" r="3"/><path d="M8 12h5m0 0 3-5m-3 5 3 5"/></svg> DNS paths & exceptions</button>
-  <div class="side-bottom"><div class="small-pill"><span class="dot"></span> DNS monitoring</div><div class="small-note">Scheduled monitoring snapshots<br>Optional read-only live checks<br>No WAN configuration writes</div></div>
+  <button class="nav" data-tab="backups"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="12" r="3"/><circle cx="18" cy="6" r="3"/><circle cx="18" cy="18" r="3"/><path d="M9 12h6m-1-4 2-2m-2 10 2 2"/></svg> Backup &amp; Alternate Resolvers</button>
+  <button class="nav" data-tab="settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v3m0 14v3M4 4l2.2 2.2M17.8 17.8 20 20M2 12h3m14 0h3M4 20l2.2-2.2M17.8 6.2 20 4"/></svg> Settings</button>
+  <div class="side-bottom"><div class="small-pill"><span class="dot"></span> DNS monitoring</div><div class="small-note">Scheduled monitoring snapshots<br>Optional read-only live checks<br>Primary WAN DNS stays in ASUS settings</div></div>
 </aside>
 <main class="main">
-  <div class="tabs-mobile"><button class="m-tab active" data-tab="overview">Overview</button><button class="m-tab" data-tab="history">History</button><button class="m-tab" data-tab="paths">DNS Paths</button></div>
+  <div class="tabs-mobile"><button class="m-tab active" data-tab="overview">Overview</button><button class="m-tab" data-tab="history">History</button><button class="m-tab" data-tab="paths">DNS Paths</button><button class="m-tab" data-tab="backups">Backups</button><button class="m-tab" data-tab="settings">Settings</button></div>
   <header class="top"><div><div class="eyebrow">Intelligent DNS monitoring</div><h1 class="page-title" id="pageTitle">Dashboard overview</h1><div class="desc" id="pageDesc">Your DNS reliability, clearly visible.</div></div><div class="top-tools"><span class="tag demo" id="feedStatus">CONNECTING...</span><button class="btn primary" id="runHealthCheck"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v18M3 12h18"/></svg> Run Health Check</button></div></header>
   <section class="manual-panel" id="manualPanel" hidden aria-live="polite">
     <div class="manual-head"><div><strong id="manualTitle">Manual health check</strong><div class="manual-help" id="manualSummary">A separate, read-only authenticated DoT policy evaluation.</div></div><button type="button" class="inspector-close" id="manualClose" aria-label="Close manual health-check results">×</button></div>
@@ -246,20 +305,53 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     <div class="section-head"><h3>Configured Stubby-bypass exceptions</h3><span class="warn-pill">Bypass warning from Quick Setup</span></div>
     <div class="card"><div class="card-head"><div><div class="card-title">Domain-scoped DNSMasq upstream rules</div><div class="card-sub">From <code>/tmp/resolv.dnsmasq</code> via <code>server=/domain/IP</code></div></div><div id="exceptionList"></div><div class="card-pad" style="padding-top:9px"><p class="desc">Read-only results from the same DNSMasq upstream file used by the installer warning. Not a complete audit of LAN device traffic.</p></div></div>
   </section>
-  <footer class="footer"><span>ResolvGuard live dashboard · On-demand checks are read-only · No WAN writes</span><span>Heartbeat follows completed scheduled cycles · History stored in /tmp</span></footer>
+  <section id="backups" class="tab">
+    <div class="section-head" style="margin-top:0"><h3>Backup &amp; Alternate Resolvers</h3><span class="hint">ResolvGuard-managed encrypted DNS backups</span></div>
+    <div class="note rg-config-note">Primary/preferred DNS is configured through <strong>ASUS WAN → DNS Privacy</strong>, not here. These backup endpoints are used only according to ResolvGuard's verified failover policy. Editing backup configuration may require renewed policy approval.</div>
+    <div class="card" style="margin-top:16px">
+      <div class="card-head"><div><div class="card-title">Configured backup resolvers</div><div class="card-sub">Configured endpoints are not assumed healthy until independently checked</div></div><div style="display:flex;gap:8px;flex-wrap:wrap"><span class="small-pill" id="backupPoolState">Pool: unknown</span><span class="small-pill" id="backupCount">—</span></div></div>
+      <div id="backupRows"><div class="empty">Loading configuration…</div></div>
+      <div class="card-pad" id="backupGroups" style="border-top:1px solid var(--line)"></div>
+    </div>
+    <div class="card" style="margin-top:18px">
+      <div class="card-head"><div><div class="card-title">Add or edit a backup resolver</div><div class="card-sub">Validated IPv4/IPv6 address, TLS hostname and port; existing IDs cannot be renamed</div></div><button type="button" class="btn" id="backupReset">Clear</button></div>
+      <div class="card-pad">
+        <div class="rg-fields">
+          <label>Resolver ID <input class="rg-input" id="backupId" maxlength="32" placeholder="backup1" autocomplete="off"></label>
+          <label>DNS IP address <input class="rg-input" id="backupIp" maxlength="48" placeholder="1.1.1.2" autocomplete="off"></label>
+          <label>Verified TLS hostname <input class="rg-input" id="backupTls" maxlength="120" placeholder="security.cloudflare-dns.com" autocomplete="off"></label>
+          <label>TLS port <input class="rg-input" id="backupPort" type="number" min="1" max="65535" value="853"></label>
+        </div>
+        <div class="rg-actions"><button type="button" class="btn primary" id="backupSave" disabled>Save resolver</button><span class="hint" id="backupMode">Add new resolver</span></div>
+        <div class="rg-divider"></div>
+        <div class="card-title">Add a preset pair</div><p class="desc">Presets use the same checks and all-or-nothing configuration transaction as SSH.</p>
+        <div class="rg-actions"><button type="button" class="btn rg-preset" data-preset="GO" disabled>Google</button><button type="button" class="btn rg-preset" data-preset="CS" disabled>Cloudflare Security</button><button type="button" class="btn rg-preset" data-preset="QS" disabled>Quad9 Security</button></div>
+      </div>
+    </div>
+  </section>
+  <section id="settings" class="tab">
+    <div class="section-head" style="margin-top:0"><h3>ResolvGuard settings</h3><span class="hint">Configuration saved through authenticated ASUS service actions</span></div>
+    <div class="note rg-config-note">These settings govern ResolvGuard's monitoring behavior. Preferred WAN resolvers, DNS Privacy settings, and automatic failover authorization are <strong>not edited here</strong>. Those retain their existing ASUS and SSH approval workflows.</div>
+    <div class="card" style="margin-top:16px">
+      <div class="card-head"><div><div class="card-title">Monitoring &amp; health-check parameters</div><div class="card-sub" id="settingsSummary">Loading saved configuration…</div></div></div>
+      <div id="settingsRows"></div>
+    </div>
+  </section>
+  <div class="rg-configuration-status" id="configFeedback" role="status" aria-live="polite" hidden></div>
+  <footer class="footer"><span>ResolvGuard dashboard · Authenticated backup/settings changes · No WAN DNS writes</span><span>Heartbeat follows completed scheduled cycles · History stored in /tmp</span></footer>
 </main>
 </div>
 <div id="inspectBackdrop" class="inspector-backdrop" tabindex="-1"></div>
 <aside class="inspector" id="inspector" aria-label="Resolver details" aria-hidden="true" role="dialog" aria-modal="true"><button id="inspectorClose" class="inspector-close" aria-label="Close">×</button><div class="eyebrow">Resolver inspector</div><div id="inspectContent"></div></aside>
 <script>
-/* ResolvGuard read-only scheduled feed + explicitly requested independent DoT checks. */
+/* ResolvGuard monitoring and authenticated configuration UI. */
 (() => {
   'use strict';
   const $ = id => document.getElementById(id);
   const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const fmtTime = v => {const d=Date.parse(v||'');return Number.isFinite(d)?new Date(d).toLocaleString():'No completed check';};
   const since = v => {const d=Date.parse(v||'');if(!Number.isFinite(d))return 'No completed check';const sec=Math.max(0,Math.floor((Date.now()-d)/1000));return sec<60?sec+' seconds ago':Math.floor(sec/60)+' min ago';};
-  const state={tab:'overview',period:'24',snapshot:null,history:[],lastEnd:'',lastFetch:0,polling:false,feedConnected:false,historyPending:'',historyBaseline:'',historyAttempts:0,historyAdvanced:false,manualBusy:false,manualPolling:null,manualPreviousId:'',manualRequestedAt:0,manualRunId:''};
+  const state={tab:'overview',period:'24',snapshot:null,history:[],lastEnd:'',lastFetch:0,polling:false,feedConnected:false,historyPending:'',historyBaseline:'',historyAttempts:0,historyAdvanced:false,manualBusy:false,manualPolling:null,manualPreviousId:'',manualRequestedAt:0,manualRunId:'',config:null,configBusy:false,configFresh:false,configLoading:false,editingBackupId:''};
   const hasRealChecks = d => (d?.resolvers||[]).some(r => r.policyPass+r.policyFail>0);
   function isStale(d){if(!d?.lastEnd)return true;const ms=Date.parse(d.lastEnd);return !Number.isFinite(ms)||Date.now()-ms>Math.max(150000,(d.scheduleMinutes||1)*150000);}
   function pref(d){return (d?.resolvers||[]).filter(r=>/^wan[0-9]+$/.test(r.id));}
@@ -477,7 +569,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     }
   }
   function closeInspector(){$('inspectBackdrop').classList.remove('open');$('inspector').classList.remove('open');$('inspector').setAttribute('aria-hidden','true');}
-  function tab(name){state.tab=name;waveform.setVisible(name==='overview');document.querySelectorAll('[data-tab]').forEach(el=>{const active=el.dataset.tab===name;el.classList.toggle('active',active);});document.querySelectorAll('.tab').forEach(el=>el.classList.toggle('active',el.id===name));const m={overview:['Dashboard overview','Your DNS reliability, clearly visible.'],history:['Health history','Observed DNS reliability from volatile history.'],paths:['DNS paths & exceptions','Inspect DNSMasq domain-scoped Stubby bypasses.']}[name];$('pageTitle').textContent=m[0];$('pageDesc').textContent=m[1];if(name==='history')renderHistory();if(name==='paths')renderPaths();}
+  function tab(name){state.tab=name;waveform.setVisible(name==='overview');document.querySelectorAll('[data-tab]').forEach(el=>{const active=el.dataset.tab===name;el.classList.toggle('active',active);});document.querySelectorAll('.tab').forEach(el=>el.classList.toggle('active',el.id===name));const m={overview:['Dashboard overview','Your DNS reliability, clearly visible.'],history:['Health history','Observed DNS reliability from volatile history.'],paths:['DNS paths & exceptions','Inspect DNSMasq domain-scoped Stubby bypasses.'],backups:['Backup & alternate resolvers','Manage ResolvGuard backup DoT endpoints, not ASUS WAN primary DNS.'],settings:['ResolvGuard settings','Configure monitoring thresholds and timing using Merlin authentication.']}[name];$('pageTitle').textContent=m[0];$('pageDesc').textContent=m[1];if(name==='history')renderHistory();if(name==='paths')renderPaths();if(name==='settings'||name==='backups')loadConfig();}
   async function load(url){const response=await fetch(url+'?t='+Date.now(),{cache:'no-store',credentials:'same-origin'});if(!response.ok)throw Error('HTTP '+response.status);const d=JSON.parse(await response.text());if(d.schema!==1)throw Error('Unsupported feed schema');return d;}
   async function refresh(){if(state.polling)return;state.polling=true;try{
       const d=await load('/ext/ResolvGuard/status.htm');
@@ -613,6 +705,121 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     state.manualPolling=setInterval(pollManual,1500);
     pollManual();
   }
+  // The authenticated parent page submits configuration requests through
+  // Merlin's standard start_apply.htm action and owned service-event hook.
+  const settingsDefs={
+    SCHEDULE_INTERVAL_MINUTES:['Schedule interval (minutes)',[1,2,5,10,15,20,30,60]],
+    FAST_CONFIRM_SECONDS:['Fast failure confirmation (seconds)',[0,15]],
+    FAIL_THRESHOLD:['Failure threshold',[1,20]],
+    RECOVERY_THRESHOLD:['Recovery threshold',[1,20]],
+    TIMEOUT_SECONDS:['DoT query timeout (seconds)',[1,15]],
+    BOOT_MIN_UPTIME_SECONDS:['Startup warmup (seconds)',[0,3600]],
+    SYSLOG_HEALTH_INTERVAL_MINUTES:['Healthy syslog interval (minutes)',[0,15,30,60]]
+  };
+  function configNotice(msg,isError=false){const e=$('configFeedback');e.hidden=false;e.textContent=msg;e.classList.toggle('error',isError);}
+  function controlsBusy(b){state.configBusy=b;document.querySelectorAll('#backups button,#settingsRows button').forEach(e=>e.disabled=b||!state.config||!state.configFresh);}
+  function renderSettings(){
+    const cfg=state.config;if(!cfg)return;
+    var summary=cfg.monitoringEnabled?'Monitoring enabled'+(cfg.autoFailoverEnabled?' · Automatic failover authorization exists':' · Monitoring only'):'Monitoring disabled';
+    $('settingsSummary').textContent=summary+(cfg.generatedEpoch?' · Router snapshot: '+new Date(Number(cfg.generatedEpoch)*1000).toLocaleString():'');
+    $('settingsRows').innerHTML=Object.entries(settingsDefs).map(([key,[title,options]])=>{
+      const val=Number(cfg.settings?.[key]||0),list=options.length>2||['SCHEDULE_INTERVAL_MINUTES','SYSLOG_HEALTH_INTERVAL_MINUTES'].includes(key);
+      const input=list?`<select class="rg-input" id="s_${key}">${options.map(n=>`<option value="${n}"${n===val?' selected':''}>${n}</option>`).join('')}</select>`:
+        `<input class="rg-input" type="number" id="s_${key}" min="${options[0]}" max="${options[1]}" step="1" value="${val}">`;
+      return `<div class="rg-setting-row"><label for="s_${key}">${esc(title)}</label><div class="rg-control">${input}<button type="button" class="btn rg-save-setting" data-setting="${key}"${state.configBusy?' disabled':''}>Apply</button></div></div>`;
+    }).join('');
+  }
+  function resetBackup(){state.editingBackupId='';$('backupId').disabled=false;for(const id of ['backupId','backupIp','backupTls'])$(id).value='';$('backupPort').value='853';$('backupMode').textContent='Add new resolver';$('backupSave').textContent='Save resolver';}
+  function renderBackups(){
+    const cfg=state.config;if(!cfg)return;
+    const rs=Array.isArray(cfg.backups)?cfg.backups:[];
+    $('backupCount').textContent=rs.length+' configured';
+    $('backupPoolState').textContent='Active pool: '+(state.snapshot?.pool||'unknown');
+    const groups=new Map();for(const r of rs){const key=r.tls+':'+r.port;if(!groups.has(key))groups.set(key,[]);groups.get(key).push(r.id);}
+    $('backupGroups').innerHTML='<div class="card-title">Candidate alternate groups</div><p class="desc">Grouped by identical TLS hostname and port. These are configuration candidates, not proof of successful health checks.</p>'+
+      (groups.size?[...groups].map(([key,ids])=>`<div class="rg-backup-info" style="padding:8px 0"><strong>${esc(key)}</strong><small>${esc(ids.join(', '))}</small></div>`).join(''):'<p class="desc">No alternate resolver groups configured.</p>');
+    $('backupRows').innerHTML=rs.length?rs.map(r=>`<div class="rg-backup-row"><div class="rg-backup-info"><strong>${esc(r.id)} · ${esc(r.tls)}</strong><small>${esc(r.ip)}:${Number(r.port)} · Configured backup · Not automatically health-verified</small></div><div class="rg-actions" style="margin-top:0"><button type="button" class="btn rg-backup-edit" data-id="${esc(r.id)}">Edit</button><button type="button" class="btn rg-backup-delete" data-id="${esc(r.id)}">Remove</button></div></div>`).join(''):'<div class="empty">No ResolvGuard backup endpoints configured. Preferred WAN resolvers are managed in ASUS WAN settings.</div>';
+    controlsBusy(state.configBusy);
+  }
+  async function loadConfig(fresh=true){
+    if(state.configLoading || (fresh && state.configBusy))return false;
+    state.configLoading=true;state.configFresh=false;controlsBusy(true);
+    const previous=Number(state.config?.revision||0);
+    let requested=false;
+    try{
+      if(fresh){
+        if(window.parent===window || typeof window.parent.rgRequestConfigRefresh!=='function' || !window.parent.rgRequestConfigRefresh())
+          throw Error('Authenticated firmware refresh could not be submitted.');
+        requested=true;
+      }
+      const deadline=Date.now()+(requested?16000:6000);
+      let current=null;
+      do {
+        try {
+          const d=await load('/ext/ResolvGuard/config.htm');
+          if(d.kind!=='configuration'||!Number.isSafeInteger(d.revision)||d.revision<1)throw Error('Invalid configuration revision');
+          if(!requested || d.revision>previous){current=d;break;}
+        } catch(e) { /* Merlin may not have mounted the volatile feed yet. */ }
+        await new Promise(resolve=>setTimeout(resolve,750));
+      } while(Date.now()<deadline);
+      if(!current)throw Error('The router did not confirm a fresh configuration snapshot. No writes are permitted.');
+      state.config=current;state.configFresh=true;
+      renderSettings();renderBackups();
+      if(fresh)$('configFeedback').hidden=true;
+      return true;
+    }catch(e){
+      state.configFresh=false;
+      configNotice(e.message||'Configuration is unavailable; changes disabled.',true);
+      if(!state.config)$('settingsSummary').textContent='Configuration unavailable';
+      return false;
+    }finally {state.configLoading=false;controlsBusy(state.configBusy);}
+  }
+  function configPayload(parts){
+    // All fields are ASCII data, not shell instructions. Values are revalidated
+    // by the router using the same helpers as the SSH interface.
+    if(parts.some(p=>!(/^[A-Za-z0-9_.:/_-]+$/.test(String(p)))))throw Error('Only plain ASCII DNS values are accepted');
+    return String(Date.now())+String(Math.floor(Math.random()*1000)).padStart(3,'0')+'|'+parts.join('|');
+  }
+  async function applyConfig(parts){
+    if(state.configBusy||!state.config||!state.configFresh)return;
+    let payload;try{payload=configPayload(parts);}catch(e){configNotice(e.message,true);return;}
+    const requestId=payload.split('|')[0];
+    controlsBusy(true);configNotice('Submitting configuration request to Merlin…');
+    try {
+      if(window.parent===window || typeof window.parent.rgRequestConfiguration!=='function' || !window.parent.rgRequestConfiguration(payload))
+        throw Error('Open this page through WAN → ResolvGuard to use authenticated settings.');
+      const began=Date.now();let received=null;
+      while(Date.now()-began<25000){
+        await new Promise(resolve=>setTimeout(resolve,1000));
+        try{const d=await load('/ext/ResolvGuard/config-action.htm');if(d.requestId===requestId){received=d;break;}}catch(e){}
+      }
+      if(!received)throw Error('No matching response from the router. Check /tmp/resolvguard-webui-config.log; do not assume the setting was saved.');
+      if(received.status!=='success')throw Error(received.message||'The router rejected the configuration request.');
+      configNotice(received.message||'Configuration saved');
+      if(!await loadConfig(false))
+        configNotice('Router confirmed the save, but the new configuration snapshot is unavailable. Further edits are disabled until refreshed.',true);
+      resetBackup();
+    }catch(e){configNotice(e.message,true);}finally{controlsBusy(false);}
+  }
+  $('backupReset').addEventListener('click',resetBackup);
+  $('backupSave').addEventListener('click',()=>{
+    const id=$('backupId').value.trim(),ip=$('backupIp').value.trim(),tls=$('backupTls').value.trim(),port=$('backupPort').value.trim();
+    if(!/^[A-Za-z0-9_-]{1,32}$/.test(id)||/^wan[0-9]+$/.test(id)||!ip||!tls||!/^\d{1,5}$/.test(port)||Number(port)<1||Number(port)>65535){configNotice('Enter a valid backup ID, IP, TLS name and port.',true);return;}
+    applyConfig([state.editingBackupId?'backup-edit':'backup-add',id,ip,tls,port]);
+  });
+  document.addEventListener('click',e=>{
+    const setting=e.target.closest('.rg-save-setting');if(setting){const key=setting.dataset.setting;const val=$('s_'+key).value;
+      if(!/^\d+$/.test(val)){configNotice('Enter a valid numeric value.',true);return;}
+      const options=settingsDefs[key]?.[1];if(!options)return;
+      const v=Number(val);if(options.length===2?(v<options[0]||v>options[1]):!options.includes(v)){configNotice('Value outside allowed range.',true);return;}
+      applyConfig(['setting',key,val]);return;}
+    const preset=e.target.closest('[data-preset]');if(preset){if(confirm('Add both endpoints of this backup resolver preset?'))applyConfig(['preset',preset.dataset.preset]);return;}
+    const edit=e.target.closest('.rg-backup-edit');if(edit){const r=state.config?.backups?.find(x=>x.id===edit.dataset.id);if(!r)return;
+      state.editingBackupId=r.id;$('backupId').value=r.id;$('backupId').disabled=true;$('backupIp').value=r.ip;$('backupTls').value=r.tls;$('backupPort').value=r.port;
+      $('backupMode').textContent='Editing '+r.id;$('backupSave').textContent='Update resolver';return;}
+    const remove=e.target.closest('.rg-backup-delete');if(remove&&confirm('Remove backup resolver '+remove.dataset.id+'? This may require a new policy approval.'))applyConfig(['backup-delete',remove.dataset.id]);
+  });
+  loadConfig();
   $('runHealthCheck').addEventListener('click',runManualHealthCheck);
   $('manualClose').addEventListener('click',()=>{$('manualPanel').hidden=true;});
   $('period').addEventListener('change',e=>{state.period=e.target.value;renderHistory();});
