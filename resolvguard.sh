@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.2
-readonly SCRIPT_VERSTAG="26111701"
+readonly SCRIPT_VERSTAG="26111702"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -4840,9 +4840,6 @@ _RGWebConfig_() (
       'case "$1:$2" in' \
       '  start:ResolvGuardCfg)' \
       '    /bin/sh /jffs/addons/ResolvGuard.d/resolvguard.sh webui config-run >/tmp/resolvguard-webui-config.log 2>&1 &' \
-      '    ;;' \
-      '  start:ResolvGuardCfgRefresh)' \
-      '    /bin/sh /jffs/addons/ResolvGuard.d/resolvguard.sh webui config-snapshot >/tmp/resolvguard-webui-config-refresh.log 2>&1 &' \
       '    ;;' \
       'esac' "$rg_end"
   }

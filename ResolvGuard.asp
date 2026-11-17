@@ -1,5 +1,8 @@
 <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<!-- ResolvGuard WebUI Integration v3.0: self-contained dashboard in one ASP -->
 <!-- ResolvGuard WebUI Integration v1 -->
+<!-- ResolvGuard WebUI Config Transport v2 -->
+<!-- ResolvGuard WebUI v3.7.3: MerlinAU-aligned read-only loading and explicit firmware actions -->
 <html xmlns="http://www.w3.org/1999/xhtml">
 <head>
 <meta http-equiv="X-UA-Compatible" content="IE=Edge" />
@@ -31,7 +34,8 @@ function rgRequestManualCheck() {
   if (!form || !form.elements.namedItem("action_script")) return false;
   var page=window.location.pathname.split("/").pop();
   form.elements.namedItem("current_page").value=page;
-  form.elements.namedItem("next_page").value=page;
+  // MerlinAU sends service actions to a hidden iframe without requesting navigation.
+  form.elements.namedItem("next_page").value="";
   form.submit();
   return true;
 }
@@ -53,22 +57,12 @@ function rgRequestConfiguration(data) {
   merged.ResolvGuard_config_request=token;
   var page=window.location.pathname.split('/').pop();
   form.elements.namedItem('current_page').value=page;
-  form.elements.namedItem('next_page').value=page;
+  form.elements.namedItem('next_page').value='';
   form.elements.namedItem('action_script').value='start_ResolvGuardCfg';
   form.elements.namedItem('amng_custom').value=JSON.stringify(merged);
   form.submit();
   // Keep subsequent saves from this open page in sync with the submitted key.
   rgSharedCustomSettings.ResolvGuard_config_request=token;
-  return true;
-}
-function rgRequestConfigRefresh() {
-  var form=document.getElementById('rg_refresh_form');
-  if(!form || !form.elements.namedItem('action_script')) return false;
-  var page=window.location.pathname.split('/').pop();
-  form.elements.namedItem('current_page').value=page;
-  form.elements.namedItem('next_page').value=page;
-  form.elements.namedItem('action_script').value='start_ResolvGuardCfgRefresh';
-  form.submit();
   return true;
 }
 function initial() {
@@ -137,14 +131,6 @@ function rgDashboardLoaded() {
 <iframe name="rg_command_frame" id="rg_command_frame" title="ResolvGuard command response" style="display:none;width:0;height:0;border:0" aria-hidden="true"></iframe>
 <form id="rg_manual_form" name="form" method="post" action="start_apply.htm" target="rg_command_frame" style="display:none">
   <input type="hidden" name="action_script" value="start_ResolvGuardManualCheck" />
-  <input type="hidden" name="action_mode" value="apply" />
-  <input type="hidden" name="action_wait" value="0" />
-  <input type="hidden" name="current_page" value="" />
-  <input type="hidden" name="next_page" value="" />
-  <input type="hidden" name="modified" value="0" />
-</form>
-<form id="rg_refresh_form" method="post" action="start_apply.htm" target="rg_command_frame" style="display:none">
-  <input type="hidden" name="action_script" value="start_ResolvGuardCfgRefresh" />
   <input type="hidden" name="action_mode" value="apply" />
   <input type="hidden" name="action_wait" value="0" />
   <input type="hidden" name="current_page" value="" />
@@ -738,31 +724,31 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     $('backupRows').innerHTML=rs.length?rs.map(r=>`<div class="rg-backup-row"><div class="rg-backup-info"><strong>${esc(r.id)} · ${esc(r.tls)}</strong><small>${esc(r.ip)}:${Number(r.port)} · Configured backup · Not automatically health-verified</small></div><div class="rg-actions" style="margin-top:0"><button type="button" class="btn rg-backup-edit" data-id="${esc(r.id)}">Edit</button><button type="button" class="btn rg-backup-delete" data-id="${esc(r.id)}">Remove</button></div></div>`).join(''):'<div class="empty">No ResolvGuard backup endpoints configured. Preferred WAN resolvers are managed in ASUS WAN settings.</div>';
     controlsBusy(state.configBusy);
   }
-  async function loadConfig(fresh=true){
-    if(state.configLoading || (fresh && state.configBusy))return false;
+  // Reading a page or opening a tab must never issue an ASUS firmware apply.
+  // The router publishes this RAM-only snapshot after installs, scheduled
+  // checks and successful SSH/WebUI configuration commits. Fetch it without
+  // caching, preserving existing revision checks after a confirmed write.
+  async function loadConfig(afterRevision=0){
+    if(state.configLoading)return false;
     state.configLoading=true;state.configFresh=false;controlsBusy(true);
-    const previous=Number(state.config?.revision||0);
-    let requested=false;
     try{
-      if(fresh){
-        if(window.parent===window || typeof window.parent.rgRequestConfigRefresh!=='function' || !window.parent.rgRequestConfigRefresh())
-          throw Error('Authenticated firmware refresh could not be submitted.');
-        requested=true;
-      }
-      const deadline=Date.now()+(requested?16000:6000);
+      const deadline=Date.now()+6000;
       let current=null;
       do {
         try {
           const d=await load('/ext/ResolvGuard/config.htm');
-          if(d.kind!=='configuration'||!Number.isSafeInteger(d.revision)||d.revision<1)throw Error('Invalid configuration revision');
-          if(!requested || d.revision>previous){current=d;break;}
-        } catch(e) { /* Merlin may not have mounted the volatile feed yet. */ }
+          if(d.kind!=='configuration'||!Number.isSafeInteger(d.revision)||d.revision<1)
+            throw Error('Invalid configuration revision');
+          if(d.revision>afterRevision){current=d;break;}
+        } catch(e) { /* Snapshot may not have been published yet. */ }
         await new Promise(resolve=>setTimeout(resolve,750));
       } while(Date.now()<deadline);
-      if(!current)throw Error('The router did not confirm a fresh configuration snapshot. No writes are permitted.');
+      if(!current)throw Error(afterRevision>0?
+        'The router confirmed the save but did not publish a newer configuration snapshot. Editing is disabled.':
+        'No router configuration snapshot is available. Editing is disabled.');
       state.config=current;state.configFresh=true;
       renderSettings();renderBackups();
-      if(fresh)$('configFeedback').hidden=true;
+      if(afterRevision===0)$('configFeedback').hidden=true;
       return true;
     }catch(e){
       state.configFresh=false;
@@ -781,6 +767,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     if(state.configBusy||!state.config||!state.configFresh)return;
     let payload;try{payload=configPayload(parts);}catch(e){configNotice(e.message,true);return;}
     const requestId=payload.split('|')[0];
+    const previousRevision=Number(state.config.revision||0);
     controlsBusy(true);configNotice('Submitting configuration request to Merlin…');
     try {
       if(window.parent===window || typeof window.parent.rgRequestConfiguration!=='function' || !window.parent.rgRequestConfiguration(payload))
@@ -793,7 +780,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
       if(!received)throw Error('No matching response from the router. Check /tmp/resolvguard-webui-config.log; do not assume the setting was saved.');
       if(received.status!=='success')throw Error(received.message||'The router rejected the configuration request.');
       configNotice(received.message||'Configuration saved');
-      if(!await loadConfig(false))
+      if(!await loadConfig(previousRevision))
         configNotice('Router confirmed the save, but the new configuration snapshot is unavailable. Further edits are disabled until refreshed.',true);
       resetBackup();
     }catch(e){configNotice(e.message,true);}finally{controlsBusy(false);}
