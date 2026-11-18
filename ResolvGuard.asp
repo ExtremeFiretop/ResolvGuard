@@ -278,19 +278,30 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
   pointer-events:none;
   filter:drop-shadow(0 0 2px var(--rg-signal-glow));
 }
-/* Pulse halos also inherit severity instead of flashing green on degraded. */
-/* A second soft ring pulse fires when the visual return reaches the heart.
-   Both are tied to the same completed cycle; no extra checks are requested. */
+/* Both pulses use the active status colour. The return echo gives the
+   heart a slightly stronger, compact pulse without triggering another check. */
 .heartbeat .heart-ring.pulse {
-  animation:rg-ring-pulse 1.5s ease-out, rg-ring-pulse .95s ease-out 2.95s;
+  animation:rg-ring-pulse 1.5s ease-out, rg-ring-return .95s ease-out 2.95s;
 }
 .heartbeat .heart-ring.pulse svg {
-  animation:icon-pulse 1.5s ease-out, icon-pulse .95s ease-out 2.95s;
+  animation:icon-pulse 1.5s ease-out, rg-icon-return .95s ease-out 2.95s;
 }
 @keyframes rg-ring-pulse {
-  0% { box-shadow:0 0 0 3px var(--rg-ring),0 0 0 7px var(--rg-ring-soft); }
-  60% { box-shadow:0 0 0 8px var(--rg-ring-soft),0 0 0 13px transparent; }
-  100% { box-shadow:0 0 0 4px var(--rg-ring-soft),0 0 0 9px var(--rg-ring-soft); }
+  0% { box-shadow:0 0 0 3px var(--rg-ring),0 0 0 7px var(--rg-ring-soft),0 0 4px 0 var(--rg-signal-glow); }
+  45% { box-shadow:0 0 0 8px var(--rg-ring),0 0 0 17px var(--rg-ring-soft),0 0 11px 2px var(--rg-signal-glow); }
+  72% { box-shadow:0 0 0 12px var(--rg-ring-soft),0 0 0 19px transparent,0 0 7px 0 var(--rg-signal-glow); }
+  100% { box-shadow:0 0 0 4px var(--rg-ring-soft),0 0 0 9px var(--rg-ring-soft),0 0 0 0 transparent; }
+}
+@keyframes rg-ring-return {
+  0% { box-shadow:0 0 0 3px var(--rg-ring),0 0 0 7px var(--rg-ring-soft),0 0 4px 0 var(--rg-signal-glow); }
+  42% { box-shadow:0 0 0 10px var(--rg-ring),0 0 0 20px var(--rg-ring-soft),0 0 13px 3px var(--rg-signal-glow); }
+  72% { box-shadow:0 0 0 13px var(--rg-ring-soft),0 0 0 20px transparent,0 0 8px 0 var(--rg-signal-glow); }
+  100% { box-shadow:0 0 0 4px var(--rg-ring-soft),0 0 0 9px var(--rg-ring-soft),0 0 0 0 transparent; }
+}
+@keyframes rg-icon-return {
+  0%,100% { transform:scale(1); }
+  22% { transform:scale(1.21); }
+  48% { transform:scale(.96); }
 }
 /* Ambient activity remains decorative. Only a real completed monitoring cycle
    triggers the outgoing/returning QRS deformation in the SAME SVG trace. */
