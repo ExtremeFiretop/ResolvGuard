@@ -190,19 +190,106 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
 }
 @media(max-width:860px){body.rg-embedded .stats{grid-template-columns:repeat(2,minmax(0,1fr))}}
 
-/* One continuous SVG trace. The browser redraws the SAME path for ambient
-   motion and completed-check QRS deformation: there is no second peak layer. */
+/* The monitoring state drives ONE signal palette. A degraded result is
+   amber from the heart through the return echo; red is reserved for a
+   critical/hold signal. This avoids competing amber/red ECG layers. */
+.heartbeat {
+  --rg-signal: var(--green);
+  --rg-signal-glow: #63e8b678;
+  --rg-ring: #63e8b637;
+  --rg-ring-soft: #63e8b612;
+}
+.heartbeat.signal-degraded {
+  --rg-signal: var(--amber);
+  --rg-signal-glow: #ffbd6980;
+  --rg-ring: #ffbd6948;
+  --rg-ring-soft: #ffbd691b;
+}
+.heartbeat.signal-hold {
+  --rg-signal: var(--red);
+  --rg-signal-glow: #ff817e80;
+  --rg-ring: #ff817e48;
+  --rg-ring-soft: #ff817e1b;
+}
+.heartbeat .heart-ring {
+  border-color: var(--rg-ring);
+  box-shadow: 0 0 0 4px var(--rg-ring-soft), 0 0 0 9px var(--rg-ring-soft);
+  transition: border-color .25s ease, box-shadow .25s ease;
+}
+.heartbeat .heart-ring svg { color:var(--rg-signal); }
+.heartbeat .heart-ring::after { border-color:var(--rg-ring); }
+.heartbeat .heart-ring::before {
+  content:"";
+  position:absolute;
+  inset:6px;
+  border:2px solid transparent;
+  border-top-color:var(--rg-signal);
+  border-right-color:var(--rg-ring);
+  border-radius:50%;
+  opacity:.74;
+  pointer-events:none;
+  filter:drop-shadow(0 0 2px var(--rg-signal-glow));
+}
+/* Pulse halos also inherit severity instead of flashing green on degraded. */
+/* A second soft ring pulse fires when the visual return reaches the heart.
+   Both are tied to the same completed cycle; no extra checks are requested. */
+.heartbeat .heart-ring.pulse {
+  animation:rg-ring-pulse 1.5s ease-out, rg-ring-pulse .95s ease-out 2.95s;
+}
+.heartbeat .heart-ring.pulse svg {
+  animation:icon-pulse 1.5s ease-out, icon-pulse .95s ease-out 2.95s;
+}
+@keyframes rg-ring-pulse {
+  0% { box-shadow:0 0 0 3px var(--rg-ring),0 0 0 7px var(--rg-ring-soft); }
+  60% { box-shadow:0 0 0 8px var(--rg-ring-soft),0 0 0 13px transparent; }
+  100% { box-shadow:0 0 0 4px var(--rg-ring-soft),0 0 0 9px var(--rg-ring-soft); }
+}
+/* Ambient activity remains decorative. Only a real completed monitoring cycle
+   triggers the outgoing/returning QRS deformation in the SAME SVG trace. */
+.heartbeat.motion-active .heart-ring::after { animation:rg-heart-dots 17s linear infinite; }
+.heartbeat.motion-active .heart-ring::before { animation:rg-heart-arc 22s linear infinite reverse; }
+.heartbeat.motion-active .ecg .ecg-trace { animation:rg-ecg-breathe 5.5s ease-in-out infinite; }
+@keyframes rg-ecg-breathe { 0%,100% {opacity:.84} 50% {opacity:1} }
+@keyframes rg-heart-dots { to { transform:rotate(360deg); } }
+@keyframes rg-heart-arc { to { transform:rotate(360deg); } }
 .ecg { overflow:hidden; flex-shrink:0; }
-.ecg .ecg-trace {
-  stroke-width:2.05;
+.heartbeat .ecg .ecg-trace {
+  stroke:var(--rg-signal);
+  stroke-width:2.25;
   stroke-linecap:round;
   stroke-linejoin:round;
-  opacity:.94;
+  opacity:.95;
   transition:opacity .3s ease, stroke .25s ease;
+  filter:drop-shadow(0 0 3px var(--rg-signal-glow));
 }
-.heartbeat.signal-degraded .ecg .ecg-trace { stroke:var(--amber); }
-.heartbeat.signal-hold .ecg .ecg-trace { stroke:var(--red); }
 .heartbeat.no-signal .ecg .ecg-trace { opacity:.28; }
+/* Return echo is brighter/thicker, but ALWAYS the same hue as the baseline. */
+.heartbeat .ecg .ecg-return {
+  fill:none;
+  stroke:var(--rg-signal);
+  stroke-width:3.2;
+  stroke-linecap:round;
+  stroke-linejoin:round;
+  pointer-events:none;
+  filter:drop-shadow(0 0 5px var(--rg-signal-glow));
+}
+.heartbeat .ecg .ecg-turn {
+  fill:var(--rg-signal);
+  /* SVG's opacity attribute is driven by the JS turnaround flash. A CSS
+     opacity:0 here would override the attribute and hide the flash. */
+  pointer-events:none;
+  filter:drop-shadow(0 0 4px var(--rg-signal-glow));
+}
+@media(prefers-reduced-motion:reduce) {
+  .heartbeat .heart-ring::before,
+  .heartbeat .heart-ring::after,
+  .heartbeat .heart-ring.pulse,
+  .heartbeat .heart-ring.pulse svg { animation:none!important; }
+  .ecg .ecg-trace, .ecg .ecg-return, .ecg .ecg-turn { filter:none; }
+  .heartbeat .ecg .ecg-trace,
+  .heartbeat.running .heart-ring svg { animation:none!important; }
+}
+
 .history-row .history-live-count {font-size:10px;color:#98dabc;font-weight:650;white-space:nowrap}
 .history-row .history-live-count.pending {color:var(--amber)}
 @keyframes history-check-arrived {0%{box-shadow:0 0 0 0 #91efbb88}45%{box-shadow:0 0 0 3px #91efbb88}100%{box-shadow:0 0 0 0 #91efbb00}}
@@ -243,12 +330,12 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
 
   <section id="overview" class="tab active">
     <div class="hero" id="hero"><div><div class="hero-kicker"><span class="dot" id="heroDot"></span><span id="heroKicker">Monitoring status unknown</span></div><h2 id="heroHeading">Connecting to ResolvGuard…</h2><p id="heroText">Waiting for a completed scheduled DNS health check.</p><div class="hero-meta"><span id="poolPill">Active pool: unknown</span><span id="modePill">Mode unknown</span></div></div>
-      <div class="heartbeat no-signal" id="heartbeat"><div class="heart-ring" id="heartRing"><svg viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M32 54C19 45 9 36 9 23a12 12 0 0 1 22-6 12 12 0 0 1 22 6c0 13-10 22-21 31Z"/><path d="M16 30h10l5-11 7 22 5-11h5"/></svg></div><div class="heart-copy"><div class="heart-detail" id="heartLabel">Awaiting checks</div><small id="heartSub">Waiting for scheduled check</small></div><svg class="ecg" id="ecgWave" viewBox="0 0 185 35" aria-hidden="true" focusable="false"><path id="ecgTrace" class="ecg-trace" d="M0 17.5 H185" /></svg></div>
+      <div class="heartbeat no-signal" id="heartbeat"><div class="heart-ring" id="heartRing"><svg viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M32 54C19 45 9 36 9 23a12 12 0 0 1 22-6 12 12 0 0 1 22 6c0 13-10 22-21 31Z"/><path d="M16 30h10l5-11 7 22 5-11h5"/></svg></div><div class="heart-copy"><div class="heart-detail" id="heartLabel">Awaiting checks</div><small id="heartSub">Waiting for scheduled check</small></div><svg class="ecg" id="ecgWave" viewBox="0 0 185 35" aria-hidden="true" focusable="false"><path id="ecgTrace" class="ecg-trace" d="M0 17.5 H185" /><path id="ecgReturn" class="ecg-return" d="" /><circle id="ecgTurn" class="ecg-turn" cx="183" cy="17.5" r="2.4" opacity="0" /></svg></div>
     </div>
     <div class="section-head"><h3>Network health at a glance</h3><div class="hint">Scheduled monitoring · Manual checks are independent</div></div>
     <div class="stats">
       <div class="stat"><div class="stat-label">Preferred resolvers</div><div class="stat-val green" id="statResolvers">—</div><div class="stat-sub" id="statResolversSub">Reachable and policy-compliant</div></div>
-      <div class="stat"><div class="stat-label">DNS policy checks</div><div class="stat-val" id="statPolicies">—</div><div class="stat-sub">Configured DNS policy checks</div></div>
+      <div class="stat"><div class="stat-label">DNS probe results</div><div class="stat-val" id="statPolicies">—</div><div class="stat-sub">Passed / total · latest cycle</div></div>
       <div class="stat"><div class="stat-label">Active production pool</div><div class="stat-val" id="statPool" style="font-size:23px">unknown</div><div class="stat-sub" id="statPoolSub">WAN DNS configuration</div></div>
       <div class="stat"><div class="stat-label">Next scheduled cycle</div><div class="stat-val" id="statCountdown">—</div><div class="stat-sub" id="statSeq">No completed check yet</div></div>
     </div>
@@ -363,36 +450,40 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     if(h==='degraded')return {title:'Preferred DNS health is degraded.',detail:`${n} of ${p.length} preferred resolvers passed. Refer to the detailed checks and event history.`,status:'degraded'};
     return {title:'DNS health is not fully verified.',detail:'Some enrolled resolvers were not observed in the last completed cycle.',status:'unknown'};
   }
-  // One animated SVG path; both quiet oscillation and the real-cycle spike
-  // are samples of a single function. The spike replaces local idle motion
-  // rather than appearing in a second overlaid layer.
+  // One sampled ECG waveform, with a short colour overlay ON the same path
+  // during its returning echo (not a second QRS spike). A completed scheduled
+  // cycle starts the entire out-and-back *replay*: this does not claim that a
+  // live DNS request is currently in flight or imply extra checks.
   const waveform=(() => {
-    const path=$('ecgTrace'), svg=$('ecgWave');
+    const path=$('ecgTrace'), echo=$('ecgReturn'), turn=$('ecgTurn'), svg=$('ecgWave');
     const reduced=window.matchMedia('(prefers-reduced-motion: reduce)');
     let width=185; // SVG user units follow its measured CSS width.
-    const midpoint=17.5, duration=1650;
+    const midpoint=17.5, outboundMs=1450, returnMs=1550;
+    const duration=outboundMs+returnMs;
     let running=false, displayed=true, frame=0, beatAt=-Infinity, frozenAt=0;
     const gaussian=(x,sigma)=>Math.exp(-0.5*(x/sigma)*(x/sigma));
     function trace(t){
       const sec=t/1000;
       const elapsed=t-beatAt;
       const beating=Number.isFinite(elapsed)&&elapsed>=0&&elapsed<duration;
-      // Run from left to right; the P/Q/R/S/T components travel together.
-      const center=beating?-49+(width+98)*(elapsed/duration):0;
-      const points=[];
-      // Cap the point count on wide screens; the last sample always reaches
-      // the actual right-hand edge of the responsive SVG viewBox.
+      const returning=beating&&elapsed>=outboundMs;
+      // Travel slightly beyond both ends to let the single waveform enter
+      // and leave naturally; reverse direction at the far edge.
+      const span=width+56;
+      const center=beating
+        ? returning ? width+28-span*((elapsed-outboundMs)/returnMs)
+                    : -28+span*(elapsed/outboundMs)
+        : 0;
+      const points=[],echoPoints=[];
       const samples=Math.max(80,Math.min(360,Math.ceil(width/1.5)));
       for(let i=0;i<=samples;i++){
         const x=width*i/samples;
         const idle=1.45*Math.sin(x*.115-sec*1.25)
           +0.56*Math.sin(x*.26+sec*.67);
-        let beat=0, suppression=0;
+        let beat=0,suppression=0;
         if(beating){
-          const dx=x-center;
-          // Smooth localized deformation, with a pronounced R peak and S dip.
-          // Suppress the idle wiggle *inside* the QRS region so only one
-          // connected stroke passes through the beat.
+          // Mirror the QRS sequence when the response travels back.
+          const dx=returning?center-x:x-center;
           suppression=.98*gaussian(dx,24);
           beat=-1.8*gaussian(dx+24,6.3)
             +3.2*gaussian(dx+8.0,3.5)
@@ -401,12 +492,20 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
             -2.6*gaussian(dx-23,7.8);
         }
         const y=Math.max(1.5,Math.min(33.5,midpoint+idle*(1-suppression)+beat));
-        points.push((i===0?'M':'L')+x.toFixed(2)+' '+y.toFixed(2));
+        const point=x.toFixed(2)+' '+y.toFixed(2);
+        points.push((i===0?'M':'L')+point);
+        // The echo trace follows the exact same geometry. Only a narrow
+        // section is coloured aqua/red; the rest of the ECG stays legible.
+        if(returning&&Math.abs(x-center)<=27)
+          echoPoints.push((echoPoints.length?'L':'M')+point);
       }
       path.setAttribute('d',points.join(' '));
+      echo.setAttribute('d',returning?echoPoints.join(' '):'');
+      const bounce=returning?Math.max(0,1-(elapsed-outboundMs)/260):0;
+      turn.setAttribute('opacity',bounce.toFixed(2));
     }
     function shouldAnimate(){
-      return running && displayed && !reduced.matches && !document.hidden;
+      return running&&displayed&&!reduced.matches&&!document.hidden;
     }
     function tick(now){
       frame=0;
@@ -417,20 +516,19 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     function update(){
       if(frame){cancelAnimationFrame(frame);frame=0;}
       if(!shouldAnimate()){
-        // A stale, hidden or reduced-motion dashboard never invents a beat.
+        // Stale, hidden and reduced-motion views never invent a pulse.
         beatAt=-Infinity;
         trace(reduced.matches?0:frozenAt);
       }else{
         frame=requestAnimationFrame(tick);
       }
     }
-    // Follow actual layout width, including native Merlin's responsive iframe.
-    // This redraws the SAME path; it does not stretch or layer an SVG overlay.
     function resize(){
       const measured=Math.round(svg.getBoundingClientRect().width);
-      if(!measured || measured===width)return;
+      if(!measured||measured===width)return;
       width=measured;
       svg.setAttribute('viewBox',`0 0 ${width} 35`);
+      turn.setAttribute('cx',String(Math.max(0,width-2)));
       trace(frozenAt);
     }
     document.addEventListener('visibilitychange',update);
@@ -445,9 +543,10 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     return {
       setActive(value){const next=!!value;if(next!==running){running=next;update();}},
       setVisible(value){const next=!!value;if(next!==displayed){displayed=next;update();}},
+      active(){return shouldAnimate();},
       beat(){if(shouldAnimate()){
         beatAt=performance.now();
-        // One-shot beat is drawn in the next animation frame; no overlay.
+        // Both legs depict the LAST completed cycle, never an extra probe.
         if(!frame)frame=requestAnimationFrame(tick);
       }}
     };
@@ -460,8 +559,10 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     node.classList.toggle('signal-degraded',summary==='degraded');
     node.classList.toggle('signal-hold',summary==='hold');
     waveform.setActive(live);
+    node.classList.toggle('motion-active',waveform.active());
     if(!live)$('heartRing').classList.remove('pulse');
   }
+  document.addEventListener('visibilitychange',()=>syncWaveSignal(state.snapshot,state.feedConnected));
   function pulseCompletedCheck(){
     // A newly completed observed cycle is the only trigger (never UI motion).
     if(!state.feedConnected||isStale(state.snapshot)||!hasRealChecks(state.snapshot))return;
@@ -554,7 +655,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     }
   }
   function closeInspector(){$('inspectBackdrop').classList.remove('open');$('inspector').classList.remove('open');$('inspector').setAttribute('aria-hidden','true');}
-  function tab(name){state.tab=name;waveform.setVisible(name==='overview');document.querySelectorAll('[data-tab]').forEach(el=>{const active=el.dataset.tab===name;el.classList.toggle('active',active);});document.querySelectorAll('.tab').forEach(el=>el.classList.toggle('active',el.id===name));const m={overview:['Dashboard overview','Your DNS reliability, clearly visible.'],history:['Health history','Observed DNS reliability from volatile history.'],paths:['DNS paths & exceptions','Inspect DNSMasq domain-scoped Stubby bypasses.'],backups:['Backup & alternate resolvers','Manage ResolvGuard backup DoT endpoints, not ASUS WAN primary DNS.'],settings:['ResolvGuard settings','Configure monitoring thresholds and timing using Merlin authentication.']}[name];$('pageTitle').textContent=m[0];$('pageDesc').textContent=m[1];if(name==='history')renderHistory();if(name==='paths')renderPaths();if(name==='settings'||name==='backups')loadConfig();}
+  function tab(name){state.tab=name;waveform.setVisible(name==='overview');syncWaveSignal(state.snapshot,state.feedConnected);document.querySelectorAll('[data-tab]').forEach(el=>{const active=el.dataset.tab===name;el.classList.toggle('active',active);});document.querySelectorAll('.tab').forEach(el=>el.classList.toggle('active',el.id===name));const m={overview:['Dashboard overview','Your DNS reliability, clearly visible.'],history:['Health history','Observed DNS reliability from volatile history.'],paths:['DNS paths & exceptions','Inspect DNSMasq domain-scoped Stubby bypasses.'],backups:['Backup & alternate resolvers','Manage ResolvGuard backup DoT endpoints, not ASUS WAN primary DNS.'],settings:['ResolvGuard settings','Configure monitoring thresholds and timing using Merlin authentication.']}[name];$('pageTitle').textContent=m[0];$('pageDesc').textContent=m[1];if(name==='history')renderHistory();if(name==='paths')renderPaths();if(name==='settings'||name==='backups')loadConfig();}
   async function load(url){const response=await fetch(url+'?t='+Date.now(),{cache:'no-store',credentials:'same-origin'});if(!response.ok)throw Error('HTTP '+response.status);const d=JSON.parse(await response.text());if(d.schema!==1)throw Error('Unsupported feed schema');return d;}
   async function refresh(){if(state.polling)return;state.polling=true;try{
       const d=await load('/ext/ResolvGuard/status.htm');
