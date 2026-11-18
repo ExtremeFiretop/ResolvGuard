@@ -5,3 +5,5 @@ snapshot_date,snapshot_time_utc,tag,published_at,kind,asset_name,asset_id,downlo
 2026-11-16,2026-11-16T03:59:53Z,v0.2.0,2026-11-15T17:50:29Z,update,ResolvGuard-update.sh,751822286,6
 2026-11-17,2026-11-17T05:52:03Z,v0.2.1,2026-11-16T07:09:28Z,install,ResolvGuard-install.sh,753850381,11
 2026-11-17,2026-11-17T05:52:03Z,v0.2.1,2026-11-16T07:09:28Z,update,ResolvGuard-update.sh,753850383,3
+2026-11-18,2026-11-18T05:19:26Z,v0.2.1,2026-11-16T07:09:28Z,install,ResolvGuard-install.sh,753850381,11
+2026-11-18,2026-11-18T05:19:26Z,v0.2.1,2026-11-16T07:09:28Z,update,ResolvGuard-update.sh,753850383,3
