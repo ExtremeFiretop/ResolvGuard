@@ -248,7 +248,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     <div class="section-head"><h3>Network health at a glance</h3><div class="hint">Scheduled monitoring · Manual checks are independent</div></div>
     <div class="stats">
       <div class="stat"><div class="stat-label">Preferred resolvers</div><div class="stat-val green" id="statResolvers">—</div><div class="stat-sub" id="statResolversSub">Reachable and policy-compliant</div></div>
-      <div class="stat"><div class="stat-label">DNS policy checks</div><div class="stat-val" id="statPolicies">—</div><div class="stat-sub">A / A / AAAA per resolver</div></div>
+      <div class="stat"><div class="stat-label">DNS policy checks</div><div class="stat-val" id="statPolicies">—</div><div class="stat-sub">Configured DNS policy checks</div></div>
       <div class="stat"><div class="stat-label">Active production pool</div><div class="stat-val" id="statPool" style="font-size:23px">unknown</div><div class="stat-sub" id="statPoolSub">WAN DNS configuration</div></div>
       <div class="stat"><div class="stat-label">Next scheduled cycle</div><div class="stat-val" id="statCountdown">—</div><div class="stat-sub" id="statSeq">No completed check yet</div></div>
     </div>
