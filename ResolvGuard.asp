@@ -329,11 +329,11 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
   const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const fmtTime = v => {const d=Date.parse(v||'');return Number.isFinite(d)?new Date(d).toLocaleString():'No completed check';};
   // UTC is retained for arithmetic; local wall-clock times come from the router.
-  // Never infer the router's time zone from the viewing browser's location.
+  // Display the router's clock without its offset; never use the viewer's time zone.
   function routerTimeLabel(stamp,short=false){
     const t=String(stamp||'');
     if(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4}$/.test(t))
-      return (short?t.slice(11,19):t.slice(0,10)+' '+t.slice(11,19))+' UTC'+t.slice(19);
+      return short?t.slice(11,19):t.slice(0,10)+' '+t.slice(11,19);
     return '';
   }
   function eventTimeLabel(event,short=false){
