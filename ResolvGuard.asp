@@ -159,6 +159,54 @@ function rgDashboardLoaded() {
 @media(max-width:760px){.app{display:block}.sidebar{width:auto;height:auto;position:relative;padding:15px 18px;border-right:0;border-bottom:1px solid #253f46}.logo{padding:0;margin:0}.sidebar .side-section,.sidebar .nav,.sidebar .side-bottom{display:none}.main{width:100%;padding:20px 15px 45px}.top{display:block;margin-bottom:16px}.page-title{font-size:26px}.top-tools{justify-content:flex-start;margin-top:15px}.hero{padding:22px;grid-template-columns:1fr;gap:9px;min-height:0}.hero h2{font-size:28px}.heartbeat{flex-direction:row;justify-content:flex-start;gap:15px;padding:12px 4px 0}.heart-ring{width:69px;height:69px;box-shadow:0 0 0 7px #43b18c0d}.heart-ring:after{inset:7px}.heart-ring svg{width:34px;height:34px}.heart-detail{margin:0}.heartbeat small{display:block}.ecg{width:95px}.stats{gap:8px}.stat{min-height:104px;padding:13px}.stat-val{font-size:24px}.path-flow{grid-template-columns:1fr;gap:5px}.flow-arrow{transform:rotate(90deg);text-align:center}.exception{grid-template-columns:1fr;gap:7px}.tabs-mobile{display:flex;gap:6px;overflow:auto;padding:0 0 14px}.m-tab{border:1px solid #344f56;background:#14242b;border-radius:9px;padding:9px 13px;color:#9bb6b9;white-space:nowrap}.m-tab.active{background:#1b4740;color:var(--green);border-color:#3d886b}.metrics-strip{grid-template-columns:1fr}.inspector{padding:24px}.event{gap:8px}}
 @media(prefers-reduced-motion:reduce){*,*:before,*:after{animation-duration:.01ms!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
 
+/* Consistent event severity in both Recent Activity and full History.
+   Keep the text legible: a narrow accent and a quiet tinted row, not solid fill. */
+.event {
+  --rg-event-accent: var(--blue);
+  --rg-event-fill: #93c8f90a;
+  --rg-event-border: #93c8f92d;
+  --rg-event-icon-bg: #1b3245;
+  margin: 6px 0;
+  padding: 12px 11px;
+  border: 1px solid var(--rg-event-border);
+  border-left: 3px solid var(--rg-event-accent);
+  border-radius: 10px;
+  background: var(--rg-event-fill);
+}
+.event:last-child { border-bottom: 1px solid var(--rg-event-border); }
+.event.event-recovery {
+  --rg-event-accent: var(--green);
+  --rg-event-fill: #63e8b60b;
+  --rg-event-border: #63e8b631;
+  --rg-event-icon-bg: #15392f;
+}
+.event.event-warning {
+  --rg-event-accent: var(--amber);
+  --rg-event-fill: #ffbd690b;
+  --rg-event-border: #ffbd6933;
+  --rg-event-icon-bg: #423023;
+}
+.event.event-critical {
+  --rg-event-accent: var(--red);
+  --rg-event-fill: #ff817e0c;
+  --rg-event-border: #ff817e36;
+  --rg-event-icon-bg: #45292b;
+}
+.event .event-icon {
+  color: var(--rg-event-accent);
+  background: var(--rg-event-icon-bg);
+  font-weight: 800;
+}
+.event .event-title { line-height: 1.5; overflow-wrap: anywhere; }
+.event .event-time { color: #9ab2bb; }
+.event-legend { display: flex; flex-wrap: wrap; gap: 8px 14px; }
+.event-legend span { display: inline-flex; align-items: center; gap: 6px; font-size: 10px; color: #a7bdc4; }
+.event-legend i { width: 7px; height: 7px; border-radius: 50%; background: var(--rg-legend); }
+@media(max-width:540px) {
+  .event { gap: 9px; }
+  .event-time { white-space: normal; text-align: right; }
+}
+
 /* Embedded dashboard runs inside the native Merlin ASP shell. */
 body.rg-embedded { min-height:0; margin:0; }
 body.rg-embedded .app { min-height:0; display:block; }
@@ -355,7 +403,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     <div class="card"><div class="card-head"><div><div class="card-title">Historical policy outcomes</div><div class="card-sub">Click any interval to inspect the observation, or select a resolver card</div></div><span class="tag">Live timeline</span></div><div class="history-rows" id="fullHeat"></div><div class="timeline" id="histAxis"><span>24 hours ago</span><span>12 hours ago</span><span>Now</span></div></div>
     <div class="section-head"><h3>Selected observation</h3></div>
     <div class="card card-pad" id="selectedInterval"><div class="desc">Choose any colored interval in the timeline to inspect its sample result.</div></div>
-    <div class="section-head"><h3>Failover & recovery events</h3></div>
+    <div class="section-head"><h3>Failover & recovery events</h3><div class="event-legend" aria-label="Event colours"><span><i style="--rg-legend:var(--green)"></i>Restored</span><span><i style="--rg-legend:var(--amber)"></i>Filtered / warning</span><span><i style="--rg-legend:var(--red)"></i>Backup / critical</span><span><i style="--rg-legend:var(--blue)"></i>Info</span></div></div>
     <div class="card"><div id="historyEvents" class="feed"></div></div>
   </section>
 
@@ -573,6 +621,32 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     waveform.beat();
   }
   const glyph={healthy:'✓',degraded:'!',unknown:'?',hold:'!'};
+  // Classify actual shell-emitted events by action and destination pool.
+  // filtered1/filtered2 are preferred-resolver subsets, not independent backups.
+  // Independent backup pools are backupN/wanpoolN. Share one classifier across
+  // the Overview activity feed and the full History event list.
+  function eventKind(message){
+    const m=String(message||'').trim();
+    if (/^DNS (?:RESOLVER RESTORED|FILTERED RECOVERY):/i.test(m) ||
+        /^DNS FAILBACK:.*->\s*preferred\b/i.test(m)) return 'recovery';
+    if (/^(?:DNS RECOVERED:|FAST CONFIRM FAILED:)/i.test(m)) return 'info';
+
+    // Only colour independent-backup transitions and explicitly identified
+    // backup switching/recovery failures red. A filtered-pool failover is amber.
+    const isPoolSwitch=/^DNS (?:FAILOVER|POOL CHANGE|SWITCH FAILED|RECOVERY FAILED|ROLLBACK FAILED|RECOVERY ATTENTION):/i.test(m);
+    const targetIsIndependentBackup=/->\s*(?:backup[0-9]+|wanpool[0-9]+)\b/i.test(m);
+    const failedIndependentBackup=/^DNS RECOVERY FAILED:\s*(?:backup[0-9]+|wanpool[0-9]+)\b/i.test(m);
+    if (isPoolSwitch && (targetIsIndependentBackup || failedIndependentBackup)) return 'critical';
+
+    if (/^DNS (?:RESOLVER EXCLUDED|FILTERED MEMBERSHIP|FAILOVER|POOL CHANGE|SWITCH FAILED|RECOVERY FAILED|ROLLBACK FAILED|RECOVERY ATTENTION|RECOVERY):/i.test(m)) return 'warning';
+    return 'info';
+  }
+  function renderEvent(e, recent=false){
+    const kind=eventKind(e?.message);
+    const symbol=kind==='recovery'?'✓':kind==='info'?'i':'!';
+    const body=recent?'<div class="event-body">Recorded by ResolvGuard\'s completed scheduled check</div>':'';
+    return `<div class="event event-${kind}"><div class="event-icon" aria-hidden="true">${symbol}</div><div class="event-main"><div class="event-title">${esc(e?.message)}</div>${body}</div><span class="event-time">${esc(eventTimeLabel(e,recent))}</span></div>`;
+  }
   function renderOverview(){
     const d=state.snapshot,s=topState(d),r=pref(d),n=r.filter(x=>x.state==='ok').length;
     syncWaveSignal(d,state.feedConnected);
@@ -594,7 +668,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     $('preferredCount').textContent=r.length?`${n}/${r.length} passing`:'Unenrolled / unknown';
     $('resolverList').innerHTML=r.length?r.map(x=>`<button class="resolve-row" data-resolver="${esc(x.id)}"><div class="res-left"><span class="status-glyph ${x.state==='fail'?'bad':''}">${x.state==='ok'?'✓':x.state==='fail'?'!':'?'}</span><div><div class="res-name">${esc(x.tls||x.id)}</div><div class="res-ip">${esc(x.id)} · ${esc(x.ip)}:${esc(x.port)}</div></div></div><div class="res-right"><span class="res-state ${x.state==='ok'?'green':x.state==='fail'?'red':'amber'}">${x.state==='ok'?'PASS':x.state==='fail'?'FAIL':'NOT OBSERVED'}</span><span>›</span></div></button>`).join(''):'<div class="empty">No preferred resolver roster available. Enroll preferred WAN DNS before monitoring.</div>';
     const ev=(d?.events||[]).slice(-5).reverse();
-    $('eventFeed').innerHTML=ev.length?ev.map(e=>`<div class="event"><div class="event-icon ${/FAIL|DEGRADED|EXCLUDED/i.test(e.message)?'warn':'info'}">${/FAIL|DEGRADED|EXCLUDED/i.test(e.message)?'!':'i'}</div><div class="event-main"><div class="event-title">${esc(e.message)}</div><div class="event-body">Recorded by ResolvGuard's completed scheduled check</div></div><span class="event-time">${esc(eventTimeLabel(e,true))}</span></div>`).join(''):'<div class="empty">No switching or recovery events recorded since this router boot.</div>';
+    $('eventFeed').innerHTML=ev.length?ev.map(e=>renderEvent(e,true)).join(''):'<div class="empty">No switching or recovery events recorded since this router boot.</div>';
     renderHeat('overviewHeat','24');
   }
   function renderHeat(id,period){
@@ -631,7 +705,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     $('histAxis').innerHTML=state.period==='24'?'<span>24 hours ago</span><span>12 hours ago</span><span>Now</span>':'<span>7 days ago</span><span>3.5 days ago</span><span>Now</span>';
     renderHeat('fullHeat',state.period);
     const ev=(d?.events||[]).slice().reverse();
-    $('historyEvents').innerHTML=ev.length?ev.map(e=>`<div class="event"><div class="event-icon info">i</div><div class="event-main"><div class="event-title">${esc(e.message)}</div></div><span class="event-time">${esc(eventTimeLabel(e))}</span></div>`).join(''):'<div class="empty">No logged recovery/failover events since the current boot.</div>';
+    $('historyEvents').innerHTML=ev.length?ev.map(e=>renderEvent(e)).join(''):'<div class="empty">No logged recovery/failover events since the current boot.</div>';
   }
   function selectBin(id,period,index){
     const minutes=period==='24'?30:60,slots=period==='24'?48:168,start=Date.now()-(slots-index)*minutes*60000,end=start+minutes*60000;
