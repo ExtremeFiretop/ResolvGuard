@@ -3,7 +3,7 @@
 # ResolvGuard.sh
 #
 # Project Created: 2026-Oct-29 by @ExtremeFiretop
-# Last Modified: 2026-Nov-15
+# Last Modified: 2026-Nov-18
 #
 # ResolvGuard™
 # Official project: https://github.com/ExtremeFiretop/ResolvGuard
@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.2
-readonly SCRIPT_VERSTAG="26111705"
+readonly SCRIPT_VERSTAG="26111802"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
