@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.2
-readonly SCRIPT_VERSTAG="26111913"
+readonly SCRIPT_VERSTAG="26111914"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -4155,7 +4155,7 @@ _RegisterScheduleCron_() {
 # Keep the startup entry as a single, exactly owned line. Legacy blocks
 # from an existing installed ResolvGuard may be replaced only if unmodified.
 _StartupHookLine_() {
-  printf '/bin/sh %s/resolvguard.sh startup >> /tmp/resolvguard-startup.log 2>&1 & # RESOLVGUARD STARTUP\n' "$ROOT"
+  printf '%s/resolvguard.sh startup & # RESOLVGUARD STARTUP\n' "$ROOT"
 }
 
 _CheckOwnedStartupHook_() {
@@ -4615,7 +4615,7 @@ _RGManual_() (
     return 1
   }
   hook_body() {
-    printf '%s\n' 'case "$1:$2" in start:ResolvGuardManualCheck) /bin/sh /jffs/addons/ResolvGuard.d/resolvguard.sh webui manual-run >/tmp/resolvguard-webui-manual.log 2>&1 & ;; esac # RESOLVGUARD MANUAL'
+    printf '%s\n' 'case "$1:$2" in start:ResolvGuardManualCheck) /jffs/addons/ResolvGuard.d/resolvguard.sh webui manual-run & ;; esac # RESOLVGUARD MANUAL'
   }
   hook_current() {
     [ -f "$RG_M_HOOK" ] && [ ! -L "$RG_M_HOOK" ] || return 1
@@ -4900,7 +4900,7 @@ _RGWebConfig_() (
     ) | rg_atomic "$rg_result"
   }
   rg_hook_body() {
-    printf '%s\n' 'case "$1:$2" in start:ResolvGuardCfg) /bin/sh /jffs/addons/ResolvGuard.d/resolvguard.sh webui config-run >/tmp/resolvguard-webui-config.log 2>&1 & ;; esac # RESOLVGUARD CONFIG'
+    printf '%s\n' 'case "$1:$2" in start:ResolvGuardCfg) /jffs/addons/ResolvGuard.d/resolvguard.sh webui config-run & ;; esac # RESOLVGUARD CONFIG'
   }
   rg_hook_current() {
     [ -f "$rg_hook" ] && [ ! -L "$rg_hook" ] || return 1
