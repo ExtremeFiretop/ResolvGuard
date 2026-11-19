@@ -322,15 +322,15 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
   filter:drop-shadow(0 0 3px var(--rg-signal-glow));
 }
 .heartbeat.no-signal .ecg .ecg-trace { opacity:.28; }
-/* Return echo is brighter/thicker, but ALWAYS the same hue as the baseline. */
+/* The returning echo shares the outbound trace's stroke weight and glow. */
 .heartbeat .ecg .ecg-return {
   fill:none;
   stroke:var(--rg-signal);
-  stroke-width:3.2;
+  stroke-width:2.25;
   stroke-linecap:round;
   stroke-linejoin:round;
   pointer-events:none;
-  filter:drop-shadow(0 0 5px var(--rg-signal-glow));
+  filter:drop-shadow(0 0 3px var(--rg-signal-glow));
 }
 .heartbeat .ecg .ecg-turn {
   fill:var(--rg-signal);
