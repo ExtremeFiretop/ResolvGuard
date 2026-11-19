@@ -776,27 +776,41 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     }
     const data={lastEnd:state.lastEnd,evaluations,failures};state.detailCache=data;return data;
   }
-  // Only use the router-provided local timestamp/offset for an exact local
-  // conversion; old records without one are explicitly labelled UTC.
+  // Preserve UTC for comparisons and aligned history buckets. Display times
+  // in the router's timezone, never the viewing browser's timezone. New records
+  // have their own exact router wall clock. Legacy rows use the latest known
+  // router offset; that approximation can cross a daylight-saving transition.
+  function historyRouterOffset(reference){
+    const stamp=String(reference||'');
+    if(!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4}$/.test(stamp))return null;
+    const m=/([+-])(\d\d)(\d\d)$/.exec(stamp);
+    const hours=Number(m[2]),minutes=Number(m[3]);
+    if(hours>14||minutes>59||(hours===14&&minutes))return null;
+    return (m[1]==='-'?-1:1)*(hours*60+minutes);
+  }
+  function historyRouterReference(reference){
+    return historyRouterOffset(reference)!==null?reference:state.snapshot?.lastEndRouter||'';
+  }
   function historyStamp(utc,routerAt){
-    if(!Number.isFinite(Date.parse(utc)))return 'Unknown time';
-    if(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4}$/.test(routerAt||''))return routerTimeLabel(routerAt);
-    return utc.slice(0,10)+' '+utc.slice(11,19)+' UTC';
+    const when=Date.parse(utc||'');
+    if(!Number.isFinite(when))return 'Unknown time';
+    if(historyRouterOffset(routerAt)!==null)return routerTimeLabel(routerAt);
+    const offset=historyRouterOffset(historyRouterReference(''));
+    if(offset===null)return new Date(when).toISOString().slice(0,19).replace('T',' ')+' UTC';
+    return new Date(when+offset*60000).toISOString().slice(0,19).replace('T',' ');
   }
   function historyRange(start,end,reference){
-    const suffix=/([+-])(\d\d)(\d\d)$/.exec(reference||'');
-    if(!suffix)return `${new Date(start).toISOString().slice(0,16).replace('T',' ')} – ${new Date(end).toISOString().slice(11,16)} UTC`;
-    const direction=suffix[1]==='-'?-1:1;
-    const shift=direction*(Number(suffix[2])*60+Number(suffix[3]))*60000;
-    const a=new Date(start+shift).toISOString(),b=new Date(end+shift).toISOString();
-    return `${a.slice(0,16).replace('T',' ')} – ${b.slice(0,10)===a.slice(0,10)?b.slice(11,16):b.slice(0,16).replace('T',' ')} (router time)`;
+    const offset=historyRouterOffset(historyRouterReference(reference));
+    if(offset===null)return `${new Date(start).toISOString().slice(0,16).replace('T',' ')} – ${new Date(end).toISOString().slice(11,16)} UTC`;
+    const a=new Date(start+offset*60000).toISOString(),b=new Date(end+offset*60000).toISOString();
+    return `${a.slice(0,16).replace('T',' ')} – ${b.slice(0,10)===a.slice(0,10)?b.slice(11,16):b.slice(0,16).replace('T',' ')}`;
   }
   async function selectBin(id,period,startStamp){
     const start=Date.parse(startStamp),{step}=historyWindow(period),end=start+step;
     if(!/^wan[0-9]+$/.test(id)||!Number.isFinite(start))return;
     const selection=++state.historySelection;
     const panel=$('selectedInterval');
-    panel.innerHTML=`<div class="eyebrow">Loading retained observations</div><h3>${esc(id)} · ${esc(startStamp)}</h3><p class="desc">Reading the router's completed-cycle history…</p>`;
+    panel.innerHTML=`<div class="eyebrow">Loading retained observations</div><h3>${esc(id)} · ${esc(historyRange(start,end,''))}</h3><p class="desc">Reading the router's completed-cycle history…</p>`;
     try{
       const data=await fetchHistoryDetails();if(selection!==state.historySelection)return;
       const relevant=data.evaluations.filter(x=>x.id===id&&Date.parse(x.at)>=start&&Date.parse(x.at)<end).sort((a,b)=>Date.parse(a.at)-Date.parse(b.at));
@@ -812,7 +826,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
           :x.status==='ok'?'All configured DNS policy checks for this resolver passed during this completed evaluation.':'No conclusive result was recorded for this resolver.';
         return `<details class="history-evaluation ${x.status}"><summary><span class="history-time">${esc(historyStamp(x.at,x.routerAt))}</span><span class="history-result">${x.status==='ok'?'PASS':x.status==='fail'?'FAIL':'UNKNOWN'}</span><span aria-hidden="true">⌄</span></summary><div class="history-reasons">${message}</div></details>`;
       }).join('');
-      panel.innerHTML=`<div class="eyebrow">Recorded historical interval · ${esc(id)}</div><h3>${esc(title)}</h3>${summary}<div class="history-detail-heading">Individual completed-cycle results</div><div class="history-evaluations">${entries||'<div class="desc">No resolver evaluations were retained in this interval.</div>'}</div><p class="history-detail-note">Time labels use the router-local timestamp when retained, otherwise explicitly show UTC. Each row is one resolver evaluation at cycle completion, not an individual DNS query. Future recorded failures include individual policy names, types and reasons; previous diagnostics cannot be reconstructed. No availability is inferred between checks.</p>`;
+      panel.innerHTML=`<div class="eyebrow">Recorded historical interval · ${esc(id)}</div><h3>${esc(title)}</h3>${summary}<div class="history-detail-heading">Individual completed-cycle results</div><div class="history-evaluations">${entries||'<div class="desc">No resolver evaluations were retained in this interval.</div>'}</div><p class="history-detail-note">Times use the router's clock, not the browser's. Older records without a saved local timestamp use the router's latest known offset; their displayed hour may be approximate across daylight-saving changes. Each row is a completed resolver evaluation, not an individual DNS query. Missing historical policy details cannot be reconstructed. No availability is inferred between checks.</p>`;
     }catch(e){if(selection!==state.historySelection)return;
       panel.innerHTML=`<div class="eyebrow">Detailed history unavailable</div><h3>${esc(id)}</h3><p class="desc">Unable to read the router's per-cycle records: ${esc(e.message)}. The timeline summary is still available; install both updated source files and remount the WebUI for drill-down.</p>`;
     }
