@@ -394,11 +394,16 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     <div class="section-head"><h3>Network health at a glance</h3><div class="hint">Scheduled monitoring · Manual checks are independent</div></div>
     <div class="stats">
       <div class="stat"><div class="stat-label">Preferred resolvers</div><div class="stat-val green" id="statResolvers">—</div><div class="stat-sub" id="statResolversSub">Reachable and policy-compliant</div></div>
-      <div class="stat"><div class="stat-label">DNS probe results</div><div class="stat-val" id="statPolicies">—</div><div class="stat-sub">Passed / total · latest cycle</div></div>
+      <div class="stat"><div class="stat-label" id="statPoliciesLabel">DNS probe results</div><div class="stat-val" id="statPolicies">—</div><div class="stat-sub" id="statPoliciesDescription">Passed / total attempts · latest cycle</div></div>
       <div class="stat"><div class="stat-label">Active production pool</div><div class="stat-val" id="statPool" style="font-size:23px">unknown</div><div class="stat-sub" id="statPoolSub">WAN DNS configuration</div></div>
       <div class="stat"><div class="stat-label">Next scheduled cycle</div><div class="stat-val" id="statCountdown">—</div><div class="stat-sub" id="statSeq">No completed check yet</div></div>
     </div>
     <div class="section-head"><h3>Live resolver view</h3><button class="text-link" data-tab="history">Explore full history →</button></div>
+    <div class="card" id="activePoolCard" hidden style="margin-bottom:15px">
+      <div class="card-head"><div><div class="card-title" id="activePoolTitle">Active production DNS resolvers</div><div class="card-sub" id="activePoolDescription">Verified membership of the current WAN DNS pool</div></div><span class="small-pill" id="activePoolCount">—</span></div>
+      <div id="activeResolverList"></div>
+      <div class="card-pad" style="padding-top:10px"><div class="note">Active membership comes from the verified production WAN DNS rulelist. PASS/FAIL refers to direct authenticated DNS observations in the latest completed cycle, not individual LAN query routing.</div></div>
+    </div>
     <div class="two-col">
       <div class="card"><div class="card-head"><div><div class="card-title">Preferred DNS resolvers</div><div class="card-sub">Tap a resolver for authentication and policy details</div></div><div class="small-pill" id="preferredCount">— healthy</div></div><div id="resolverList"></div><div class="card-pad" style="padding-top:10px"><div class="note">These are <strong>direct authenticated DoT probes</strong>. Production LAN DNS still uses DNSMasq → Stubby by default.</div></div></div>
       <div class="card"><div class="card-head"><div><div class="card-title">Recent activity</div><div class="card-sub">Actual completed failover and recovery events</div></div><button class="text-link" data-tab="history">All events →</button></div><div class="feed" id="eventFeed"></div></div>
@@ -504,7 +509,14 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     if(isStale(d))return {title:'Monitoring data is stale.',detail:'No recent completed health evaluation is available. This is not a passing result.',status:'unknown'};
     if(!hasRealChecks(d))return {title:'Waiting for health results.',detail:'The latest completed cycle had no DNS policy observations.',status:'unknown'};
     const h=health(d),p=pref(d),n=p.filter(r=>r.state==='ok').length;
-    if(d.pool!=='preferred')return {title:'Failover pool active: '+d.pool,detail:`${n} of ${p.length} preferred resolvers passed the latest observed policy checks. A managed alternate pool is active; see the resolver and event details below.`,status:'degraded'};
+    if(/^backup[0-9]+$|^wanpool[0-9]+$/.test(d.pool||'')){
+      const active=d.activePoolVerified && Array.isArray(d.activeResolvers)?d.activeResolvers:[];
+      const detail=d.activePoolVerified
+        ? `${n} of ${p.length} preferred resolvers passed. Independent backup DNS ${d.pool} is serving the production WAN with ${active.length} verified member(s); their last observed checks are shown below.`
+        : `${n} of ${p.length} preferred resolvers passed. Backup pool ${d.pool} is recorded as active, but its live membership could not be verified; check SSH status.`;
+      return {title:'Backup DNS active: '+d.pool,detail,status:'backup'};
+    }
+    if(d.pool!=='preferred')return {title:'Filtered DNS pool active: '+d.pool,detail:`${n} of ${p.length} preferred resolvers passed. ResolvGuard is using a reduced subset of preferred DNS resolvers.`,status:'degraded'};
     if(h==='healthy')return {title:'All preferred DNS resolvers are healthy.',detail:`All ${p.length} preferred resolvers passed the latest completed scheduled cycle.`,status:'healthy'};
     if(h==='degraded')return {title:'Preferred DNS health is degraded.',detail:`${n} of ${p.length} preferred resolvers passed. Refer to the detailed checks and event history.`,status:'degraded'};
     return {title:'DNS health is not fully verified.',detail:'Some enrolled resolvers were not observed in the last completed cycle.',status:'unknown'};
@@ -616,7 +628,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     node.classList.toggle('no-signal',!live);
     const summary=live?topState(d).status:'unknown';
     node.classList.toggle('signal-degraded',summary==='degraded');
-    node.classList.toggle('signal-hold',summary==='hold');
+    node.classList.toggle('signal-hold',summary==='hold'||summary==='backup');
     waveform.setActive(live);
     node.classList.toggle('motion-active',waveform.active());
     if(!live)$('heartRing').classList.remove('pulse');
@@ -662,21 +674,36 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     const d=state.snapshot,s=topState(d),r=pref(d),n=r.filter(x=>x.state==='ok').length;
     syncWaveSignal(d,state.feedConnected);
     $('heroHeading').textContent=s.title; $('heroText').textContent=s.detail;
-    $('heroKicker').textContent=s.status==='healthy'?'Monitoring healthy':s.status==='degraded'?'DNS degraded':'Verification pending';
-    $('heroDot').style.background=s.status==='healthy'?'var(--green)':s.status==='degraded'?'var(--amber)':'var(--muted)';
-    $('hero').style.borderColor=s.status==='healthy'?'#29564b':s.status==='degraded'?'#86633b':'#395058';
+    $('heroKicker').textContent=s.status==='healthy'?'Monitoring healthy':s.status==='degraded'?'DNS degraded':s.status==='backup'?'BACKUP DNS ACTIVE':'Verification pending';
+    $('heroDot').style.background=s.status==='healthy'?'var(--green)':s.status==='degraded'?'var(--amber)':s.status==='backup'?'var(--red)':'var(--muted)';
+    $('hero').style.borderColor=s.status==='healthy'?'#29564b':s.status==='degraded'?'#86633b':s.status==='backup'?'#955355':'#395058';
     $('poolPill').textContent='Active pool: '+(d?.pool||'unknown');
     $('modePill').textContent=({'monitoring':'Monitoring Only','automatic':'Auto Failover configured','inactive':'Monitoring inactive','hold':'Policy safety hold'})[d?.mode]||'Unknown mode';
-    $('heartLabel').textContent=s.status==='healthy'?'Check complete · Healthy':s.status==='degraded'?'Check complete · Degraded':'Awaiting reliable check';
+    $('heartLabel').textContent=s.status==='healthy'?'Check complete · Healthy':s.status==='degraded'?'Check complete · Degraded':s.status==='backup'?'Check complete · Backup active':'Awaiting reliable check';
     $('heartSub').textContent=d?.lastEnd?'Last completed '+(routerTimeLabel(d.lastEndRouter)||String(d.lastEnd).replace('T',' ').replace(/Z$/,' UTC')):'No completed cycle recorded';
     $('statResolvers').textContent=d&&r.length?`${n} / ${r.length}`:'—';
     $('statResolversSub').textContent='Preferred members passing observed policy';
     const pol=r.reduce((z,x)=>z+x.policyPass,0),fail=r.reduce((z,x)=>z+x.policyFail,0);
     $('statPolicies').textContent=d&&pol+fail?`${pol} / ${pol+fail}`:'—';
+    const alternate=!!d?.pool && d.pool!=='preferred';
+    $('statPoliciesLabel').textContent=alternate?'Preferred DNS probe attempts':'DNS probe results';
+    $('statPoliciesDescription').textContent=alternate?'Passed / total · may include repeat checks':'Passed / total attempts · latest cycle';
     $('statPool').textContent=d?.pool||'unknown';
     $('statPoolSub').textContent='Read-only managed pool state';
     $('statSeq').textContent=d?.lastEnd?'Completed '+(routerTimeLabel(d.lastEndRouter)||String(d.lastEnd).replace('T',' ').replace(/Z$/,' UTC')):'No completed check yet';
     $('preferredCount').textContent=r.length?`${n}/${r.length} passing`:'Unenrolled / unknown';
+    const activeCard=$('activePoolCard');
+    activeCard.hidden=!alternate;
+    if(alternate){
+      const active=d?.activePoolVerified && Array.isArray(d.activeResolvers)?d.activeResolvers:[];
+      $('activePoolTitle').textContent='Active production DNS resolvers · '+d.pool;
+      $('activePoolCount').textContent=d?.activePoolVerified?active.length+' member(s)':'Unverified';
+      $('activePoolDescription').textContent=d?.activePoolVerified
+        ? 'Actual active WAN DNS pool membership · latest completed-cycle probe results'
+        : 'Live WAN membership is not verified; no active endpoints are assumed';
+      $('activeResolverList').innerHTML=active.length?active.map(x=>`<button class="resolve-row" data-resolver="${esc(x.id)}"><div class="res-left"><span class="status-glyph ${x.state==='fail'?'bad':''}">${x.state==='ok'?'✓':x.state==='fail'?'!':'?'}</span><div><div class="res-name">${esc(x.tls||x.id)}</div><div class="res-ip">${esc(x.id)} · ${esc(x.ip)}:${esc(x.port)}</div></div></div><div class="res-right"><span class="res-state ${x.state==='ok'?'green':x.state==='fail'?'red':'amber'}">${x.state==='ok'?'PASS':x.state==='fail'?'FAIL':'NOT OBSERVED'}</span><span>›</span></div></button>`).join(''):
+        '<div class="empty">Active member identities could not be verified from the current WAN DNS configuration. Use SSH status to inspect the production pool.</div>';
+    }
     $('resolverList').innerHTML=r.length?r.map(x=>`<button class="resolve-row" data-resolver="${esc(x.id)}"><div class="res-left"><span class="status-glyph ${x.state==='fail'?'bad':''}">${x.state==='ok'?'✓':x.state==='fail'?'!':'?'}</span><div><div class="res-name">${esc(x.tls||x.id)}</div><div class="res-ip">${esc(x.id)} · ${esc(x.ip)}:${esc(x.port)}</div></div></div><div class="res-right"><span class="res-state ${x.state==='ok'?'green':x.state==='fail'?'red':'amber'}">${x.state==='ok'?'PASS':x.state==='fail'?'FAIL':'NOT OBSERVED'}</span><span>›</span></div></button>`).join(''):'<div class="empty">No preferred resolver roster available. Enroll preferred WAN DNS before monitoring.</div>';
     const ev=(d?.events||[]).slice(-5).reverse();
     $('eventFeed').innerHTML=ev.length?ev.map(e=>renderEvent(e,true)).join(''):'<div class="empty">No switching or recovery events recorded since this router boot.</div>';
@@ -730,7 +757,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
       rows.length?rows.map(r=>`<div class="exception"><div><div class="muted">Matching domain scope</div><strong>${esc(r.domain)}</strong></div><div><div class="muted">Configured upstream</div><code>${esc(r.upstream)}</code></div><span class="warn-pill">Bypasses Stubby</span></div>`).join(''):
       '<div class="empty"><strong>No domain-scoped rules reported</strong>No matching DNSMasq exceptions found in the current readable upstream file. This does not establish that LAN devices cannot use other DNS paths.</div>';
   }
-  function openInspector(id){const d=state.snapshot,r=(d?.resolvers||[]).find(x=>x.id===id);if(!r)return;
+  function openInspector(id){const d=state.snapshot,r=(d?.activeResolvers||[]).find(x=>x.id===id)||(d?.resolvers||[]).find(x=>x.id===id);if(!r)return;
     $('inspectContent').innerHTML=`<h2>${esc(r.tls||r.id)} · ${esc(r.id)}</h2><p class="desc">Latest completed scheduled observation</p><div class="inspect-field"><span>Status</span><strong>${r.state==='ok'?'PASS':r.state==='fail'?'FAIL':'NOT OBSERVED'}</strong></div><div class="inspect-field"><span>DNS address</span><strong>${esc(r.ip)}:${esc(r.port)}</strong></div><div class="inspect-field"><span>TLS authentication</span><strong>${esc(r.tls)}</strong></div><div class="inspect-field"><span>Passed policy records</span><strong>${Number(r.policyPass||0)}</strong></div><div class="inspect-field"><span>Failed policy records</span><strong>${Number(r.policyFail||0)}</strong></div><p class="desc" style="margin-top:24px">The totals include repeated fast-confirmation probes where applicable. They are not unique DNS-policy counts.</p>`;
     $('inspectBackdrop').classList.add('open');$('inspector').classList.add('open');$('inspector').setAttribute('aria-hidden','false');$('inspectorClose').focus();
     // Embedded in Merlin's native page: bring the inspector into view when

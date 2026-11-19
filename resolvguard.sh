@@ -3,7 +3,7 @@
 # ResolvGuard.sh
 #
 # Project Created: 2026-Oct-29 by @ExtremeFiretop
-# Last Modified: 2026-Nov-18
+# Last Modified: 2026-Nov-15
 #
 # ResolvGuard™
 # Official project: https://github.com/ExtremeFiretop/ResolvGuard
@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.2
-readonly SCRIPT_VERSTAG="26111802"
+readonly SCRIPT_VERSTAG="26111901"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -5074,7 +5074,7 @@ _RGWebUI_() (
     flock -x 8 || return 1
     cycle="$RG_DATA/cycle-$$"
     observations="$RG_DATA/observations-$$"
-    trap 'rm -f "$cycle" "$observations" "$RG_DATA"/status-"$$".tmp "$RG_DATA"/history-"$$".tmp "$RG_DATA"/events-"$$".tmp "$RG_DATA"/last-end.new."$$"' EXIT HUP INT TERM
+    trap 'rm -f "$cycle" "$observations" "$RG_DATA"/active-members-"$$" "$RG_DATA"/status-"$$".tmp "$RG_DATA"/history-"$$".tmp "$RG_DATA"/events-"$$".tmp "$RG_DATA"/last-end.new."$$"' EXIT HUP INT TERM
     extract_cycle > "$cycle" || :
     # First publish can precede the first cron cycle. Do not invent green state.
     header=$(sed -n '1p' "$cycle")
@@ -5157,6 +5157,24 @@ _RGWebUI_() (
       fi
       printf '%s\n' "$done_at" > "$RG_DATA/last-end.new.$$" && mv "$RG_DATA/last-end.new.$$" "$RG_DATA/last-end"
     fi
+    # The published active roster must match the *live* WAN DNS rulelist.
+    # Reading it is safe: neither operation switches pools or probes DNS.
+    # Fail closed when production membership cannot be verified.
+    active_members="$RG_DATA/active-members-$$"
+    : > "$active_members" || return 1
+    active_verified=false
+    case "$current_pool" in
+      preferred|unknown) : ;;
+      filtered1|filtered2|backup[0-9]*|wanpool[0-9]*)
+        if [ "$(_GetActiveWANPool_ 2>/dev/null || :)" = "$current_pool" ] &&
+           _GetPoolMembers_ "$current_pool" > "$active_members" 2>/dev/null &&
+           [ -s "$active_members" ]; then
+          active_verified=true
+        else
+          : > "$active_members"
+        fi
+        ;;
+    esac
     # JSON is computed in volatile files and atomically published to the WebUI.
     tmp="$RG_DATA/status-$$.tmp"
     (
@@ -5207,6 +5225,25 @@ _RGWebUI_() (
           sep=,
         done < "$providers"
       fi
+      # Verified active non-preferred members, with observations from this
+      # completed cycle. An unobserved member is never labelled healthy.
+      printf '],"activePoolVerified":%s,"activeResolvers":[' "$active_verified"
+      sep=''
+      while IFS='|' read -r id ip tls dotport extra; do
+        [ -n "$id" ] && [ -n "$ip" ] && [ -n "$tls" ] || continue
+        row=$(awk -F'|' -v k="$id" '$1==k {print;exit}' "$observations")
+        state=unknown; pass=0; fail=0
+        if [ -n "$row" ]; then
+          state=$(printf '%s' "$row" | cut -d'|' -f2)
+          pass=$(printf '%s' "$row" | cut -d'|' -f3)
+          fail=$(printf '%s' "$row" | cut -d'|' -f4)
+        fi
+        printf '%s{"id":' "$sep";jsonq "$id";printf ',"ip":';jsonq "$ip"
+        printf ',"tls":';jsonq "$tls";printf ',"port":';jsonq "$dotport"
+        printf ',"state":';jsonq "$state"
+        printf ',"policyPass":%s,"policyFail":%s}' "$(number "$pass")" "$(number "$fail")"
+        sep=,
+      done < "$active_members"
       printf '],"exceptions":['
       sep=''
       exceptions | while IFS='|' read -r domain upstream; do
