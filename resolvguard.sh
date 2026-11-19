@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.2
-readonly SCRIPT_VERSTAG="26111901"
+readonly SCRIPT_VERSTAG="26111911"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -1100,6 +1100,30 @@ _PrintHealthCheckResult_() {
       # belonging to the active filtered pool. Preserve that distinction.
       RG_HEALTH_FAILURE_PHASES="${RG_HEALTH_FAILURE_PHASES:-}|$resolver_id:${RG_HEALTH_PROBE_PHASE:-active}|"
     fi
+  fi
+
+  # Record the precise time and policy reason of scheduled failures for
+  # WebUI history drill-down. This is diagnostic output only: no DNS probes,
+  # switching decisions or monitoring counters are changed.
+  if [ "$result" = FAIL ] && [ "${RG_WEBUI_RECORD_POLICY_FAILURES:-0}" = 1 ]; then
+    local tail qname qtype reason
+    resolver_id="${details%% *}"
+    tail="${details#* }"
+    qname="${tail%% *}"
+    tail="${tail#* }"
+    qtype="${tail%%:*}"
+    reason="${tail#*: }"
+    case "$resolver_id:$qtype" in
+      *'|'*|*' '*|*'<'*|*'>'*) : ;;
+      *)
+        # The checked hostname/type come from validated monitoring policy.
+        # Do not put arbitrary delimiters into the volatile history feed.
+        case "$qname:$reason" in
+          *'|'*) : ;;
+          *) _Say_ "WEBUI POLICY FAILURE|$(date -u '+%Y-%m-%dT%H:%M:%SZ')|$(date '+%Y-%m-%dT%H:%M:%S%z')|${RG_HEALTH_PROBE_PHASE:-active}|$resolver_id|$qname|$qtype|$reason" ;;
+        esac
+        ;;
+    esac
   fi
 
   if [ "${RG_HEALTH_COLOR_ENABLED:-0}" != 1 ]; then
@@ -5070,6 +5094,16 @@ _RGWebUI_() (
     fi
     mkdir -p "$RG_DATA" || return 1
     chmod 700 "$RG_DATA" || :
+    # On-demand history files are public only to the authenticated Merlin WebUI.
+    # Reject unsafe replacements before exposing them through /ext/ResolvGuard.
+    for history_file in history.tsv history-failures.tsv; do
+      if [ -L "$RG_DATA/$history_file" ] ||
+         { [ -e "$RG_DATA/$history_file" ] && [ ! -f "$RG_DATA/$history_file" ]; }; then
+        err 'unsafe history detail file'; return 1
+      fi
+      [ -f "$RG_DATA/$history_file" ] || : > "$RG_DATA/$history_file" || return 1
+      chmod 600 "$RG_DATA/$history_file" || return 1
+    done
     exec 8> "$RG_DATA/publish.lock" || return 1
     flock -x 8 || return 1
     cycle="$RG_DATA/cycle-$$"
@@ -5128,7 +5162,7 @@ _RGWebUI_() (
         awk -F'|' 'NR==FNR {state[$1]=$2; next}
           $1~/^wan[0-9]+$/ {print $1"|"(state[$1]!=""?state[$1]:"unknown")}
         ' "$observations" "$providers" | while IFS='|' read -r id status; do
-          printf '%s|%s|%s\n' "$done_at" "$id" "$status"
+          printf '%s|%s|%s|%s\n' "$done_at" "$id" "$status" "$router_end"
         done >> "$RG_DATA/history.tsv"
       fi
       # Preserve the newest 40,320 rows; trim only every 60 completed cycles
@@ -5154,6 +5188,24 @@ _RGWebUI_() (
             printf '%s|%s|%s\n' "$done_at" "$message" "$router_end"
           done >> "$RG_DATA/events.tsv"
         tail -n 200 "$RG_DATA/events.tsv" > "$RG_DATA/events-$$.tmp" && mv "$RG_DATA/events-$$.tmp" "$RG_DATA/events.tsv"
+      fi
+      # Preserve bounded, timestamped policy failures from this *completed*
+      # scheduled cycle. Historical records before this feature may only have
+      # resolver-level PASS/FAIL; never infer missing policy details.
+      awk -F'|' -v cycle_end="$done_at" '
+        $1=="WEBUI POLICY FAILURE" && NF==8 &&
+        $2 ~ /^[0-9][0-9][0-9][0-9]-/ &&
+        $5 ~ /^[A-Za-z][A-Za-z0-9_-]*$/ &&
+        $7 ~ /^[A-Za-z0-9_-]+$/ {
+          print cycle_end "|" $2 "|" $3 "|" $4 "|" $5 "|" $6 "|" $7 "|" $8
+        }
+      ' "$cycle" >> "$RG_DATA/history-failures.tsv" || return 1
+      # Keep only the latest 8,192 failure details in volatile RAM. Unlike
+      # history.tsv this is needed only for diagnostic drill-down.
+      details_lines=$(wc -l < "$RG_DATA/history-failures.tsv")
+      if [ "$details_lines" -gt 8192 ]; then
+        tail -n 8192 "$RG_DATA/history-failures.tsv" > "$RG_DATA/history-failures-$$.tmp" &&
+          mv "$RG_DATA/history-failures-$$.tmp" "$RG_DATA/history-failures.tsv" || return 1
       fi
       printf '%s\n' "$done_at" > "$RG_DATA/last-end.new.$$" && mv "$RG_DATA/last-end.new.$$" "$RG_DATA/last-end"
     fi
@@ -5275,7 +5327,7 @@ _RGWebUI_() (
             printf "{\"at\":\"%s\",\"id\":\"%s\",\"state\":\"%s\",\"samples\":%d,\"failures\":%d,\"unknowns\":%d}",bucket,id,state,n,fail,unknown
           }
           $1 ~ /^[0-9]{4}-/ { }
-          NF==3 && $1 ~ /^[0-9][0-9][0-9][0-9]-/ && $2 ~ /^wan[0-9]+$/ && $3 ~ /^(ok|fail|unknown)$/ {
+          (NF==3 || NF==4) && $1 ~ /^[0-9][0-9][0-9][0-9]-/ && $2 ~ /^wan[0-9]+$/ && $3 ~ /^(ok|fail|unknown)$/ {
             # yyyy-mm-ddThh:mm:ssZ, all timestamps from ResolvGuard UTC cron.
             t=substr($1,1,13)
             half=substr($1,15,2)+0 < 30 ? "00" : "30"
@@ -5383,12 +5435,17 @@ _RGWebUI_() (
       err 'unsafe asset directory';unlock_menu; return 1
     fi
     mkdir -p "$dir" "$RG_DATA" || { unlock_menu; return 1; }
-    # Link read-only public JSON snapshots, never config/settings or secrets.
-    for name in status.htm history.htm manual.htm config.htm config-action.htm; do
+    # Link owned, read-only dashboard feeds (JSON plus bounded history TSV);
+    # never expose config/settings or credentials.
+    for name in status.htm history.htm history-records.htm history-failures.htm manual.htm config.htm config-action.htm; do
       if [ -e "$dir/$name" ] && [ ! -L "$dir/$name" ]; then
         err 'refusing to replace non-owned web asset';unlock_menu; return 1
       fi
       source_file="$RG_DATA/$name"
+      case "$name" in
+        history-records.htm) source_file="$RG_DATA/history.tsv" ;;
+        history-failures.htm) source_file="$RG_DATA/history-failures.tsv" ;;
+      esac
       ln -sf "$source_file" "$dir/$name" || { unlock_menu; return 1; }
     done
     # Retire only the legacy link pointing to our old two-file installation.
@@ -5420,8 +5477,12 @@ _RGWebUI_() (
       rewrite_menu remove "$found" || { unlock_menu; return 1; }
       rm -f "$RG_WEB/$found" "$RG_WEB/${found%.asp}.title" || { unlock_menu; return 1; }
     fi
-    for name in status.htm history.htm manual.htm config.htm config-action.htm; do
+    for name in status.htm history.htm history-records.htm history-failures.htm manual.htm config.htm config-action.htm; do
       source_file="$RG_DATA/$name"
+      case "$name" in
+        history-records.htm) source_file="$RG_DATA/history.tsv" ;;
+        history-failures.htm) source_file="$RG_DATA/history-failures.tsv" ;;
+      esac
       if [ -L "$RG_WEB/ResolvGuard/$name" ] && [ "$(readlink "$RG_WEB/ResolvGuard/$name")" = "$source_file" ]; then
         rm -f "$RG_WEB/ResolvGuard/$name"
       fi
@@ -5506,9 +5567,11 @@ _RunScheduledCheck_() {
   [ ! -e "$PENDING_TRANSACTION" ] && [ ! -e "$RECOVERY_HOLD" ] || {
     _Say_ 'SKIP: unresolved WAN transaction or recovery hold; no WAN switching'; return 0;
   }
+  RG_WEBUI_RECORD_POLICY_FAILURES=1
   if _RunDNSHealthCheck_ scheduled; then outcome=0
   else outcome=$?
   fi
+  RG_WEBUI_RECORD_POLICY_FAILURES=0
   # Preserve UTC for history and give the WebUI the router's actual local
   # clock and UTC offset at completion (independent of the viewing browser).
   _Say_ "SCHEDULE UTC END: $(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || _Say_ 'clock-unavailable') result=$outcome routerTime=$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || _Say_ 'clock-unavailable')"

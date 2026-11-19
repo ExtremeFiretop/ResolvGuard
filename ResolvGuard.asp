@@ -354,6 +354,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
 @keyframes history-check-arrived {0%{box-shadow:0 0 0 0 #91efbb88}45%{box-shadow:0 0 0 3px #91efbb88}100%{box-shadow:0 0 0 0 #91efbb00}}
 .compact-heat .hcell.history-new {animation:history-check-arrived 1.1s ease-out}
 @media(prefers-reduced-motion:reduce){.compact-heat .hcell.history-new{animation:none}}
+.history-detail-summary{display:flex;gap:12px;flex-wrap:wrap;margin:16px 0}.history-detail-stat{background:#162b32;border:1px solid #304a51;border-radius:10px;padding:11px 15px;min-width:90px}.history-detail-stat strong{display:block;font-size:19px;color:#e4f3ef}.history-detail-stat span{font-size:11px;color:#93b5b9}.history-detail-heading{font-size:12px;font-weight:750;margin:15px 0 8px}.history-evaluations{display:grid;gap:7px;max-height:500px;overflow:auto}.history-evaluation{border:1px solid #30434b;border-left:3px solid #4ca883;border-radius:9px;background:#13262d;color:#e3efee}.history-evaluation.fail{border-left-color:#e99969;background:#2d2727}.history-evaluation.unknown{border-left-color:#83969b}.history-evaluation summary{cursor:pointer;padding:10px 12px;display:flex;align-items:center;gap:12px;font-size:12px}.history-evaluation summary::marker{content:''}.history-evaluation summary::-webkit-details-marker{display:none}.history-evaluation .history-time{font-family:ui-monospace,Consolas,monospace;color:#b1cbd1}.history-evaluation .history-result{font-size:10px;font-weight:800;letter-spacing:.4px;margin-left:auto}.history-evaluation.fail .history-result{color:#f0a578}.history-evaluation:not(.fail) .history-result{color:#6edeb4}.history-evaluation .history-reasons{margin:0 12px 12px;border-top:1px solid #48504e;padding-top:10px;color:#b3cbd0;font-size:11px;line-height:1.7}.history-evaluation .history-reason{margin:6px 0}.history-reason strong{color:#f0c3a1}.history-detail-note{font-size:11px;color:#8cacb4;line-height:1.55;margin-top:12px}
 
 @media(prefers-reduced-motion:reduce) {
   .ecg .ecg-trace { transition:none; }
@@ -414,11 +415,11 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
 
   <section id="history" class="tab">
     <div class="section-head" style="margin-top:0"><h3>Reliability across time</h3><div class="toolbar"><label for="period">Time period</label><select id="period" class="select"><option value="24">Last 24 hours</option><option value="7">Last 7 days</option></select></div></div>
-    <div class="metrics-strip"><div class="stat"><div class="stat-label">Recent observations</div><div class="mini-value" id="histObservations">192</div><div class="stat-sub">Recorded policy observations</div></div><div class="stat"><div class="stat-label">Preferred endpoints</div><div class="mini-value" id="histPreferred">—</div><div class="stat-sub">Independently checked</div></div><div class="stat"><div class="stat-label">Live data source</div><div class="mini-value amber" style="font-size:18px">Live feed</div><div class="stat-sub">Volatile history; resets on reboot</div></div></div>
+    <div class="metrics-strip"><div class="stat"><div class="stat-label">Recent observations</div><div class="mini-value" id="histObservations">192</div><div class="stat-sub">Resolver evaluations from retained RAM history</div></div><div class="stat"><div class="stat-label">Preferred endpoints</div><div class="mini-value" id="histPreferred">—</div><div class="stat-sub">Independently checked</div></div><div class="stat"><div class="stat-label">Live data source</div><div class="mini-value amber" style="font-size:18px">Live feed</div><div class="stat-sub">Volatile history; resets on reboot</div></div></div>
     <div class="section-head"><h3>Resolver health timeline</h3><div class="legend"><span><i class="square" style="background:#3e9b78"></i>Passed</span><span><i class="square" style="background:#e99969"></i>Failed</span><span><i class="square" style="background:#395058"></i>Unknown</span></div></div>
-    <div class="card"><div class="card-head"><div><div class="card-title">Historical policy outcomes</div><div class="card-sub">Click any interval to inspect the observation, or select a resolver card</div></div><span class="tag">Live timeline</span></div><div class="history-rows" id="fullHeat"></div><div class="timeline" id="histAxis"><span>24 hours ago</span><span>12 hours ago</span><span>Now</span></div></div>
-    <div class="section-head"><h3>Selected observation</h3></div>
-    <div class="card card-pad" id="selectedInterval"><div class="desc">Choose any colored interval in the timeline to inspect its sample result.</div></div>
+    <div class="card"><div class="card-head"><div><div class="card-title">Historical resolver evaluations</div><div class="card-sub">Select a 30-minute or 1-hour interval for exact check times and retained failure details</div></div><span class="tag">Live timeline</span></div><div class="history-rows" id="fullHeat"></div><div class="timeline" id="histAxis"><span>24 hours ago</span><span>12 hours ago</span><span>Now</span></div></div>
+    <div class="section-head"><h3>Selected interval details</h3></div>
+    <div class="card card-pad" id="selectedInterval" aria-live="polite"><div class="desc">Choose a timeline segment to see individual resolver evaluations, their exact completion times, and available policy-failure evidence.</div></div>
     <div class="section-head"><h3>Failover & recovery events</h3><div class="event-legend" aria-label="Event colours"><span><i style="--rg-legend:var(--green)"></i>Restored</span><span><i style="--rg-legend:var(--amber)"></i>Filtered / warning</span><span><i style="--rg-legend:var(--red)"></i>Backup / critical</span><span><i style="--rg-legend:var(--blue)"></i>Info</span></div></div>
     <div class="card"><div id="historyEvents" class="feed"></div></div>
   </section>
@@ -491,7 +492,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     return routerTimeLabel(event?.routerAt,short)||String(event?.at||'Unknown').replace('T',' ').replace(/Z$/,' UTC');
   }
   const since = v => {const d=Date.parse(v||'');if(!Number.isFinite(d))return 'No completed check';const sec=Math.max(0,Math.floor((Date.now()-d)/1000));return sec<60?sec+' seconds ago':Math.floor(sec/60)+' min ago';};
-  const state={tab:'overview',period:'24',snapshot:null,history:[],lastEnd:'',lastFetch:0,polling:false,feedConnected:false,historyPending:'',historyBaseline:'',historyAttempts:0,historyAdvanced:false,manualBusy:false,manualPolling:null,manualPreviousId:'',manualRequestedAt:0,manualRunId:'',config:null,configBusy:false,configFresh:false,configLoading:false,editingBackupId:''};
+  const state={tab:'overview',period:'24',snapshot:null,history:[],lastEnd:'',lastFetch:0,polling:false,feedConnected:false,historyPending:'',historyBaseline:'',historyAttempts:0,historyAdvanced:false,manualBusy:false,manualPolling:null,manualPreviousId:'',manualRequestedAt:0,manualRunId:'',config:null,configBusy:false,configFresh:false,configLoading:false,editingBackupId:'',historySelection:0,detailCache:null};
   const hasRealChecks = d => (d?.resolvers||[]).some(r => r.policyPass+r.policyFail>0);
   function isStale(d){if(!d?.lastEnd)return true;const ms=Date.parse(d.lastEnd);return !Number.isFinite(ms)||Date.now()-ms>Math.max(150000,(d.scheduleMinutes||1)*150000);}
   function pref(d){return (d?.resolvers||[]).filter(r=>/^wan[0-9]+$/.test(r.id));}
@@ -709,32 +710,40 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     $('eventFeed').innerHTML=ev.length?ev.map(e=>renderEvent(e,true)).join(''):'<div class="empty">No switching or recovery events recorded since this router boot.</div>';
     renderHeat('overviewHeat','24');
   }
+  // History bucket alignment must match the publisher's UTC half-hour/hour
+  // boundaries, not the viewing browser's current minute and seconds.
+  function historyWindow(period,now=Date.now()){
+    const step=(period==='24'?30:60)*60000;
+    const slots=period==='24'?48:168;
+    return {step,slots,origin:Math.floor(now/step)*step};
+  }
   function renderHeat(id,period){
-    const d=state.snapshot,r=pref(d),minutes=period==='24'?30:60,slots=period==='24'?48:168,now=Date.now();
+    const d=state.snapshot,r=pref(d),{step,slots,origin}=historyWindow(period),minutes=step/60000;
     $(id).innerHTML=r.length?r.map(res=>{
-      const bins=Array.from({length:slots},()=>({total:0,fail:0,unknown:0,at:''}));
+      const bins=Array.from({length:slots},()=>({total:0,fail:0,unknown:0}));
       for(const b of state.history){if(b.id!==res.id)continue;
         const ts=Date.parse(b.at);if(!Number.isFinite(ts))continue;
-        const age=Math.floor((now-ts)/(minutes*60000)),j=slots-1-age;
+        const age=(origin-Math.floor(ts/step)*step)/step,j=slots-1-age;
         if(j<0||j>=slots)continue;
-        bins[j].total+=Number(b.samples||0);bins[j].fail+=Number(b.failures||0);bins[j].unknown+=Number(b.unknowns||0);bins[j].at=b.at;
+        bins[j].total+=Number(b.samples||0);bins[j].fail+=Number(b.failures||0);bins[j].unknown+=Number(b.unknowns||0);
       }
       const passed=bins.reduce((a,b)=>a+Math.max(0,b.total-b.fail-b.unknown),0),total=bins.reduce((a,b)=>a+b.total,0);
       const current=bins[slots-1],currentCount=current.total;
-      const currentMessage=currentCount?`${currentCount} recorded check${currentCount===1?'':'s'} in current ${minutes}-minute segment`:`No checks recorded in current ${minutes}-minute segment`;
+      const currentMessage=currentCount?`${currentCount} resolver evaluation${currentCount===1?'':'s'} in current ${minutes}-minute segment`:`No resolver evaluations in current ${minutes}-minute segment`;
       const pending=!!state.historyPending;
       const caption=(total?Math.round(100*passed/total)+'% observed passes':'No observations')+' · '+currentMessage;
-      return `<div class="history-row"><div class="history-name"><strong>${esc(res.tls)} <span style="color:#7e9ca5;font-weight:400">${esc(res.id)}</span></strong><span class="history-live-count ${pending?'pending':''}" data-history-count="${esc(res.id)}" title="${esc(caption)}">${currentCount} checks / ${minutes} min${pending?' · syncing…':''}</span></div><div class="compact-heat">${bins.map((b,j)=>{
+      return `<div class="history-row"><div class="history-name"><strong>${esc(res.tls)} <span style="color:#7e9ca5;font-weight:400">${esc(res.id)}</span></strong><span class="history-live-count ${pending?'pending':''}" data-history-count="${esc(res.id)}" title="${esc(caption)}">${currentCount} evaluations / ${minutes} min${pending?' · syncing…':''}</span></div><div class="compact-heat">${bins.map((b,j)=>{
         const cls=b.total?(b.fail?'fail':b.unknown?'unknown':'ok'):'unknown';
         const currentCell=j===slots-1;
         const liveClass=currentCell?' is-current'+(state.historyAdvanced?' history-new':''):'';
-        const detail=b.total?`${b.total} observed check(s), ${b.fail} failures, ${b.unknown} unknown results`:'No sample in interval';
-        return `<button class="hcell ${cls}${liveClass}" data-bin="${j}" data-period="${period}" data-resolver="${esc(res.id)}" title="${esc(detail)}" aria-label="${esc(res.id)}, ${esc(detail)}"></button>`;
+        const detail=b.total?`${b.total} resolver evaluations, ${b.fail} failed, ${b.unknown} unknown`:'No evaluation in interval';
+        const bucketStart=new Date(origin-(slots-1-j)*step).toISOString();
+        return `<button class="hcell ${cls}${liveClass}" data-bin="${j}" data-period="${period}" data-resolver="${esc(res.id)}" data-start="${bucketStart}" title="${esc(detail)}" aria-label="${esc(res.id)}, ${esc(detail)}"></button>`;
       }).join('')}</div></div>`;
     }).join(''):'<div class="empty">No preferred resolver inventory yet.</div>';
   }
-  // Used only to decide whether a new completed cycle reached history.htm;
-  // the backend writes status.htm before history.htm, so the two can briefly differ.
+  // Preserve the normal aggregate feed for fast polling; detailed records are
+  // fetched on-demand only when the user selects an interval.
   function historySignature(rows){return rows.slice(-16).map(b=>[b.at,b.id,b.samples,b.failures,b.unknowns].join('|')).join('~');}
   function renderHistory(){
     const d=state.snapshot;
@@ -745,11 +754,68 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     const ev=(d?.events||[]).slice().reverse();
     $('historyEvents').innerHTML=ev.length?ev.map(e=>renderEvent(e)).join(''):'<div class="empty">No logged recovery/failover events since the current boot.</div>';
   }
-  function selectBin(id,period,index){
-    const minutes=period==='24'?30:60,slots=period==='24'?48:168,start=Date.now()-(slots-index)*minutes*60000,end=start+minutes*60000;
-    const relevant=state.history.filter(b=>b.id===id && Date.parse(b.at)>=start && Date.parse(b.at)<end);
-    const samples=relevant.reduce((a,b)=>a+Number(b.samples||0),0),fail=relevant.reduce((a,b)=>a+Number(b.failures||0),0),un=relevant.reduce((a,b)=>a+Number(b.unknowns||0),0);
-    $('selectedInterval').innerHTML=`<div class="eyebrow">Recorded historical interval</div><h3>${esc(id)} · ${new Date(start).toLocaleString()}</h3><p class="desc">${samples} observed check(s), ${fail} failed, ${un} unknown. ${samples===0?'No result was observed for this interval.':'Based on retained RAM history; no availability is inferred between checks.'}</p>`;
+  async function fetchHistoryDetails(){
+    if(state.detailCache?.lastEnd===state.lastEnd)return state.detailCache;
+    const urls=['/ext/ResolvGuard/history-records.htm','/ext/ResolvGuard/history-failures.htm'];
+    const rows=await Promise.all(urls.map(async url=>{
+      const response=await fetch(url+'?t='+Date.now(),{cache:'no-store',credentials:'same-origin'});
+      if(!response.ok)throw Error(url+' HTTP '+response.status);
+      return (await response.text()).split(/\r?\n/).filter(Boolean);
+    }));
+    const evaluations=[];
+    for(const line of rows[0]){
+      const [at,id,status,routerAt='']=line.split('|');
+      if(!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(at)||!/^wan[0-9]+$/.test(id)||!['ok','fail','unknown'].includes(status))continue;
+      evaluations.push({at,id,status,routerAt});
+    }
+    const failures=[];
+    for(const line of rows[1]){
+      const [cycleAt,at,routerAt,phase,id,qname,qtype,...reason]=line.split('|');
+      if(!/^\d{4}-/.test(cycleAt)||!/^\d{4}-/.test(at)||!/^\w[\w-]*$/.test(id)||!qname||!qtype||!reason.length)continue;
+      failures.push({cycleAt,at,routerAt,phase,id,qname,qtype,reason:reason.join('|')});
+    }
+    const data={lastEnd:state.lastEnd,evaluations,failures};state.detailCache=data;return data;
+  }
+  // Only use the router-provided local timestamp/offset for an exact local
+  // conversion; old records without one are explicitly labelled UTC.
+  function historyStamp(utc,routerAt){
+    if(!Number.isFinite(Date.parse(utc)))return 'Unknown time';
+    if(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4}$/.test(routerAt||''))return routerTimeLabel(routerAt);
+    return utc.slice(0,10)+' '+utc.slice(11,19)+' UTC';
+  }
+  function historyRange(start,end,reference){
+    const suffix=/([+-])(\d\d)(\d\d)$/.exec(reference||'');
+    if(!suffix)return `${new Date(start).toISOString().slice(0,16).replace('T',' ')} – ${new Date(end).toISOString().slice(11,16)} UTC`;
+    const direction=suffix[1]==='-'?-1:1;
+    const shift=direction*(Number(suffix[2])*60+Number(suffix[3]))*60000;
+    const a=new Date(start+shift).toISOString(),b=new Date(end+shift).toISOString();
+    return `${a.slice(0,16).replace('T',' ')} – ${b.slice(0,10)===a.slice(0,10)?b.slice(11,16):b.slice(0,16).replace('T',' ')} (router time)`;
+  }
+  async function selectBin(id,period,startStamp){
+    const start=Date.parse(startStamp),{step}=historyWindow(period),end=start+step;
+    if(!/^wan[0-9]+$/.test(id)||!Number.isFinite(start))return;
+    const selection=++state.historySelection;
+    const panel=$('selectedInterval');
+    panel.innerHTML=`<div class="eyebrow">Loading retained observations</div><h3>${esc(id)} · ${esc(startStamp)}</h3><p class="desc">Reading the router's completed-cycle history…</p>`;
+    try{
+      const data=await fetchHistoryDetails();if(selection!==state.historySelection)return;
+      const relevant=data.evaluations.filter(x=>x.id===id&&Date.parse(x.at)>=start&&Date.parse(x.at)<end).sort((a,b)=>Date.parse(a.at)-Date.parse(b.at));
+      const detail=data.failures.filter(x=>x.id===id&&Date.parse(x.cycleAt)>=start&&Date.parse(x.cycleAt)<end);
+      const failed=relevant.filter(x=>x.status==='fail').length,unknown=relevant.filter(x=>x.status==='unknown').length;
+      const passed=relevant.length-failed-unknown,reference=relevant.find(x=>routerTimeLabel(x.routerAt))?.routerAt||'';
+      const title=historyRange(start,end,reference);
+      const summary=`<div class="history-detail-summary"><div class="history-detail-stat"><strong>${relevant.length}</strong><span>Evaluations</span></div><div class="history-detail-stat"><strong>${passed}</strong><span>Passed</span></div><div class="history-detail-stat"><strong>${failed}</strong><span>Failed</span></div><div class="history-detail-stat"><strong>${unknown}</strong><span>Unknown</span></div></div>`;
+      const entries=relevant.map(x=>{
+        const diagnostics=detail.filter(y=>y.cycleAt===x.at);
+        const hasDetails=diagnostics.length>0;
+        const message=x.status==='fail'?(hasDetails?diagnostics.map(y=>`<div class="history-reason"><strong>${esc(y.qname)} · ${esc(y.qtype)}</strong> · ${esc(y.reason)}<div>${esc(historyStamp(y.at,y.routerAt))} · ${esc(y.phase)} probe</div></div>`).join(''):'Detailed policy failures were not retained for this older evaluation.')
+          :x.status==='ok'?'All configured DNS policy checks for this resolver passed during this completed evaluation.':'No conclusive result was recorded for this resolver.';
+        return `<details class="history-evaluation ${x.status}"><summary><span class="history-time">${esc(historyStamp(x.at,x.routerAt))}</span><span class="history-result">${x.status==='ok'?'PASS':x.status==='fail'?'FAIL':'UNKNOWN'}</span><span aria-hidden="true">⌄</span></summary><div class="history-reasons">${message}</div></details>`;
+      }).join('');
+      panel.innerHTML=`<div class="eyebrow">Recorded historical interval · ${esc(id)}</div><h3>${esc(title)}</h3>${summary}<div class="history-detail-heading">Individual completed-cycle results</div><div class="history-evaluations">${entries||'<div class="desc">No resolver evaluations were retained in this interval.</div>'}</div><p class="history-detail-note">Time labels use the router-local timestamp when retained, otherwise explicitly show UTC. Each row is one resolver evaluation at cycle completion, not an individual DNS query. Future recorded failures include individual policy names, types and reasons; previous diagnostics cannot be reconstructed. No availability is inferred between checks.</p>`;
+    }catch(e){if(selection!==state.historySelection)return;
+      panel.innerHTML=`<div class="eyebrow">Detailed history unavailable</div><h3>${esc(id)}</h3><p class="desc">Unable to read the router's per-cycle records: ${esc(e.message)}. The timeline summary is still available; install both updated source files and remount the WebUI for drill-down.</p>`;
+    }
   }
   function renderPaths(){
     const d=state.snapshot,rows=d?.exceptions||[];
@@ -772,6 +838,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
   async function refresh(){if(state.polling)return;state.polling=true;try{
       const d=await load('/ext/ResolvGuard/status.htm');
       const changed=!!d.lastEnd && d.lastEnd!==state.lastEnd;
+      if(changed)state.detailCache=null;
       const first=state.snapshot===null;
       state.snapshot=d;state.lastFetch=Date.now();state.feedConnected=true;
       $('feedStatus').textContent='ROUTER FEED · '+(isStale(d)?'STALE':'CONNECTED');
@@ -819,7 +886,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
   }
   document.addEventListener('click',e=>{
     const t=e.target.closest('[data-tab]');if(t){tab(t.dataset.tab);return;}
-    const b=e.target.closest('[data-bin]');if(b){tab('history');selectBin(b.dataset.resolver,b.dataset.period,Number(b.dataset.bin));$('selectedInterval').scrollIntoView({behavior:'smooth',block:'center'});return;}
+    const b=e.target.closest('[data-bin]');if(b){tab('history');selectBin(b.dataset.resolver,b.dataset.period,b.dataset.start);$('selectedInterval').scrollIntoView({behavior:'smooth',block:'center'});return;}
     const r=e.target.closest('[data-resolver]');if(r)openInspector(r.dataset.resolver);
   });
   // A real manual health check uses the native ASUS authentication/session and
