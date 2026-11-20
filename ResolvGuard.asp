@@ -390,7 +390,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     <div class="hero" id="hero"><div><div class="hero-kicker"><span class="dot" id="heroDot"></span><span id="heroKicker">Monitoring status unknown</span></div><h2 id="heroHeading">Connecting to ResolvGuard…</h2><p id="heroText">Waiting for a completed scheduled DNS health check.</p><div class="hero-meta"><span id="poolPill">Active pool: unknown</span><span id="modePill">Mode unknown</span></div></div>
       <div class="heartbeat no-signal" id="heartbeat"><div class="heart-ring" id="heartRing"><svg viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M32 54C19 45 9 36 9 23a12 12 0 0 1 22-6 12 12 0 0 1 22 6c0 13-10 22-21 31Z"/><path d="M16 30h10l5-11 7 22 5-11h5"/></svg></div><div class="heart-copy"><div class="heart-detail" id="heartLabel">Awaiting checks</div><small id="heartSub">Waiting for scheduled check</small></div><svg class="ecg" id="ecgWave" viewBox="0 0 185 35" aria-hidden="true" focusable="false"><path id="ecgTrace" class="ecg-trace" d="M0 17.5 H185" /><circle id="ecgTurn" class="ecg-turn" cx="183" cy="17.5" r="2.4" opacity="0" /></svg></div>
     </div>
-    <div class="note hidden" id="unboundOverviewNotice" role="status" style="margin-top:12px"><strong>Recursive Unbound is the configured LAN DNS path.</strong> DoT checks are separate; ResolvGuard WAN failover does not protect Unbound.</div>
+    <div class="note hidden" id="unboundOverviewNotice" role="status" style="margin-top:12px"><strong>Recursive Unbound currently handles LAN DNS.</strong> ResolvGuard's DoT checks are separate, and WAN failover is disabled in recursive mode. To use ResolvGuard's DoT failover, select Unbound Manager's <strong>Integrate with Stubby</strong> option.</div>
     <div class="section-head"><h3 id="overviewMetricsHeading">Network health at a glance</h3><div class="hint">Scheduled monitoring · Manual checks are independent</div></div>
     <div class="stats">
       <div class="stat"><div class="stat-label">Preferred resolvers</div><div class="stat-val green" id="statResolvers">—</div><div class="stat-sub" id="statResolversSub">Reachable and policy-compliant</div></div>
@@ -436,7 +436,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
         <div class="path-node" id="pathWanNode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c-4 5-4 13 0 18M12 3c4 5 4 13 0 18"/></svg><strong id="pathWanName">WAN pool</strong><small id="pathWanDetail">Membership unknown</small></div>
       </div>
       <div class="path-verification" id="pathVerification" aria-live="polite"></div>
-      <div class="card-pad hidden" id="unboundPathNotice" style="padding-top:0" role="status"><div class="note">DoT monitoring is separate. ResolvGuard WAN failover does not protect recursive Unbound.</div></div>
+      <div class="card-pad hidden" id="unboundPathNotice" style="padding-top:0" role="status"><div class="note">WAN failover is disabled in recursive mode. To use ResolvGuard's monitored DoT path, select Unbound Manager's <strong>Integrate with Stubby</strong> option.</div></div>
       <div class="card-pad" style="padding-top:0"><div class="note">These checks verify configuration, not actual LAN query traffic.</div></div>
     </div>
     <div class="section-head"><h3>Domain-scoped exceptions</h3><span class="small-pill" id="pathExceptionCount">Checking…</span></div>
@@ -706,7 +706,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     $('heroDot').style.background=s.status==='healthy'?'var(--green)':s.status==='degraded'?'var(--amber)':s.status==='backup'?'var(--red)':'var(--muted)';
     $('hero').style.borderColor=s.status==='healthy'?'#29564b':s.status==='degraded'?'#86633b':s.status==='backup'?'#955355':'#395058';
     $('poolPill').textContent=(recursive?'WAN pool: ':'Active pool: ')+(d?.pool||'unknown');
-    $('modePill').textContent=recursive?'WAN failover does not protect Unbound':(({'monitoring':'Monitoring Only','automatic':'Auto Failover configured','inactive':'Monitoring inactive','hold':'Policy safety hold'})[d?.mode]||'Unknown mode');
+    $('modePill').textContent=recursive?'WAN failover disabled in recursive mode':(({'monitoring':'Monitoring Only','automatic':'Auto Failover configured','inactive':'Monitoring inactive','hold':'Policy safety hold'})[d?.mode]||'Unknown mode');
     $('heartLabel').textContent=s.status==='healthy'?'Check complete · Healthy':s.status==='degraded'?'Check complete · Degraded':s.status==='backup'?'Check complete · Backup active':'Awaiting reliable check';
     if(recursive&&(s.status==='healthy'||s.status==='degraded'))$('heartLabel').textContent='DoT check complete · '+(s.status==='healthy'?'Healthy':'Degraded');
     $('heartSub').textContent=d?.lastEnd?'Last completed '+(routerTimeLabel(d.lastEndRouter)||String(d.lastEnd).replace('T',' ').replace(/Z$/,' UTC')):'No completed cycle recorded';
