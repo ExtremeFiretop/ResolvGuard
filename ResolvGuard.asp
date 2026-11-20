@@ -421,13 +421,13 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
       <div class="path-node"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="2" width="18" height="8" rx="2"/><rect x="3" y="14" width="18" height="8" rx="2"/><path d="M7 6h.01M7 18h.01"/></svg><strong>DNSMasq</strong><small>Local DNS</small></div><div class="flow-arrow">→</div>
       <div class="path-node"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2 4 5v6c0 5 3.5 9 8 11 4.5-2 8-6 8-11V5l-8-3Z"/><path d="M9 12l2 2 4-4"/></svg><strong>Stubby</strong><small>Authenticated TLS</small></div><div class="flow-arrow">→</div>
       <div class="path-node"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c-4 5-4 13 0 18M12 3c4 5 4 13 0 18"/></svg><strong>DoT upstream</strong><small>TCP port 853</small></div>
-    </div><div class="card-pad" style="padding-top:0"><div class="note">ResolvGuard separately queries resolvers through direct authenticated DoT for independent health assessments. Those intentional probes do not use production Stubby.</div></div></div>
+    </div><div class="card-pad" style="padding-top:0"><div class="note">ResolvGuard separately queries resolvers through direct authenticated DoT for independent health assessments. Those intentional probes do not use the production Stubby instance to avoid disruptions.</div></div></div>
     <div class="section-head"><h3>Configured Stubby-bypass exceptions</h3><span class="warn-pill">Bypass warning from Quick Setup</span></div>
-    <div class="card"><div class="card-head"><div><div class="card-title">Domain-scoped DNSMasq upstream rules</div><div class="card-sub">From <code>/tmp/resolv.dnsmasq</code> via <code>server=/domain/IP</code></div></div><div id="exceptionList"></div><div class="card-pad" style="padding-top:9px"><p class="desc">Read-only results from the same DNSMasq upstream file used by the installer warning. Not a complete audit of LAN device traffic.</p></div></div>
+    <div class="card"><div class="card-head"><div><div class="card-title">Domain-scoped DNSMasq upstream rules</div><div class="card-sub">From <code>/tmp/resolv.dnsmasq</code> via <code>server=/domain/IP</code></div></div><div id="exceptionList"></div><div class="card-pad" style="padding-top:9px"><p class="desc">Read-only results from the same DNSMasq upstream file used by the installer warning.</p></div></div>
   </section>
   <section id="backups" class="tab">
     <div class="section-head" style="margin-top:0"><h3>Backup &amp; Alternate Resolvers</h3><span class="hint">ResolvGuard-managed encrypted DNS backups</span></div>
-    <div class="note rg-config-note">Primary/preferred DNS is configured through <strong>ASUS WAN → DNS Privacy</strong>, not here. These backup endpoints are used only according to ResolvGuard's verified failover policy. Editing backup configuration may require renewed policy approval.</div>
+    <div class="note rg-config-note">Primary/preferred DNS is configured through <strong>ASUS WAN → DNS Privacy</strong>, not here. These backup endpoints are used only according to ResolvGuard's approved failover policy. Editing backup configuration may require renewed policy approval.</div>
     <div class="card" style="margin-top:16px">
       <div class="card-head"><div><div class="card-title">Configured backup resolvers</div><div class="card-sub">Configured endpoints are not assumed healthy until independently checked</div></div><div style="display:flex;gap:8px;flex-wrap:wrap"><span class="small-pill" id="backupPoolState">Pool: unknown</span><span class="small-pill" id="backupCount">—</span></div></div>
       <div id="backupRows"><div class="empty">Loading configuration…</div></div>
@@ -450,15 +450,15 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     </div>
   </section>
   <section id="settings" class="tab">
-    <div class="section-head" style="margin-top:0"><h3>ResolvGuard settings</h3><span class="hint">Configuration saved through authenticated ASUS service actions</span></div>
-    <div class="note rg-config-note">These settings govern ResolvGuard's monitoring behavior. Preferred WAN resolvers, DNS Privacy settings, and automatic failover authorization are <strong>not edited here</strong>. Those retain their existing ASUS and SSH approval workflows.</div>
+    <div class="section-head" style="margin-top:0"><h3>ResolvGuard settings</h3></div>
+    <div class="note rg-config-note">These settings govern ResolvGuard's monitoring behavior.</div>
     <div class="card" style="margin-top:16px">
       <div class="card-head"><div><div class="card-title">Monitoring &amp; health-check parameters</div><div class="card-sub" id="settingsSummary">Loading saved configuration…</div></div></div>
       <div id="settingsRows"></div>
     </div>
   </section>
   <div class="rg-configuration-status" id="configFeedback" role="status" aria-live="polite" hidden></div>
-  <footer class="footer"><span>ResolvGuard dashboard · Authenticated backup/settings changes · No WAN DNS writes</span><span>Heartbeat follows completed scheduled cycles · History stored in /tmp</span></footer>
+  <footer class="footer"><span>ResolvGuard dashboard · By ExtremeFiretop</span><span>Heartbeat follows completed scheduled cycles · History stored in /tmp</span></footer>
 </main>
 </div>
 <div id="inspectBackdrop" class="inspector-backdrop" tabindex="-1"></div>
@@ -810,7 +810,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
           :x.status==='ok'?'All configured DNS policy checks for this resolver passed during this completed evaluation.':'No conclusive result was recorded for this resolver.';
         return `<details class="history-evaluation ${x.status}"><summary><span class="history-time">${esc(historyStamp(x.at,x.routerAt))}</span><span class="history-result">${x.status==='ok'?'PASS':x.status==='fail'?'FAIL':'UNKNOWN'}</span><span aria-hidden="true">⌄</span></summary><div class="history-reasons">${message}</div></details>`;
       }).join('');
-      panel.innerHTML=`<div class="eyebrow">Recorded historical interval · ${esc(id)}</div><h3>${esc(title)}</h3>${summary}<div class="history-detail-heading">Individual completed-cycle results</div><div class="history-evaluations">${entries||'<div class="desc">No resolver evaluations were retained in this interval.</div>'}</div><p class="history-detail-note">Times use the router's clock, not the browser's. Older records without a saved local timestamp use the router's latest known offset; their displayed hour may be approximate across daylight-saving changes. Each row is a completed resolver evaluation, not an individual DNS query. Missing historical policy details cannot be reconstructed. No availability is inferred between checks.</p>`;
+      panel.innerHTML=`<div class="eyebrow">Recorded historical interval · ${esc(id)}</div><h3>${esc(title)}</h3>${summary}<div class="history-detail-heading">Individual completed-cycle results</div><div class="history-evaluations">${entries||'<div class="desc">No resolver evaluations were retained in this interval.</div>'}</div><p class="history-detail-note">Each row is a completed resolver evaluation, not an individual DNS query. Missing historical policy details cannot be reconstructed.</p>`;
     }catch(e){if(selection!==state.historySelection)return;
       panel.innerHTML=`<div class="eyebrow">Detailed history unavailable</div><h3>${esc(id)}</h3><p class="desc">Unable to read the router's per-cycle records: ${esc(e.message)}. The timeline summary is still available; install both updated source files and remount the WebUI for drill-down.</p>`;
     }
@@ -819,7 +819,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     const d=state.snapshot,rows=d?.exceptions||[];
     $('exceptionList').innerHTML=!d||!d.exceptionsReadable?'<div class="empty">DNSMasq upstream file is not available to the snapshot collector. Exceptions cannot be assessed.</div>':
       rows.length?rows.map(r=>`<div class="exception"><div><div class="muted">Matching domain scope</div><strong>${esc(r.domain)}</strong></div><div><div class="muted">Configured upstream</div><code>${esc(r.upstream)}</code></div><span class="warn-pill">Bypasses Stubby</span></div>`).join(''):
-      '<div class="empty"><strong>No domain-scoped rules reported</strong>No matching DNSMasq exceptions found in the current readable upstream file. This does not establish that LAN devices cannot use other DNS paths.</div>';
+      '<div class="empty"><strong>No domain-scoped rules reported</strong>No matching DNSMasq exceptions found in the current readable upstream file.</div>';
   }
   function openInspector(id){const d=state.snapshot,r=(d?.activeResolvers||[]).find(x=>x.id===id)||(d?.resolvers||[]).find(x=>x.id===id);if(!r)return;
     $('inspectContent').innerHTML=`<h2>${esc(r.tls||r.id)} · ${esc(r.id)}</h2><p class="desc">Latest completed scheduled observation</p><div class="inspect-field"><span>Status</span><strong>${r.state==='ok'?'PASS':r.state==='fail'?'FAIL':'NOT OBSERVED'}</strong></div><div class="inspect-field"><span>DNS address</span><strong>${esc(r.ip)}:${esc(r.port)}</strong></div><div class="inspect-field"><span>TLS authentication</span><strong>${esc(r.tls)}</strong></div><div class="inspect-field"><span>Passed policy records</span><strong>${Number(r.policyPass||0)}</strong></div><div class="inspect-field"><span>Failed policy records</span><strong>${Number(r.policyFail||0)}</strong></div><p class="desc" style="margin-top:24px">The totals include repeated fast-confirmation probes where applicable. They are not unique DNS-policy counts.</p>`;
@@ -831,7 +831,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     }
   }
   function closeInspector(){$('inspectBackdrop').classList.remove('open');$('inspector').classList.remove('open');$('inspector').setAttribute('aria-hidden','true');}
-  function tab(name){state.tab=name;waveform.setVisible(name==='overview');syncWaveSignal(state.snapshot,state.feedConnected);document.querySelectorAll('[data-tab]').forEach(el=>{const active=el.dataset.tab===name;el.classList.toggle('active',active);});document.querySelectorAll('.tab').forEach(el=>el.classList.toggle('active',el.id===name));const m={overview:['Dashboard overview','Your DNS reliability, clearly visible.'],history:['Health history','Observed DNS reliability from volatile history.'],paths:['DNS paths & exceptions','Inspect DNSMasq domain-scoped Stubby bypasses.'],backups:['Backup & alternate resolvers','Manage ResolvGuard backup DoT endpoints, not ASUS WAN primary DNS.'],settings:['ResolvGuard settings','Configure monitoring thresholds and timing using Merlin authentication.']}[name];$('pageTitle').textContent=m[0];$('pageDesc').textContent=m[1];if(name==='history')renderHistory();if(name==='paths')renderPaths();if(name==='settings'||name==='backups')loadConfig();}
+  function tab(name){state.tab=name;waveform.setVisible(name==='overview');syncWaveSignal(state.snapshot,state.feedConnected);document.querySelectorAll('[data-tab]').forEach(el=>{const active=el.dataset.tab===name;el.classList.toggle('active',active);});document.querySelectorAll('.tab').forEach(el=>el.classList.toggle('active',el.id===name));const m={overview:['Dashboard overview','Your DNS reliability, clearly visible.'],history:['Health history','Observed DNS reliability'],paths:['DNS paths & exceptions','Inspect DNSMasq domain-scoped Stubby bypasses.'],backups:['Backup & alternate resolvers','Manage ResolvGuard backup DoT endpoints.'],settings:['ResolvGuard settings','Configure monitoring thresholds and timing using TLS authentication.']}[name];$('pageTitle').textContent=m[0];$('pageDesc').textContent=m[1];if(name==='history')renderHistory();if(name==='paths')renderPaths();if(name==='settings'||name==='backups')loadConfig();}
   async function load(url){const response=await fetch(url+'?t='+Date.now(),{cache:'no-store',credentials:'same-origin'});if(!response.ok)throw Error('HTTP '+response.status);const d=JSON.parse(await response.text());if(d.schema!==1)throw Error('Unsupported feed schema');return d;}
   async function refresh(){if(state.polling)return;state.polling=true;try{
       const d=await load('/ext/ResolvGuard/status.htm');
@@ -1005,7 +1005,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     $('backupCount').textContent=rs.length+' configured';
     $('backupPoolState').textContent='Active pool: '+(state.snapshot?.pool||'unknown');
     const groups=new Map();for(const r of rs){const key=r.tls+':'+r.port;if(!groups.has(key))groups.set(key,[]);groups.get(key).push(r.id);}
-    $('backupGroups').innerHTML='<div class="card-title">Candidate alternate groups</div><p class="desc">Grouped by identical TLS hostname and port. These are configuration candidates, not proof of successful health checks.</p>'+
+    $('backupGroups').innerHTML='<div class="card-title">Candidate alternate groups</div><p class="desc">Grouped by identical TLS hostname and port.</p>'+
       (groups.size?[...groups].map(([key,ids])=>`<div class="rg-backup-info" style="padding:8px 0"><strong>${esc(key)}</strong><small>${esc(ids.join(', '))}</small></div>`).join(''):'<p class="desc">No alternate resolver groups configured.</p>');
     $('backupRows').innerHTML=rs.length?rs.map(r=>`<div class="rg-backup-row"><div class="rg-backup-info"><strong>${esc(r.id)} · ${esc(r.tls)}</strong><small>${esc(r.ip)}:${Number(r.port)} · Configured backup · Not automatically health-verified</small></div><div class="rg-actions" style="margin-top:0"><button type="button" class="btn rg-backup-edit" data-id="${esc(r.id)}">Edit</button><button type="button" class="btn rg-backup-delete" data-id="${esc(r.id)}">Remove</button></div></div>`).join(''):'<div class="empty">No ResolvGuard backup endpoints configured. Preferred WAN resolvers are managed in ASUS WAN settings.</div>';
     syncConfigControls();
