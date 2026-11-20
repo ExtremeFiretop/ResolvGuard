@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.2
-readonly SCRIPT_VERSTAG="26112008"
+readonly SCRIPT_VERSTAG="26112009"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -2442,7 +2442,147 @@ _MarkDNSRecoveryHold_() {
   }
 }
 
+# Unbound Manager path hints are read-only. Presence/configuration is not
+# proof of a live LAN DNS query, and never authorizes DNS switching.
+# Resolve Unbound includes in place. Never execute configuration content.
+# Bound the number, depth and total size of files read from the router.
+unbound_expand() {
+  local file depth line trimmed path child matched bytes
+  file=$1;depth=$2
+  [ "$depth" -le 8 ] && [ -f "$file" ] && [ ! -L "$file" ] && [ -r "$file" ] || return 1
+  case "|$RG_UNBOUND_SEEN|" in *"|$file|"*) return 1 ;; esac
+  RG_UNBOUND_SEEN="$RG_UNBOUND_SEEN|$file"
+  RG_UNBOUND_FILES=$((RG_UNBOUND_FILES + 1))
+  [ "$RG_UNBOUND_FILES" -le 32 ] || return 1
+  bytes=$(wc -c < "$file") || return 1
+  RG_UNBOUND_BYTES=$((RG_UNBOUND_BYTES + bytes))
+  [ "$RG_UNBOUND_BYTES" -le 1048576 ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    trimmed=${line#"${line%%[![:space:]]*}"}
+    case "$trimmed" in
+      include:*|include-toplevel:*)
+        case "$trimmed" in include-toplevel:*) printf 'RG-TOP-RESET:\n' ;; esac
+        path=${trimmed#*:};path=${path%%#*}
+        path=$(printf '%s' "$path" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        case "$path" in
+          \"*\") path=${path#\"};path=${path%\"} ;;
+          \'*\') path=${path#\'};path=${path%\'} ;;
+        esac
+        # Absolute paths and simple globs only. Ambiguous paths fail closed.
+        case "$path" in /*) : ;; *) return 1 ;; esac
+        case "$path" in *..*|*[!A-Za-z0-9_./*-]*) return 1 ;; esac
+        matched=0
+        for child in $path; do
+          [ -f "$child" ] || return 1
+          unbound_expand "$child" "$((depth + 1))" || return 1
+          matched=1
+        done
+        [ "$matched" -eq 1 ] || return 1
+        ;;
+      *) printf '%s\n' "$line" ;;
+    esac
+  done < "$file"
+}
+unbound_path() {
+  local config main marker present running port route upstream expanded
+  config=${RG_WEBUI_UNBOUND_CONFIG:-/opt/var/lib/unbound/unbound.conf}
+  marker=${RG_WEBUI_UNBOUND_MARKER:-/jffs/addons/unbound/unbound.postconf}
+  main=${RG_WEBUI_DNSMASQ_MAIN:-$DNSMASQ_MAIN}
+  present=false;running=false;port=unknown;route=none;upstream=unknown
+  if { [ -f "$config" ] && [ ! -L "$config" ]; } ||
+     { [ -f "$marker" ] && [ ! -L "$marker" ]; }; then
+    present=true
+  fi
+  if pidof unbound >/dev/null 2>&1; then
+    present=true;running=true
+  fi
+  if [ -f "$config" ] && [ ! -L "$config" ] && [ -r "$config" ]; then
+    port=$(LC_ALL=C awk '
+      /^[[:space:]]*#/ {next}
+      { line=$0; sub(/[[:space:]]+#.*$/, "", line)
+        if (line ~ /^[[:space:]]*port:[[:space:]]*[0-9]+[[:space:]]*$/) {
+          sub(/^.*port:[[:space:]]*/, "", line)
+          sub(/[[:space:]]*$/, "", line)
+          if (line=="53" || line=="53535") {print line; exit}
+        }
+      }
+    ' "$config")
+    [ -n "$port" ] || port=unknown
+    RG_UNBOUND_SEEN='';RG_UNBOUND_FILES=0;RG_UNBOUND_BYTES=0
+    if expanded=$(unbound_expand "$config" 0); then
+      upstream=$(printf '%s\n' "$expanded" | LC_ALL=C awk '
+        function finish_zone() {
+          if (zone && root) {
+            roots++
+            if (addresses + hosts > 0) configured++
+            if (addresses == 1 && stubby == 1 && hosts == 0 && !fallback) verified++
+          }
+          zone=0;root=0;addresses=0;stubby=0;hosts=0;fallback=0
+        }
+        /^[[:space:]]*#/ {next}
+        {
+          line=$0;sub(/[[:space:]]+#.*$/, "", line)
+          if (line ~ /^forward-zone:[[:space:]]*$/) {finish_zone();zone=1;next}
+          if (line ~ /^[^[:space:]]/ && zone) finish_zone()
+          if (!zone) next
+          if (line ~ /^[[:space:]]*name:[[:space:]]*/) {
+            name=line;sub(/^[[:space:]]*name:[[:space:]]*/, "", name)
+            sub(/[[:space:]]*$/, "", name)
+            if (name=="\".\"" || name=="." || name=="'.'") root=1
+          }
+          if (line ~ /^[[:space:]]*forward-addr:[[:space:]]*/) {
+            addr=line;sub(/^[[:space:]]*forward-addr:[[:space:]]*/, "", addr)
+            sub(/[[:space:]]*$/, "", addr)
+            addresses++
+            if (addr=="127.0.1.1@53") stubby++
+          }
+          if (line ~ /^[[:space:]]*forward-host:[[:space:]]*/) hosts++
+          if (line ~ /^[[:space:]]*forward-first:[[:space:]]*yes[[:space:]]*$/) fallback=1
+        }
+        END {
+          finish_zone()
+          if (roots==0) print "recursive"
+          else if (roots==1 && verified==1) print "stubby"
+          else if (roots==1 && configured==1) print "other"
+          else print "unknown"
+        }
+      ')
+    else
+      upstream=unknown
+    fi
+  fi
+  # These describe DNSMasq / Unbound configuration, not verified traffic.
+  if [ -f "$main" ] && [ ! -L "$main" ] && [ -r "$main" ]; then
+    if grep -Eq '^[[:space:]]*server=127\.0\.0\.1#53535[[:space:]]*$' "$main"; then
+      route=dnsmasq
+    elif [ "$port" = 53 ] &&
+         grep -Eq '^[[:space:]]*port=0[[:space:]]*$' "$main"; then
+      route=direct
+    fi
+  fi
+  printf '%s|%s|%s|%s|%s\n' "$present" "$running" "$port" "$route" "$upstream"
+}
+
+# Treat recursive Unbound as monitoring-only. This inspects configuration,
+# never modifies Unbound or tests client DNS traffic.
+_RecursiveUnboundProduction_() {
+  local info present running port route upstream
+  info="$(unbound_path)" || return 1
+  IFS='|' read -r present running port route upstream <<EOF_RG_UNBOUND_MODE
+$info
+EOF_RG_UNBOUND_MODE
+  [ "$present" = true ] || return 1
+  case "$route:$upstream" in
+    dnsmasq:recursive|direct:recursive) return 0 ;;
+  esac
+  return 1
+}
+
 _CheckLiveSwitchSafety_() {
+  if _RecursiveUnboundProduction_; then
+    _Fail_ 'WAN failover disabled in recursive Unbound mode; use Unbound Manager Integrate with Stubby'
+    return 1
+  fi
   [ "$(_ReadNVRAM_ dnspriv_enable)" = 1 ] || { _Fail_ 'DNS Privacy disabled; refusing WAN switch'; return 1; }
   [ -r "$PREF_RULELIST" ] && [ -r "$PREF_PROVIDERS" ] || { _Fail_ 'No preferred snapshot; run enroll first'; return 1; }
   if ! _ValidatePreferredSnapshot_; then
@@ -2469,7 +2609,12 @@ _CheckAutomaticRecoveryAuthorization_() {
 }
 
 _CheckAutomaticFailoverAuthorization_() {
-  _CheckAutomaticRecoveryAuthorization_ && _CheckPolicyAuthorization_
+  _CheckAutomaticRecoveryAuthorization_ || return 1
+  if _RecursiveUnboundProduction_; then
+    _Say_ 'AUTOMATIC SWITCHING DISABLED: recursive Unbound uses Monitoring Only.'
+    return 1
+  fi
+  _CheckPolicyAuthorization_
 }
 
 # Transport-level local DNS response, not an upstream policy decision.
@@ -4345,6 +4490,10 @@ _EnableScheduledMonitoring_() {
 _EnableAutomaticFailover_() {
   local approval_status staged view
   view="${1:-detail}"
+  if _RecursiveUnboundProduction_; then
+    _Fail_ 'WAN failover is disabled in recursive Unbound mode. Use Monitoring Only or enable Unbound Manager Integrate with Stubby.'
+    return 1
+  fi
   [ ! -e "$PENDING_TRANSACTION" ] && [ ! -e "$RECOVERY_HOLD" ] || {
     _Fail_ 'Unresolved recovery state; automatic switching blocked'; return 1; }
   _SyncPreferredWAN_ || return 1
@@ -4387,8 +4536,9 @@ _EnableAutomaticFailover_() {
   (
     trap '_ReleaseWANLock_ >/dev/null 2>&1 || :' EXIT HUP INT TERM
     [ ! -e "$PENDING_TRANSACTION" ] && [ ! -e "$RECOVERY_HOLD" ] &&
-      [ "$(_GetActiveWANPool_ 2>/dev/null)" = preferred ] && _CheckPolicyAuthorization_ || {
-        _Fail_ 'WAN/policy changed during authorization'; exit 1; }
+      [ "$(_GetActiveWANPool_ 2>/dev/null)" = preferred ] &&
+      ! _RecursiveUnboundProduction_ && _CheckPolicyAuthorization_ || {
+        _Fail_ 'WAN/policy or Unbound mode changed during authorization'; exit 1; }
     [ ! -L "$AUTO_FAILOVER_MARKER" ] || { _Fail_ 'Unsafe authorization marker'; exit 1; }
     failures=0; recoveries=0
     _WriteMonitoringState_ || { _Fail_ 'Unable to reset monitoring counters'; exit 1; }
@@ -4869,9 +5019,13 @@ _RGWebConfig_() (
         printf '%s' "$rg_sep"; rg_quote "$rg_key"; printf ':'; printf '%s' "$rg_value"
         rg_sep=,
       done
+      rg_recursive=false
+      if _RecursiveUnboundProduction_; then rg_recursive=true; fi
+      rg_auto=false
+      if [ "$rg_recursive" = false ] && [ -f "$AUTO_FAILOVER_MARKER" ] && [ ! -L "$AUTO_FAILOVER_MARKER" ]; then rg_auto=true; fi
       printf '},"monitoringEnabled":%s,"autoFailoverEnabled":%s,"requiresPolicyReview":%s,' \
         "$( [ -f "$SCHEDULE_MARKER" ] && [ ! -L "$SCHEDULE_MARKER" ] && printf true || printf false )" \
-        "$( [ -f "$AUTO_FAILOVER_MARKER" ] && [ ! -L "$AUTO_FAILOVER_MARKER" ] && printf true || printf false )" \
+        "$rg_auto" \
         "$( [ -f "$AUTO_FAILOVER_MARKER" ] && [ ! -L "$AUTO_FAILOVER_MARKER" ] && printf true || printf false )"
       printf '"backups":['
       rg_sep=''
@@ -5132,6 +5286,7 @@ _RGWebUI_() (
   mode_name() {
     if [ ! -f "$RG_ROOT/state/monitoring-enabled" ]; then printf inactive
     elif [ ! -f "$RG_ROOT/state/automatic-failover-enabled" ]; then printf monitoring
+    elif _RecursiveUnboundProduction_; then printf monitoring
     elif [ ! -f "$RG_ROOT/state/policy-approval" ]; then printf hold
     else printf automatic; fi
   }
@@ -5153,126 +5308,7 @@ _RGWebUI_() (
       }
     ' "$RG_SERVERS"
   }
-  # Unbound Manager path hints are read-only. Presence/configuration is not
-  # proof of a live LAN DNS query, and never authorizes DNS switching.
-  # Resolve Unbound includes in place. Never execute configuration content.
-  # Bound the number, depth and total size of files read from the router.
-  unbound_expand() {
-    local file depth line trimmed path child matched bytes
-    file=$1;depth=$2
-    [ "$depth" -le 8 ] && [ -f "$file" ] && [ ! -L "$file" ] && [ -r "$file" ] || return 1
-    case "|$RG_UNBOUND_SEEN|" in *"|$file|"*) return 1 ;; esac
-    RG_UNBOUND_SEEN="$RG_UNBOUND_SEEN|$file"
-    RG_UNBOUND_FILES=$((RG_UNBOUND_FILES + 1))
-    [ "$RG_UNBOUND_FILES" -le 32 ] || return 1
-    bytes=$(wc -c < "$file") || return 1
-    RG_UNBOUND_BYTES=$((RG_UNBOUND_BYTES + bytes))
-    [ "$RG_UNBOUND_BYTES" -le 1048576 ] || return 1
-    while IFS= read -r line || [ -n "$line" ]; do
-      trimmed=${line#"${line%%[![:space:]]*}"}
-      case "$trimmed" in
-        include:*|include-toplevel:*)
-          case "$trimmed" in include-toplevel:*) printf 'RG-TOP-RESET:\n' ;; esac
-          path=${trimmed#*:};path=${path%%#*}
-          path=$(printf '%s' "$path" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-          case "$path" in
-            \"*\") path=${path#\"};path=${path%\"} ;;
-            \'*\') path=${path#\'};path=${path%\'} ;;
-          esac
-          # Absolute paths and simple globs only. Ambiguous paths fail closed.
-          case "$path" in /*) : ;; *) return 1 ;; esac
-          case "$path" in *..*|*[!A-Za-z0-9_./*-]*) return 1 ;; esac
-          matched=0
-          for child in $path; do
-            [ -f "$child" ] || return 1
-            unbound_expand "$child" "$((depth + 1))" || return 1
-            matched=1
-          done
-          [ "$matched" -eq 1 ] || return 1
-          ;;
-        *) printf '%s\n' "$line" ;;
-      esac
-    done < "$file"
-  }
-  unbound_path() {
-    local config main marker present running port route upstream expanded
-    config=${RG_WEBUI_UNBOUND_CONFIG:-/opt/var/lib/unbound/unbound.conf}
-    marker=${RG_WEBUI_UNBOUND_MARKER:-/jffs/addons/unbound/unbound.postconf}
-    main=${RG_WEBUI_DNSMASQ_MAIN:-$DNSMASQ_MAIN}
-    present=false;running=false;port=unknown;route=none;upstream=unknown
-    if { [ -f "$config" ] && [ ! -L "$config" ]; } ||
-       { [ -f "$marker" ] && [ ! -L "$marker" ]; }; then
-      present=true
-    fi
-    if pidof unbound >/dev/null 2>&1; then
-      present=true;running=true
-    fi
-    if [ -f "$config" ] && [ ! -L "$config" ] && [ -r "$config" ]; then
-      port=$(LC_ALL=C awk '
-        /^[[:space:]]*#/ {next}
-        { line=$0; sub(/[[:space:]]+#.*$/, "", line)
-          if (line ~ /^[[:space:]]*port:[[:space:]]*[0-9]+[[:space:]]*$/) {
-            sub(/^.*port:[[:space:]]*/, "", line)
-            sub(/[[:space:]]*$/, "", line)
-            if (line=="53" || line=="53535") {print line; exit}
-          }
-        }
-      ' "$config")
-      [ -n "$port" ] || port=unknown
-      RG_UNBOUND_SEEN='';RG_UNBOUND_FILES=0;RG_UNBOUND_BYTES=0
-      if expanded=$(unbound_expand "$config" 0); then
-        upstream=$(printf '%s\n' "$expanded" | LC_ALL=C awk '
-          function finish_zone() {
-            if (zone && root) {
-              roots++
-              if (addresses + hosts > 0) configured++
-              if (addresses == 1 && stubby == 1 && hosts == 0 && !fallback) verified++
-            }
-            zone=0;root=0;addresses=0;stubby=0;hosts=0;fallback=0
-          }
-          /^[[:space:]]*#/ {next}
-          {
-            line=$0;sub(/[[:space:]]+#.*$/, "", line)
-            if (line ~ /^forward-zone:[[:space:]]*$/) {finish_zone();zone=1;next}
-            if (line ~ /^[^[:space:]]/ && zone) finish_zone()
-            if (!zone) next
-            if (line ~ /^[[:space:]]*name:[[:space:]]*/) {
-              name=line;sub(/^[[:space:]]*name:[[:space:]]*/, "", name)
-              sub(/[[:space:]]*$/, "", name)
-              if (name=="\".\"" || name=="." || name=="'.'") root=1
-            }
-            if (line ~ /^[[:space:]]*forward-addr:[[:space:]]*/) {
-              addr=line;sub(/^[[:space:]]*forward-addr:[[:space:]]*/, "", addr)
-              sub(/[[:space:]]*$/, "", addr)
-              addresses++
-              if (addr=="127.0.1.1@53") stubby++
-            }
-            if (line ~ /^[[:space:]]*forward-host:[[:space:]]*/) hosts++
-            if (line ~ /^[[:space:]]*forward-first:[[:space:]]*yes[[:space:]]*$/) fallback=1
-          }
-          END {
-            finish_zone()
-            if (roots==0) print "recursive"
-            else if (roots==1 && verified==1) print "stubby"
-            else if (roots==1 && configured==1) print "other"
-            else print "unknown"
-          }
-        ')
-      else
-        upstream=unknown
-      fi
-    fi
-    # These describe DNSMasq / Unbound configuration, not verified traffic.
-    if [ -f "$main" ] && [ ! -L "$main" ] && [ -r "$main" ]; then
-      if grep -Eq '^[[:space:]]*server=127\.0\.0\.1#53535[[:space:]]*$' "$main"; then
-        route=dnsmasq
-      elif [ "$port" = 53 ] &&
-           grep -Eq '^[[:space:]]*port=0[[:space:]]*$' "$main"; then
-        route=direct
-      fi
-    fi
-    printf '%s|%s|%s|%s|%s\n' "$present" "$running" "$port" "$route" "$upstream"
-  }
+
 
   # Import only the completed cron cycle. No probing and no read of current pending
   # cycle; caller invokes this after SCHEDULE UTC END was written.
@@ -5782,6 +5818,21 @@ _RunScheduledCheck_() {
     _Say_ 'SKIP: interactive DNS maintenance has priority; scheduled check deferred.'
     return 0
   fi
+  # An administrator may switch to recursive Unbound after granting automatic
+  # WAN switching. Revoke the old grant, keeping the schedule and DNS checks.
+  if [ -e "$AUTO_FAILOVER_MARKER" ] && _RecursiveUnboundProduction_; then
+    if _AcquireWANLock_; then
+      if [ -f "$AUTO_FAILOVER_MARKER" ] && [ ! -L "$AUTO_FAILOVER_MARKER" ] &&
+         _RecursiveUnboundProduction_; then
+        if rm -f "$AUTO_FAILOVER_MARKER"; then
+          _LogEvent_ notice 'MONITORING ONLY: recursive Unbound active; automatic WAN switching authorization revoked' >/dev/null
+        else
+          _Fail_ 'Unable to revoke automatic WAN authorization in recursive mode'
+        fi
+      fi
+      _ReleaseWANLock_ >/dev/null 2>&1 || :
+    fi
+  fi
   _RotateScheduleLog_ || :
   _Say_ "SCHEDULE UTC: $(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || _Say_ 'clock-unavailable')"
   _CheckBootReadiness_ || return 0
@@ -5922,7 +5973,7 @@ _ShowMenuState_() {
   else
     printf '  %-24s%sDISABLED%s\n' 'Scheduled DNS Checks:' "$RG_YELLOW" "$RG_RESET"
   fi
-  if [ -r "$SCHEDULE_MARKER" ] && [ -r "$AUTO_FAILOVER_MARKER" ]; then
+  if [ -r "$SCHEDULE_MARKER" ] && [ -r "$AUTO_FAILOVER_MARKER" ] && ! _RecursiveUnboundProduction_; then
     if _CheckAutomaticFailoverAuthorization_ >/dev/null 2>&1; then
       printf '  %-24s%sAUTHORIZED%s\n' 'Unattended Switching:' "$RG_GREEN" "$RG_RESET"
     else
@@ -7808,6 +7859,10 @@ _ShowAdvancedOptionsMenu_() {
 }
 
 _ToggleAutomaticFailover_() {
+  if _RecursiveUnboundProduction_; then
+    _Fail_ 'WAN failover disabled in recursive Unbound mode. Use Monitoring Only until Unbound forwards to Stubby.'
+    return 1
+  fi
   if [ -r "$AUTO_FAILOVER_MARKER" ]; then
     _DisableAutomaticFailover_
   elif [ ! -r "$PREF_RULELIST" ] || [ ! -r "$PREF_PROVIDERS" ]; then
@@ -7841,14 +7896,20 @@ _MainMenu_() {
     if ! _IsQuickSetupComplete_; then
       _PrintMenuItem_ qs 'Quick Setup (Complete Initial Setup)'
     fi
-    if _CheckAutomaticFailoverAuthorization_ >/dev/null 2>&1; then
+    if _RecursiveUnboundProduction_; then
+      state='DISABLED (RECURSIVE UNBOUND)'
+    elif _CheckAutomaticFailoverAuthorization_ >/dev/null 2>&1; then
       state='ON'
     elif [ -r "$AUTO_FAILOVER_MARKER" ]; then
       state='SAFETY HOLD'
     else
       state='OFF'
     fi
-    _PrintMenuItem_ af "Automatic DNS Failover: $state (Toggle)"
+    if _RecursiveUnboundProduction_; then
+      _PrintMenuItem_ af "Automatic DNS Failover: $state"
+    else
+      _PrintMenuItem_ af "Automatic DNS Failover: $state (Toggle)"
+    fi
     _PrintMenuItem_ vs 'View Status'
     _PrintMenuItem_ ch 'Check DNS Health Now'
     _PrintMenuItem_ in 'Inspect Live DNS'

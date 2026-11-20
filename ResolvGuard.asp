@@ -977,7 +977,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
       state.lastEnd=d.lastEnd||'';
       // Keep the heartbeat tied solely to completed checks. The history can
       // refresh separately after status without inventing another beat.
-      renderOverview();if(state.tab==='history')renderHistory();if(state.tab==='paths')renderPaths();
+      renderOverview();if(state.tab==='history')renderHistory();if(state.tab==='paths')renderPaths();if(state.tab==='settings'&&state.config)renderSettingsSummary();
       if(changed&&!first&&!isStale(d))pulseCompletedCheck();
     }catch(e){
       state.feedConnected=false;
@@ -1098,13 +1098,18 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     $('scriptInstall').disabled=disabled||state.updateBusy||!state.updateAvailable;
   }
   function controlsBusy(b){state.configBusy=Boolean(b);syncConfigControls();}
+  function renderSettingsSummary(){
+    const cfg=state.config;if(!cfg)return;
+    const recursive=recursiveUnbound(state.snapshot);
+    const summary=cfg.monitoringEnabled?'Monitoring enabled'+(recursive?' · WAN failover disabled in recursive mode':(cfg.autoFailoverEnabled?' · Automatic failover authorized':' · Monitoring only')):'Monitoring disabled';
+    $('settingsSummary').textContent=summary+(cfg.generatedEpoch?' · Router snapshot: '+new Date(Number(cfg.generatedEpoch)*1000).toLocaleString():'');
+  }
   function renderSettings(){
     const cfg=state.config;if(!cfg)return;
     const script=cfg.script||{};
     $('scriptInstalled').textContent=script.version?'v'+script.version+(script.channel==='development'?'_'+script.build:''):'Unavailable';
     $('scriptChannel').textContent=script.channel||'Unknown';
-    var summary=cfg.monitoringEnabled?'Monitoring enabled'+(cfg.autoFailoverEnabled?' · Automatic failover authorization exists':' · Monitoring only'):'Monitoring disabled';
-    $('settingsSummary').textContent=summary+(cfg.generatedEpoch?' · Router snapshot: '+new Date(Number(cfg.generatedEpoch)*1000).toLocaleString():'');
+    renderSettingsSummary();
     $('settingsRows').innerHTML=Object.entries(settingsDefs).map(([key,[title,options]])=>{
       const val=Number(cfg.settings?.[key]||0),list=options.length>2||['SCHEDULE_INTERVAL_MINUTES','SYSLOG_HEALTH_INTERVAL_MINUTES'].includes(key);
       const input=list?`<select class="rg-input" id="s_${key}">${options.map(n=>`<option value="${n}"${n===val?' selected':''}>${n}</option>`).join('')}</select>`:
