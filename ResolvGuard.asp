@@ -530,7 +530,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
       return {title:'Backup DNS active: '+d.pool,detail,status:'backup'};
     }
     if(d.pool!=='preferred')return {title:'Filtered DNS pool active: '+d.pool,detail:`${n} of ${p.length} preferred resolvers passed. ResolvGuard is using a reduced subset of preferred DNS resolvers.`,status:'degraded'};
-    if(h==='healthy')return {title:'All preferred DNS resolvers are healthy.',detail:`All ${p.length} preferred resolvers passed the latest completed scheduled cycle.`,status:'healthy'};
+    if(h==='healthy')return {title:'All preferred DNS resolvers are healthy.',detail:`All ${p.length} preferred resolvers passed the latest scheduled health check.`,status:'healthy'};
     if(h==='degraded')return {title:'Preferred DNS health is degraded.',detail:`${n} of ${p.length} preferred resolvers passed. Refer to the detailed checks and event history.`,status:'degraded'};
     return {title:'DNS health is not fully verified.',detail:'Some enrolled resolvers were not observed in the last completed cycle.',status:'unknown'};
   }
