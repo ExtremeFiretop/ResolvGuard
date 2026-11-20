@@ -160,6 +160,12 @@ function rgDashboardLoaded() {
 @media(prefers-reduced-motion:reduce){*,*:before,*:after{animation-duration:.01ms!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
 .path-node-verified{border-color:#326d5b;background:#17302e}.path-node-unverified{border-color:#6b5540}.path-node-backup{border-color:#94515a;background:#31272d}.path-node-filtered{border-color:#906d48;background:#302a26}.path-verification{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;padding:0 20px 20px}.path-check{background:#152832;border:1px solid #2d454e;border-radius:10px;padding:12px;display:flex;flex-direction:column;gap:4px}.path-check-label{font-size:11px;color:#a9c5c7;font-weight:750}.path-check strong{font-size:13px}.path-check small{font-size:10px;color:#819fa7}@media(max-width:760px){.path-verification{grid-template-columns:1fr}}
 
+/* Keep every visible DNS hop in one row; Unbound adds a fifth node. */
+.path-flow { display:flex; }
+.path-flow .path-node { flex:1; min-width:0; }
+.path-flow .flow-arrow { flex:0 0 auto; }
+@media(max-width:760px) { .path-flow { flex-direction:column; } .path-flow .path-node { width:100%; } }
+
 /* Consistent event severity in both Recent Activity and full History.
    Keep the text legible: a narrow accent and a quiet tinted row, not solid fill. */
 .event {
@@ -419,18 +425,19 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
   <section id="paths" class="tab">
     <div class="section-head" style="margin-top:0"><h3>Production DNS path</h3><span class="small-pill" id="pathPoolBadge">Pool: unknown</span></div>
     <div class="card">
-      <div class="card-head"><div><div class="card-title">LAN → DNSMasq → Stubby → DoT upstream</div><div class="card-sub">Configured forwarding route · selected WAN pool</div></div><span class="tag" id="pathFeedBadge">Loading</span></div>
+      <div class="card-head"><div><div class="card-title" id="pathRouteTitle">LAN → DNSMasq → Stubby → DoT upstream</div><div class="card-sub" id="pathRouteDescription">Configured forwarding route · selected WAN pool</div></div><span class="tag" id="pathFeedBadge">Loading</span></div>
       <div class="path-flow">
-        <div class="path-node"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="4" width="20" height="14" rx="2"/><path d="M8 22h8m-4-4v4"/></svg><strong>LAN query</strong><small>To router DNS</small></div><div class="flow-arrow">→</div>
-        <div class="path-node" id="pathDnsmasqNode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="2" width="18" height="8" rx="2"/><rect x="3" y="14" width="18" height="8" rx="2"/><path d="M7 6h.01M7 18h.01"/></svg><strong>DNSMasq</strong><small id="pathDnsmasqDetail">Checking default route</small></div><div class="flow-arrow">→</div>
-        <div class="path-node" id="pathStubbyNode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2 4 5v6c0 5 3.5 9 8 11 4.5-2 8-6 8-11V5l-8-3Z"/><path d="M9 12l2 2 4-4"/></svg><strong>Stubby</strong><small id="pathStubbyDetail">Checking Strict DoT</small></div><div class="flow-arrow">→</div>
+        <div class="path-node"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="4" width="20" height="14" rx="2"/><path d="M8 22h8m-4-4v4"/></svg><strong>LAN query</strong><small>To router DNS</small></div><div class="flow-arrow" id="pathLanArrow">→</div>
+        <div class="path-node" id="pathDnsmasqNode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="2" width="18" height="8" rx="2"/><rect x="3" y="14" width="18" height="8" rx="2"/><path d="M7 6h.01M7 18h.01"/></svg><strong>DNSMasq</strong><small id="pathDnsmasqDetail">Checking default route</small></div><div class="flow-arrow" id="pathDnsmasqArrow">→</div>
+        <div class="path-node hidden" id="pathUnboundNode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 5h16v14H4zM8 9h8M8 13h8"/></svg><strong>Unbound</strong><small id="pathUnboundDetail">Configuration unknown</small></div><div class="flow-arrow hidden" id="pathUnboundArrow">→</div>
+        <div class="path-node" id="pathStubbyNode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2 4 5v6c0 5 3.5 9 8 11 4.5-2 8-6 8-11V5l-8-3Z"/><path d="M9 12l2 2 4-4"/></svg><strong>Stubby</strong><small id="pathStubbyDetail">Checking Strict DoT</small></div><div class="flow-arrow" id="pathStubbyArrow">→</div>
         <div class="path-node" id="pathWanNode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c-4 5-4 13 0 18M12 3c4 5 4 13 0 18"/></svg><strong id="pathWanName">WAN pool</strong><small id="pathWanDetail">Membership unknown</small></div>
       </div>
       <div class="path-verification" id="pathVerification" aria-live="polite"></div>
       <div class="card-pad" style="padding-top:0"><div class="note">These checks verify configuration, not actual LAN query traffic.</div></div>
     </div>
     <div class="section-head"><h3>Domain-scoped exceptions</h3><span class="small-pill" id="pathExceptionCount">Checking…</span></div>
-    <div class="card"><div class="card-head"><div><div class="card-title">DNSMasq routes that bypass Stubby</div><div class="card-sub">Read-only <code>/tmp/resolv.dnsmasq</code> · <code>server=/domain/IP</code></div></div><div id="exceptionList"></div><div class="card-pad" style="padding-top:9px"><p class="desc">Only matching domains use the listed direct upstream. Other names follow the default route, if configured. These rules do not reveal actual client query activity.</p></div></div>
+    <div class="card"><div class="card-head"><div><div class="card-title" id="pathExceptionTitle">DNSMasq routes that bypass Stubby</div><div class="card-sub">Read-only <code>/tmp/resolv.dnsmasq</code> · <code>server=/domain/IP</code></div></div><div id="exceptionList"></div><div class="card-pad" style="padding-top:9px"><p class="desc" id="pathExceptionNote">Only matching domains use the listed direct upstream. Other names follow the default route, if configured. These rules do not reveal actual client query activity.</p></div></div>
   </section>
   <section id="backups" class="tab">
     <div class="section-head" style="margin-top:0"><h3>Backup &amp; Alternate Resolvers</h3><span class="hint">ResolvGuard-managed encrypted DNS backups</span></div>
@@ -836,29 +843,64 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     const pool=String(d?.pool||'unknown');
     const verified=fresh&&d?.activePoolVerified===true;
     const active=verified&&Array.isArray(d.activeResolvers)?d.activeResolvers:[];
-    const checks=[
-      {title:'DNSMasq default',ok:fresh&&d?.dnsmasqDefaultVerified===true,detail:'127.0.1.1 · Stubby listener'},
-      {title:'Stubby Strict DoT',ok:fresh&&d?.strictDoTVerified===true,detail:'Authenticated TLS configuration'},
-      {title:'WAN pool membership',ok:verified,detail:'Live WAN rulelist matches '+pool}
-    ];
-    $('pathPoolBadge').textContent='Pool: '+pool;
+    const ub=fresh&&d?.unboundDetected===true;
+    const route=ub?String(d.unboundRoute||'none'):'none';
+    const viaUnbound=route==='dnsmasq'||route==='direct';
+    const upstream=viaUnbound?String(d.unboundUpstream||'unknown'):'none';
+    const viaStubby=!viaUnbound||upstream==='stubby';
+    const direct=route==='direct';
+    const ubRunning=ub&&d.unboundRunning===true;
+    const ubPort=String(d?.unboundPort||'unknown');
+    const stubbyVerified=fresh&&d?.strictDoTVerified===true;
+    const wanVerified=verified&&viaStubby;
+    const checks=[];
+    if(viaUnbound){
+      checks.push({title:'DNSMasq route',state:direct?'Bypassed':'Configured',ok:!direct,
+        detail:direct?'DNSMasq DNS disabled in config':'Default server: 127.0.0.1:53535'});
+      checks.push({title:'Unbound',state:ubRunning?'Running':'Not running',ok:ubRunning,
+        detail:ubPort==='unknown'?'Configured listener unknown':'Configured port '+ubPort+' · live listener not tested'});
+      checks.push({title:'Unbound upstream',state:upstream==='stubby'?'Stubby forwarding':upstream==='recursive'?'Recursive mode':upstream==='other'?'Other forwarder':'Unknown',ok:upstream==='stubby'||upstream==='recursive',
+        detail:upstream==='stubby'?'Root forward-zone → 127.0.1.1:53':upstream==='recursive'?'No root forward-zone found':upstream==='other'?'Not the managed Stubby default':'Configuration not established'});
+      if(viaStubby) checks.push({title:'Strict DoT / WAN',state:stubbyVerified&&wanVerified?'Configured':'Not verified',ok:stubbyVerified&&wanVerified,
+        detail:stubbyVerified&&wanVerified?'Stubby TLS · '+active.length+' WAN member(s)':'WAN/Stubby configuration not fully verified'});
+    }else{
+      checks.push({title:'DNSMasq default',state:fresh&&d?.dnsmasqDefaultVerified===true?'Verified':'Not verified',ok:fresh&&d?.dnsmasqDefaultVerified===true,detail:'127.0.1.1 · active DNSMasq servers-file'});
+      checks.push({title:'Stubby Strict DoT',state:stubbyVerified?'Verified':'Not verified',ok:stubbyVerified,detail:'Authenticated TLS configuration'});
+      checks.push({title:'WAN pool membership',state:verified?'Verified':'Not verified',ok:verified,detail:'Live WAN rulelist matches '+pool});
+      if(ub)checks.push({title:'Unbound',state:ubRunning?'Running':'Not running',ok:ubRunning,detail:'Not identified in active DNSMasq path'});
+    }
+    const show=id=>$(id).classList.remove('hidden');
+    const hide=id=>$(id).classList.add('hidden');
+    (direct?hide:show)('pathDnsmasqNode');
+    (direct?hide:show)('pathDnsmasqArrow');
+    (viaUnbound?show:hide)('pathUnboundNode');
+    (viaUnbound?show:hide)('pathUnboundArrow');
+    (viaStubby?show:hide)('pathStubbyNode');
+    (viaStubby?show:hide)('pathStubbyArrow');
+    const finalName=viaStubby?(pool==='unknown'?'WAN pool':pool):upstream==='recursive'?'Recursive DNS':'Upstream DNS';
+    $('pathRouteTitle').textContent=viaUnbound?'LAN → '+(direct?'Unbound':'DNSMasq → Unbound')+(viaStubby?' → Stubby → DoT upstream':' → upstream DNS'):ub&&d?.dnsmasqDefaultVerified!==true?'LAN route unverified · Unbound detected':'LAN → DNSMasq → Stubby → DoT upstream';
+    $('pathRouteDescription').textContent=viaUnbound?'Unbound configuration detected · LAN traffic not traced':'Configured forwarding route · selected WAN pool';
+    $('pathPoolBadge').textContent=viaUnbound&&!viaStubby?'Unbound path':'Pool: '+pool;
     $('pathFeedBadge').textContent=!d?'Feed unavailable':fresh?'Current snapshot':'Stale snapshot';
-    $('pathDnsmasqDetail').textContent=checks[0].ok?'Default route verified':'Not verified';
-    $('pathStubbyDetail').textContent=checks[1].ok?'Strict DoT configured':'Not verified';
-    $('pathWanName').textContent=pool==='unknown'?'WAN pool':pool;
-    $('pathWanDetail').textContent=verified?active.length+' active member(s)':'Unverified membership';
-    ['pathDnsmasqNode','pathStubbyNode','pathWanNode'].forEach((id,i)=>{
-      $(id).classList.toggle('path-node-verified',checks[i].ok);
-      $(id).classList.toggle('path-node-unverified',!checks[i].ok);
+    $('pathDnsmasqDetail').textContent=viaUnbound?'Configured Unbound forwarding':checks[0].ok?'Default route verified':'Not verified';
+    $('pathUnboundDetail').textContent=ubRunning?'Process running · port '+ubPort:'Process not running';
+    $('pathStubbyDetail').textContent=stubbyVerified?'Strict DoT configured':'Not verified';
+    $('pathWanName').textContent=finalName;
+    $('pathWanDetail').textContent=viaStubby?(verified?active.length+' WAN member(s)':'Unverified membership'):upstream==='recursive'?'No default forward-zone detected':upstream==='other'?'Not the managed WAN pool':'Upstream not verified';
+    [['pathDnsmasqNode',!viaUnbound&&checks[0].ok],['pathUnboundNode',ubRunning&&viaUnbound],['pathStubbyNode',stubbyVerified&&viaStubby],['pathWanNode',wanVerified]].forEach(([id,ok])=>{
+      $(id).classList.toggle('path-node-verified',!!ok);
+      $(id).classList.toggle('path-node-unverified',!ok);
     });
-    $('pathWanNode').classList.toggle('path-node-backup',verified&&/^(backup|wanpool)[0-9]+$/.test(pool));
-    $('pathWanNode').classList.toggle('path-node-filtered',verified&&/^filtered[12]$/.test(pool));
-    $('pathVerification').innerHTML=checks.map(c=>`<div class="path-check"><span class="path-check-label">${esc(c.title)}</span><strong class="${c.ok?'green':'amber'}">${c.ok?'Verified':'Not verified'}</strong><small>${esc(c.detail)}</small></div>`).join('');
+    $('pathWanNode').classList.toggle('path-node-backup',wanVerified&&/^(backup|wanpool)[0-9]+$/.test(pool));
+    $('pathWanNode').classList.toggle('path-node-filtered',wanVerified&&/^filtered[12]$/.test(pool));
+    $('pathVerification').innerHTML=checks.map(c=>`<div class="path-check"><span class="path-check-label">${esc(c.title)}</span><strong class="${c.ok?'green':'amber'}">${esc(c.state)}</strong><small>${esc(c.detail)}</small></div>`).join('');
+    $('pathExceptionTitle').textContent=viaUnbound?'DNSMasq domain-scoped upstream rules':'DNSMasq routes that bypass Stubby';
+    $('pathExceptionNote').textContent=viaUnbound?'These rules are from the firmware DNSMasq servers file; it may not be active in Unbound mode. They do not prove client query routing.':'Only matching domains use the listed direct upstream. Other names follow the default route, if configured. These rules do not reveal actual client query activity.';
     const rows=fresh?(d.exceptions||[]):[];
     $('pathExceptionCount').textContent=!fresh||!d.exceptionsReadable?'Unknown':rows.length+' scoped rule'+(rows.length===1?'':'s');
     $('exceptionList').innerHTML=!fresh||!d.exceptionsReadable?'<div class="empty">No fresh, readable DNSMasq snapshot; exception status cannot be verified.</div>':
-      rows.length?rows.map(r=>`<div class="exception"><div><div class="muted">Matching domain</div><strong>${esc(r.domain)}</strong><div class="muted">Domain and matching subdomains</div></div><div><div class="muted">Direct upstream · DNSMasq rule</div><code>${esc(r.upstream)}</code><div class="muted">Outside the default Stubby route</div></div><span class="warn-pill">Scoped bypass</span></div>`).join(''):
-      '<div class="empty"><strong>No domain-scoped upstream rules</strong>No matching bypass entries found in the readable DNSMasq file.</div>';
+      rows.length?rows.map(r=>`<div class="exception"><div><div class="muted">Matching domain</div><strong>${esc(r.domain)}</strong><div class="muted">Domain and matching subdomains</div></div><div><div class="muted">Configured upstream · DNSMasq rule</div><code>${esc(r.upstream)}</code><div class="muted">${viaUnbound?'Active use not verified':'Outside the default Stubby route'}</div></div><span class="warn-pill">Scoped rule</span></div>`).join(''):
+      '<div class="empty"><strong>No domain-scoped upstream rules</strong>No matching rules found in the readable DNSMasq file.</div>';
   }
   function openInspector(id){const d=state.snapshot,r=(d?.activeResolvers||[]).find(x=>x.id===id)||(d?.resolvers||[]).find(x=>x.id===id);if(!r)return;
     $('inspectContent').innerHTML=`<h2>${esc(r.tls||r.id)} · ${esc(r.id)}</h2><p class="desc">Latest completed scheduled observation</p><div class="inspect-field"><span>Status</span><strong>${r.state==='ok'?'PASS':r.state==='fail'?'FAIL':'NOT OBSERVED'}</strong></div><div class="inspect-field"><span>DNS address</span><strong>${esc(r.ip)}:${esc(r.port)}</strong></div><div class="inspect-field"><span>TLS authentication</span><strong>${esc(r.tls)}</strong></div><div class="inspect-field"><span>Passed policy records</span><strong>${Number(r.policyPass||0)}</strong></div><div class="inspect-field"><span>Failed policy records</span><strong>${Number(r.policyFail||0)}</strong></div><p class="desc" style="margin-top:24px">The totals include repeated fast-confirmation probes where applicable. They are not unique DNS-policy counts.</p>`;

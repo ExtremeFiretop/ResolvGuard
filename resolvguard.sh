@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.2
-readonly SCRIPT_VERSTAG="26112005"
+readonly SCRIPT_VERSTAG="26112006"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -5153,6 +5153,81 @@ _RGWebUI_() (
       }
     ' "$RG_SERVERS"
   }
+  # Unbound Manager path hints are read-only. Presence/configuration is not
+  # proof of a live LAN DNS query, and never authorizes DNS switching.
+  unbound_path() {
+    local config main marker present running port route upstream
+    config=${RG_WEBUI_UNBOUND_CONFIG:-/opt/var/lib/unbound/unbound.conf}
+    marker=${RG_WEBUI_UNBOUND_MARKER:-/jffs/addons/unbound/unbound.postconf}
+    main=${RG_WEBUI_DNSMASQ_MAIN:-$DNSMASQ_MAIN}
+    present=false;running=false;port=unknown;route=none;upstream=unknown
+    if { [ -f "$config" ] && [ ! -L "$config" ]; } ||
+       { [ -f "$marker" ] && [ ! -L "$marker" ]; }; then
+      present=true
+    fi
+    if pidof unbound >/dev/null 2>&1; then
+      present=true;running=true
+    fi
+    if [ -f "$config" ] && [ ! -L "$config" ] && [ -r "$config" ]; then
+      port=$(LC_ALL=C awk '
+        /^[[:space:]]*#/ {next}
+        { line=$0; sub(/[[:space:]]+#.*$/, "", line)
+          if (line ~ /^[[:space:]]*port:[[:space:]]*[0-9]+[[:space:]]*$/) {
+            sub(/^.*port:[[:space:]]*/, "", line)
+            sub(/[[:space:]]*$/, "", line)
+            if (line=="53" || line=="53535") {print line; exit}
+          }
+        }
+      ' "$config")
+      [ -n "$port" ] || port=unknown
+      upstream=$(LC_ALL=C awk '
+        function finish_zone() {
+          if (zone && root) {
+            roots++
+            if (addresses == 1 && stubby == 1) verified++
+          }
+          zone=0;root=0;addresses=0;stubby=0
+        }
+        /^[[:space:]]*#/ {next}
+        {
+          line=$0;sub(/[[:space:]]+#.*$/, "", line)
+          if (line ~ /^[[:space:]]*include[[:space:]]*:/ ||
+              line ~ /^[[:space:]]*include-toplevel[[:space:]]*:/) includes=1
+          if (line ~ /^forward-zone:/) {finish_zone();zone=1;next}
+          if (line ~ /^[^[:space:]]/ && zone) finish_zone()
+          if (!zone) next
+          if (line ~ /^[[:space:]]*name:[[:space:]]*/) {
+            name=line;sub(/^[[:space:]]*name:[[:space:]]*/, "", name)
+            sub(/[[:space:]]*$/, "", name)
+            if (name=="\".\"" || name=="." || name=="'.'") root=1
+          }
+          if (line ~ /^[[:space:]]*forward-addr:[[:space:]]*/) {
+            addr=line;sub(/^[[:space:]]*forward-addr:[[:space:]]*/, "", addr)
+            sub(/[[:space:]]*$/, "", addr)
+            addresses++
+            if (addr=="127.0.1.1@53") stubby++
+          }
+        }
+        END {
+          finish_zone()
+          if (roots>0) print (roots==1 && verified==1 && !includes) ? "stubby" : "other"
+          else if (includes) print "unknown"
+          else print "recursive"
+        }
+      ' "$config")
+    fi
+    # These describe DNSMasq / Unbound configuration, not verified traffic.
+    if [ -f "$main" ] && [ ! -L "$main" ] && [ -r "$main" ]; then
+      if grep -Eq '^[[:space:]]*server=127\.0\.0\.1#53535[[:space:]]*$' "$main"; then
+        route=dnsmasq
+      elif [ "$port" = 53 ] &&
+           grep -Eq '^[[:space:]]*port=0[[:space:]]*$' "$main"; then
+        route=direct
+      fi
+    fi
+    printf '%s|%s|%s|%s|%s\n' "$present" "$running" "$port" "$route" "$upstream"
+  }
+
   # Import only the completed cron cycle. No probing and no read of current pending
   # cycle; caller invokes this after SCHEDULE UTC END was written.
   extract_cycle() {
@@ -5308,9 +5383,17 @@ _RGWebUI_() (
     dnsmasq_verified=false
     strict_dot_verified=false
     if [ -f "$DNSMASQ_SERVERS" ] && [ ! -L "$DNSMASQ_SERVERS" ] &&
+       [ -f "$DNSMASQ_MAIN" ] && [ ! -L "$DNSMASQ_MAIN" ] &&
+       grep -Eq '^[[:space:]]*no-resolv[[:space:]]*$' "$DNSMASQ_MAIN" &&
+       grep -Eq '^[[:space:]]*servers-file=/tmp/resolv\.dnsmasq[[:space:]]*$' "$DNSMASQ_MAIN" &&
+       ! grep -Eq '^[[:space:]]*(port=0|server=[^/])' "$DNSMASQ_MAIN" &&
        _ValidateDNSMasqUpstreamFile_ >/dev/null 2>&1; then
       dnsmasq_verified=true
     fi
+    unbound_info=$(unbound_path)
+    IFS='|' read -r unbound_present unbound_running unbound_port unbound_route unbound_upstream <<EOF_UNBOUND
+$unbound_info
+EOF_UNBOUND
     if _IsStrictProductionDoT_ >/dev/null 2>&1; then
       strict_dot_verified=true
     fi
@@ -5325,6 +5408,10 @@ _RGWebUI_() (
       printf ',"mode":';jsonq "$mode"
       printf ',"scheduleMinutes":%s' "$(number "$interval")"
       printf ',"dnsmasqDefaultVerified":%s,"strictDoTVerified":%s' "$dnsmasq_verified" "$strict_dot_verified"
+      printf ',"unboundDetected":%s,"unboundRunning":%s' "$unbound_present" "$unbound_running"
+      printf ',"unboundPort":';jsonq "$unbound_port"
+      printf ',"unboundRoute":';jsonq "$unbound_route"
+      printf ',"unboundUpstream":';jsonq "$unbound_upstream"
       printf ',"exceptionsReadable":%s' "$( [ -f "$RG_SERVERS" ] && [ ! -L "$RG_SERVERS" ] && printf true || printf false )"
       printf ',"pendingTransaction":%s,"recoveryHold":%s,' \
         "$( [ -e "$RG_ROOT/state/pending-transaction" ] && printf true || printf false )" \
