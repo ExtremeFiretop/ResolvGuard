@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.2
-readonly SCRIPT_VERSTAG="26112011"
+readonly SCRIPT_VERSTAG="26112012"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -2515,15 +2515,22 @@ unbound_path() {
           if (zone && root) {
             roots++
             if (addresses + hosts > 0) configured++
-            if (addresses == 1 && stubby == 1 && hosts == 0 && !fallback) verified++
+            # Every root forwarding destination must be a known local Stubby
+            # listener. Unbound Manager may configure both IPv4 and IPv6.
+            if (addresses > 0 && stubby == addresses && hosts == 0 && !fallback) verified++
           }
           zone=0;root=0;addresses=0;stubby=0;hosts=0;fallback=0
         }
         /^[[:space:]]*#/ {next}
         {
           line=$0;sub(/[[:space:]]+#.*$/, "", line)
-          if (line ~ /^forward-zone:[[:space:]]*$/) {finish_zone();zone=1;next}
-          if (line ~ /^[^[:space:]]/ && zone) finish_zone()
+          # Unbound Manager writes "forward-zone:#Stubby" (marker attached
+          # directly to the colon), not only "forward-zone:".
+          if (line ~ /^forward-zone:[[:space:]]*(#.*)?$/) {finish_zone();zone=1;next}
+          # Unbound Manager emits unindented name/forward-addr lines.
+          # These are zone members, not new top-level configuration blocks.
+          if (line ~ /^[^[:space:]]/ && zone &&
+              line !~ /^(name|forward-addr|forward-host|forward-first):/) finish_zone()
           if (!zone) next
           if (line ~ /^[[:space:]]*name:[[:space:]]*/) {
             name=line;sub(/^[[:space:]]*name:[[:space:]]*/, "", name)
@@ -2534,7 +2541,9 @@ unbound_path() {
             addr=line;sub(/^[[:space:]]*forward-addr:[[:space:]]*/, "", addr)
             sub(/[[:space:]]*$/, "", addr)
             addresses++
-            if (addr=="127.0.1.1@53") stubby++
+            # Both loopback listeners are used by Unbound Manager
+            # Integrate with Stubby option on supported routers.
+            if (addr=="127.0.1.1@53" || addr=="0::1@5453") stubby++
           }
           if (line ~ /^[[:space:]]*forward-host:[[:space:]]*/) hosts++
           if (line ~ /^[[:space:]]*forward-first:[[:space:]]*yes[[:space:]]*$/) fallback=1
