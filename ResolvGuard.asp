@@ -434,7 +434,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
   </section>
   <section id="backups" class="tab">
     <div class="section-head" style="margin-top:0"><h3>Backup &amp; Alternate Resolvers</h3><span class="hint">ResolvGuard-managed encrypted DNS backups</span></div>
-    <div class="note rg-config-note">Primary/preferred DNS is configured through <strong>ASUS WAN → Internet Connection → DNS Privacy Protocol/strong>, not here. These backup endpoints are used only according to ResolvGuard's approved failover policy. Editing backup configuration may require renewed policy approval.</div>
+    <div class="note rg-config-note">Primary/preferred DNS is configured through <strong>ASUS WAN → Internet Connection → DNS Privacy Protocol</strong>, not here. These backup endpoints are used only according to ResolvGuard's approved failover policy. Editing backup configuration may require renewed policy approval.</div>
     <div class="card" style="margin-top:16px">
       <div class="card-head"><div><div class="card-title">Configured backup resolvers</div><div class="card-sub">Configured endpoints are not assumed healthy until independently checked</div></div><div style="display:flex;gap:8px;flex-wrap:wrap"><span class="small-pill" id="backupPoolState">Pool: unknown</span><span class="small-pill" id="backupCount">—</span></div></div>
       <div id="backupRows"><div class="empty">Loading configuration…</div></div>
