@@ -390,11 +390,12 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     <div class="hero" id="hero"><div><div class="hero-kicker"><span class="dot" id="heroDot"></span><span id="heroKicker">Monitoring status unknown</span></div><h2 id="heroHeading">Connecting to ResolvGuard…</h2><p id="heroText">Waiting for a completed scheduled DNS health check.</p><div class="hero-meta"><span id="poolPill">Active pool: unknown</span><span id="modePill">Mode unknown</span></div></div>
       <div class="heartbeat no-signal" id="heartbeat"><div class="heart-ring" id="heartRing"><svg viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M32 54C19 45 9 36 9 23a12 12 0 0 1 22-6 12 12 0 0 1 22 6c0 13-10 22-21 31Z"/><path d="M16 30h10l5-11 7 22 5-11h5"/></svg></div><div class="heart-copy"><div class="heart-detail" id="heartLabel">Awaiting checks</div><small id="heartSub">Waiting for scheduled check</small></div><svg class="ecg" id="ecgWave" viewBox="0 0 185 35" aria-hidden="true" focusable="false"><path id="ecgTrace" class="ecg-trace" d="M0 17.5 H185" /><circle id="ecgTurn" class="ecg-turn" cx="183" cy="17.5" r="2.4" opacity="0" /></svg></div>
     </div>
-    <div class="section-head"><h3>Network health at a glance</h3><div class="hint">Scheduled monitoring · Manual checks are independent</div></div>
+    <div class="note hidden" id="unboundOverviewNotice" role="status" style="margin-top:12px"><strong>Recursive Unbound is the configured LAN DNS path.</strong> DoT checks are separate; ResolvGuard WAN failover does not protect Unbound.</div>
+    <div class="section-head"><h3 id="overviewMetricsHeading">Network health at a glance</h3><div class="hint">Scheduled monitoring · Manual checks are independent</div></div>
     <div class="stats">
       <div class="stat"><div class="stat-label">Preferred resolvers</div><div class="stat-val green" id="statResolvers">—</div><div class="stat-sub" id="statResolversSub">Reachable and policy-compliant</div></div>
       <div class="stat"><div class="stat-label" id="statPoliciesLabel">DNS probe results</div><div class="stat-val" id="statPolicies">—</div><div class="stat-sub" id="statPoliciesDescription">Passed / total attempts · latest cycle</div></div>
-      <div class="stat"><div class="stat-label">Active production pool</div><div class="stat-val" id="statPool" style="font-size:23px">unknown</div><div class="stat-sub" id="statPoolSub">WAN DNS configuration</div></div>
+      <div class="stat"><div class="stat-label" id="statPoolLabel">Active production pool</div><div class="stat-val" id="statPool" style="font-size:23px">unknown</div><div class="stat-sub" id="statPoolSub">WAN DNS configuration</div></div>
       <div class="stat"><div class="stat-label">Next scheduled cycle</div><div class="stat-val" id="statCountdown">—</div><div class="stat-sub" id="statSeq">No completed check yet</div></div>
     </div>
     <div class="section-head"><h3>Live resolver view</h3><button class="text-link" data-tab="history">Explore full history →</button></div>
@@ -404,14 +405,15 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
       <div class="card-pad" style="padding-top:10px"><div class="note">Active membership comes from the verified production WAN DNS rulelist. PASS/FAIL refers to direct authenticated DNS observations in the latest completed cycle, not individual LAN query routing.</div></div>
     </div>
     <div class="two-col">
-      <div class="card"><div class="card-head"><div><div class="card-title">Preferred DNS resolvers</div><div class="card-sub">Tap a resolver for authentication and policy details</div></div><div class="small-pill" id="preferredCount">— healthy</div></div><div id="resolverList"></div><div class="card-pad" style="padding-top:10px"><div class="note">These are <strong>direct authenticated DoT probes</strong>. Production LAN DNS still uses DNSMasq → Stubby by default.</div></div></div>
-      <div class="card"><div class="card-head"><div><div class="card-title">Recent activity</div><div class="card-sub">Actual completed failover and recovery events</div></div><button class="text-link" data-tab="history">All events →</button></div><div class="feed" id="eventFeed"></div></div>
+      <div class="card"><div class="card-head"><div><div class="card-title">Preferred DNS resolvers</div><div class="card-sub">Tap a resolver for authentication and policy details</div></div><div class="small-pill" id="preferredCount">— healthy</div></div><div id="resolverList"></div><div class="card-pad" style="padding-top:10px"><div class="note" id="resolverScopeNote">These are <strong>direct authenticated DoT probes</strong>. Production LAN DNS still uses DNSMasq → Stubby by default.</div></div></div>
+      <div class="card"><div class="card-head"><div><div class="card-title">Recent activity</div><div class="card-sub" id="recentActivityDescription">Actual completed failover and recovery events</div></div><button class="text-link" data-tab="history">All events →</button></div><div class="feed" id="eventFeed"></div></div>
     </div>
     <div class="section-head"><h3>Quick reliability history</h3><span class="hint">Last 24 hours · 30-minute segments · live check counts</span></div>
     <div class="card"><div class="card-head"><div><div class="card-title">Health by resolver</div><div class="card-sub">The rightmost segment fills as completed checks are recorded; hover or click for exact counts</div></div><div class="legend"><span><i class="square" style="background:#3e9b78"></i>Passed</span><span><i class="square" style="background:#e99969"></i>Failed</span><span><i class="square" style="background:#395058"></i>No observation</span></div></div><div class="history-rows" id="overviewHeat"></div><div class="timeline"><span>24 hours ago</span><span>12 hours ago</span><span>Now</span></div></div>
   </section>
 
   <section id="history" class="tab">
+    <div class="note hidden" id="unboundHistoryNotice" role="status">This history tracks external DoT resolvers, not recursive Unbound DNS.</div>
     <div class="section-head" style="margin-top:0"><h3>Reliability across time</h3><div class="toolbar"><label for="period">Time period</label><select id="period" class="select"><option value="24">Last 24 hours</option><option value="7">Last 7 days</option></select></div></div>
     <div class="metrics-strip"><div class="stat"><div class="stat-label">Recent observations</div><div class="mini-value" id="histObservations">192</div><div class="stat-sub">Resolver evaluations from retained RAM history</div></div><div class="stat"><div class="stat-label">Preferred endpoints</div><div class="mini-value" id="histPreferred">—</div><div class="stat-sub">Independently checked</div></div><div class="stat"><div class="stat-label">Live data source</div><div class="mini-value amber" style="font-size:18px">Live feed</div><div class="stat-sub">Volatile history; resets on reboot</div></div></div>
     <div class="section-head"><h3>Resolver health timeline</h3><div class="legend"><span><i class="square" style="background:#3e9b78"></i>Passed</span><span><i class="square" style="background:#e99969"></i>Failed</span><span><i class="square" style="background:#395058"></i>Unknown</span></div></div>
@@ -434,6 +436,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
         <div class="path-node" id="pathWanNode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c-4 5-4 13 0 18M12 3c4 5 4 13 0 18"/></svg><strong id="pathWanName">WAN pool</strong><small id="pathWanDetail">Membership unknown</small></div>
       </div>
       <div class="path-verification" id="pathVerification" aria-live="polite"></div>
+      <div class="card-pad hidden" id="unboundPathNotice" style="padding-top:0" role="status"><div class="note">DoT monitoring is separate. ResolvGuard WAN failover does not protect recursive Unbound.</div></div>
       <div class="card-pad" style="padding-top:0"><div class="note">These checks verify configuration, not actual LAN query traffic.</div></div>
     </div>
     <div class="section-head"><h3>Domain-scoped exceptions</h3><span class="small-pill" id="pathExceptionCount">Checking…</span></div>
@@ -516,12 +519,23 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     if(!p.length||p.some(r=>r.state==='unknown'))return 'unknown';
     return p.some(r=>r.state==='fail')?'degraded':'healthy';
   }
+  function recursiveUnbound(d){
+    return state.feedConnected && !!d && !isStale(d) &&
+      d.unboundDetected===true &&
+      (d.unboundRoute==='dnsmasq'||d.unboundRoute==='direct') &&
+      d.unboundUpstream==='recursive';
+  }
   function topState(d){
     if(!d)return {title:'Connecting to ResolvGuard…',detail:'Waiting for the first status snapshot.',status:'unknown'};
     if(d.pendingTransaction||d.recoveryHold)return {title:'DNS recovery requires attention.',detail:'A pending transaction or recovery hold exists. Check the SSH status command before making changes.',status:'hold'};
     if(isStale(d))return {title:'Monitoring data is stale.',detail:'No recent completed health evaluation is available. This is not a passing result.',status:'unknown'};
     if(!hasRealChecks(d))return {title:'Waiting for health results.',detail:'The latest completed cycle had no DNS policy observations.',status:'unknown'};
     const h=health(d),p=pref(d),n=p.filter(r=>r.state==='ok').length;
+    if(recursiveUnbound(d)){
+      const status=h==='healthy'?'healthy':h==='degraded'?'degraded':'unknown';
+      const title=status==='healthy'?'External DoT checks are healthy.':status==='degraded'?'External DoT checks are degraded.':'External DoT results are incomplete.';
+      return {title,detail:`${n} of ${p.length} preferred DoT resolvers passed the latest scheduled check. Recursive Unbound was not tested.`,status};
+    }
     if(/^backup[0-9]+$|^wanpool[0-9]+$/.test(d.pool||'')){
       const active=d.activePoolVerified && Array.isArray(d.activeResolvers)?d.activeResolvers:[];
       const detail=d.activePoolVerified
@@ -679,14 +693,22 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
   }
   function renderOverview(){
     const d=state.snapshot,s=topState(d),r=pref(d),n=r.filter(x=>x.state==='ok').length;
+    const recursive=recursiveUnbound(d);
+    $('unboundOverviewNotice').classList.toggle('hidden',!recursive);
+    $('overviewMetricsHeading').textContent=recursive?'External DoT checks at a glance':'Network health at a glance';
+    $('recentActivityDescription').textContent=recursive?'WAN DNS events · not Unbound recovery':'Actual completed failover and recovery events';
+    $('resolverScopeNote').innerHTML=recursive?'Direct authenticated DoT probes; not Unbound DNS health.':'These are <strong>direct authenticated DoT probes</strong>. Production LAN DNS still uses DNSMasq → Stubby by default.';
     syncWaveSignal(d,state.feedConnected);
     $('heroHeading').textContent=s.title; $('heroText').textContent=s.detail;
-    $('heroKicker').textContent=s.status==='healthy'?'Monitoring healthy':s.status==='degraded'?'DNS degraded':s.status==='backup'?'BACKUP DNS ACTIVE':'Verification pending';
+    $('heroKicker').textContent=recursive
+      ? s.status==='healthy'?'External DoT checks healthy':s.status==='degraded'?'External DoT checks degraded':'External DoT monitoring'
+      : s.status==='healthy'?'Monitoring healthy':s.status==='degraded'?'DNS degraded':s.status==='backup'?'BACKUP DNS ACTIVE':'Verification pending';
     $('heroDot').style.background=s.status==='healthy'?'var(--green)':s.status==='degraded'?'var(--amber)':s.status==='backup'?'var(--red)':'var(--muted)';
     $('hero').style.borderColor=s.status==='healthy'?'#29564b':s.status==='degraded'?'#86633b':s.status==='backup'?'#955355':'#395058';
-    $('poolPill').textContent='Active pool: '+(d?.pool||'unknown');
-    $('modePill').textContent=({'monitoring':'Monitoring Only','automatic':'Auto Failover configured','inactive':'Monitoring inactive','hold':'Policy safety hold'})[d?.mode]||'Unknown mode';
+    $('poolPill').textContent=(recursive?'WAN pool: ':'Active pool: ')+(d?.pool||'unknown');
+    $('modePill').textContent=recursive?'WAN failover does not protect Unbound':(({'monitoring':'Monitoring Only','automatic':'Auto Failover configured','inactive':'Monitoring inactive','hold':'Policy safety hold'})[d?.mode]||'Unknown mode');
     $('heartLabel').textContent=s.status==='healthy'?'Check complete · Healthy':s.status==='degraded'?'Check complete · Degraded':s.status==='backup'?'Check complete · Backup active':'Awaiting reliable check';
+    if(recursive&&(s.status==='healthy'||s.status==='degraded'))$('heartLabel').textContent='DoT check complete · '+(s.status==='healthy'?'Healthy':'Degraded');
     $('heartSub').textContent=d?.lastEnd?'Last completed '+(routerTimeLabel(d.lastEndRouter)||String(d.lastEnd).replace('T',' ').replace(/Z$/,' UTC')):'No completed cycle recorded';
     $('statResolvers').textContent=d&&r.length?`${n} / ${r.length}`:'—';
     $('statResolversSub').textContent='Preferred members passing observed policy';
@@ -696,12 +718,13 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     $('statPoliciesLabel').textContent=alternate?'Preferred DNS probe attempts':'DNS probe results';
     $('statPoliciesDescription').textContent=alternate?'Passed / total · may include repeat checks':'Passed / total attempts · latest cycle';
     $('statPool').textContent=d?.pool||'unknown';
-    $('statPoolSub').textContent='Read-only managed pool state';
+    $('statPoolLabel').textContent=recursive?'ResolvGuard WAN pool':'Active production pool';
+    $('statPoolSub').textContent=recursive?'Not used by recursive Unbound':'Read-only managed pool state';
     $('statSeq').textContent=d?.lastEnd?'Completed '+(routerTimeLabel(d.lastEndRouter)||String(d.lastEnd).replace('T',' ').replace(/Z$/,' UTC')):'No completed check yet';
     $('preferredCount').textContent=r.length?`${n}/${r.length} passing`:'Unenrolled / unknown';
     const activeCard=$('activePoolCard');
-    activeCard.hidden=!alternate;
-    if(alternate){
+    activeCard.hidden=!alternate||recursive;
+    if(alternate&&!recursive){
       const active=d?.activePoolVerified && Array.isArray(d.activeResolvers)?d.activeResolvers:[];
       $('activePoolTitle').textContent='Active production DNS resolvers · '+d.pool;
       $('activePoolCount').textContent=d?.activePoolVerified?active.length+' member(s)':'Unverified';
@@ -753,6 +776,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
   function historySignature(rows){return rows.slice(-16).map(b=>[b.at,b.id,b.samples,b.failures,b.unknowns].join('|')).join('~');}
   function renderHistory(){
     const d=state.snapshot;
+    $('unboundHistoryNotice').classList.toggle('hidden',!recursiveUnbound(d));
     $('histObservations').textContent=String(state.history.reduce((a,b)=>a+Number(b.samples||0),0));
     $('histPreferred').textContent=String(pref(d).length||'—');
     $('histAxis').innerHTML=state.period==='24'?'<span>24 hours ago</span><span>12 hours ago</span><span>Now</span>':'<span>7 days ago</span><span>3.5 days ago</span><span>Now</span>';
@@ -847,6 +871,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     const route=ub?String(d.unboundRoute||'none'):'none';
     const viaUnbound=route==='dnsmasq'||route==='direct';
     const upstream=viaUnbound?String(d.unboundUpstream||'unknown'):'none';
+    $('unboundPathNotice').classList.toggle('hidden',!(viaUnbound&&upstream==='recursive'));
     const viaStubby=!viaUnbound||upstream==='stubby';
     const direct=route==='direct';
     const ubRunning=ub&&d.unboundRunning===true;
@@ -956,6 +981,8 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
       if(changed&&!first&&!isStale(d))pulseCompletedCheck();
     }catch(e){
       state.feedConnected=false;
+      $('unboundOverviewNotice').classList.add('hidden');
+      $('unboundHistoryNotice').classList.add('hidden');
       $('feedStatus').textContent='ROUTER FEED · UNAVAILABLE';$('feedStatus').classList.add('demo');
       syncWaveSignal(state.snapshot,false);
       $('heroHeading').textContent='Cannot load ResolvGuard data.';
