@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.2
-readonly SCRIPT_VERSTAG="26112009"
+readonly SCRIPT_VERSTAG="26112010"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -4643,6 +4643,24 @@ _ReconcileBootState_() {
   current="$(_ReadWANRulelist_)" || return 1
   preferred="$(cat "$PREF_RULELIST")"
   if [ "$current" = "$preferred" ]; then
+    # Recursive Unbound owns LAN DNS, so the direct DNSMasq -> Stubby
+    # readiness test does not describe this production path. Only bypass that
+    # test for a clean, read-only Monitoring Only state with independently
+    # verified Strict DoT endpoint identities. Never clear a journal/hold or
+    # permit an automatic WAN write through this exception.
+    if _RecursiveUnboundProduction_ &&
+       [ ! -e "$PENDING_TRANSACTION" ] && [ ! -L "$PENDING_TRANSACTION" ] &&
+       [ ! -e "$RECOVERY_HOLD" ] && [ ! -L "$RECOVERY_HOLD" ]; then
+      if _AllowMonitoringOnlyWithoutLANForwarding_; then
+        _WriteBootReport_ 'MONITORING ONLY - recursive Unbound owns LAN DNS; external DoT checks separate; WAN switching disabled' || :
+        [ "$success_output" = quiet ] ||
+          _Say_ 'BOOT: recursive Unbound owns LAN DNS; external DoT monitoring ready; WAN switching disabled.'
+        return 0
+      fi
+      _WriteBootReport_ 'WAIT - recursive Unbound Monitoring Only prerequisites not verified; no WAN writes' || :
+      _Say_ 'BOOT: recursive Unbound detected; Monitoring Only prerequisites unverified; no WAN writes.'
+      return 1
+    fi
     # Do not clear a journal or recovery hold based only on matching NVRAM/YAML.
     # This was a confirmed safety gap during the November 11 Stubby outage.
     if [ ! -e "$PENDING_TRANSACTION" ] && [ ! -L "$PENDING_TRANSACTION" ] &&
@@ -7745,9 +7763,22 @@ _RunQuickSetupWizard_() {
       _Say_ '  No changes saved; existing checks will be used.'
     }
   fi
-  # Disclose domain-scoped DNS bypasses before requesting approval for
-  # automatic WAN switching. Interactive SSH users must acknowledge the
-  # warning; noninteractive callers receive plain text without a pause.
+  # Discover the current Unbound mode AFTER saved setup choices, not just
+  # once during installation. Recursive Unbound cannot use automatic WAN
+  # failover; go straight to Monitoring Only without requesting policy consent,
+  # invoking the failover command, or asking a redundant fallback question.
+  # Scheduled monitoring remains independently read-only and may be disabled
+  # later through Monitoring Settings.
+  if _RecursiveUnboundProduction_; then
+    _Say_ '  Recursive Unbound detected: automatic WAN failover is unavailable.'
+    _Say_ '  Selecting Monitoring Only for external DoT checks.'
+    _EnableScheduledMonitoring_ confirmed quiet || return 1
+    printf '  %sMONITORING ONLY%s  Scheduled checks ON; WAN switching OFF.\n' "$RG_CYAN" "$RG_RESET"
+    return 0
+  fi
+
+  # Disclose domain-scoped DNS bypasses only when considering automatic WAN
+  # switching. Recursive Unbound does not use the direct DNSMasq -> Stubby path.
   _ShowDNSMasqScopedSetupWarning_
 
   if [ -r "$AUTO_FAILOVER_MARKER" ] && _CheckAutomaticFailoverAuthorization_ >/dev/null 2>&1; then
@@ -8019,7 +8050,8 @@ No arguments: if installation is needed, install and offer Quick Setup once; oth
 install verifies prerequisites (including optional bind-dig installation), initializes missing config, and publishes the main script only after preparation succeeds.
 A failed first-time install removes an initially placed script; an existing DNS-enrolled installation is never removed on failed prerequisite repair.
 Quick Setup runs after first installation; if cancelled, it remains on the menu until completed. After completion, use the dedicated menu options, or deliberately rerun the wizard using the quick-setup CLI command.
-Default INACTIVE: no scheduled monitoring and no automatic WAN DNS changes.
+Default INACTIVE before Quick Setup: no scheduled monitoring and no automatic WAN DNS changes.
+When recursive Unbound serves LAN DNS, Quick Setup skips automatic-failover approval and starts read-only scheduled external DoT Monitoring Only; this can later be disabled from Monitoring Settings.
 Manual restoration is available through Maintenance & Recovery.
 The preferred WAN snapshot and transaction journal live in ResolvGuard.d/state.
 Probes use short-lived local authenticated DoT resolvers.
