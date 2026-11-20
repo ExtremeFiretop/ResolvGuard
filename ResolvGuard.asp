@@ -322,16 +322,6 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
   filter:drop-shadow(0 0 3px var(--rg-signal-glow));
 }
 .heartbeat.no-signal .ecg .ecg-trace { opacity:.28; }
-/* The returning echo shares the outbound trace's stroke weight and glow. */
-.heartbeat .ecg .ecg-return {
-  fill:none;
-  stroke:var(--rg-signal);
-  stroke-width:2.25;
-  stroke-linecap:round;
-  stroke-linejoin:round;
-  pointer-events:none;
-  filter:drop-shadow(0 0 3px var(--rg-signal-glow));
-}
 .heartbeat .ecg .ecg-turn {
   fill:var(--rg-signal);
   /* SVG's opacity attribute is driven by the JS turnaround flash. A CSS
@@ -344,7 +334,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
   .heartbeat .heart-ring::after,
   .heartbeat .heart-ring.pulse,
   .heartbeat .heart-ring.pulse svg { animation:none!important; }
-  .ecg .ecg-trace, .ecg .ecg-return, .ecg .ecg-turn { filter:none; }
+  .ecg .ecg-trace, .ecg .ecg-turn { filter:none; }
   .heartbeat .ecg .ecg-trace,
   .heartbeat.running .heart-ring svg { animation:none!important; }
 }
@@ -390,7 +380,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
 
   <section id="overview" class="tab active">
     <div class="hero" id="hero"><div><div class="hero-kicker"><span class="dot" id="heroDot"></span><span id="heroKicker">Monitoring status unknown</span></div><h2 id="heroHeading">Connecting to ResolvGuard…</h2><p id="heroText">Waiting for a completed scheduled DNS health check.</p><div class="hero-meta"><span id="poolPill">Active pool: unknown</span><span id="modePill">Mode unknown</span></div></div>
-      <div class="heartbeat no-signal" id="heartbeat"><div class="heart-ring" id="heartRing"><svg viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M32 54C19 45 9 36 9 23a12 12 0 0 1 22-6 12 12 0 0 1 22 6c0 13-10 22-21 31Z"/><path d="M16 30h10l5-11 7 22 5-11h5"/></svg></div><div class="heart-copy"><div class="heart-detail" id="heartLabel">Awaiting checks</div><small id="heartSub">Waiting for scheduled check</small></div><svg class="ecg" id="ecgWave" viewBox="0 0 185 35" aria-hidden="true" focusable="false"><path id="ecgTrace" class="ecg-trace" d="M0 17.5 H185" /><path id="ecgReturn" class="ecg-return" d="" /><circle id="ecgTurn" class="ecg-turn" cx="183" cy="17.5" r="2.4" opacity="0" /></svg></div>
+      <div class="heartbeat no-signal" id="heartbeat"><div class="heart-ring" id="heartRing"><svg viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M32 54C19 45 9 36 9 23a12 12 0 0 1 22-6 12 12 0 0 1 22 6c0 13-10 22-21 31Z"/><path d="M16 30h10l5-11 7 22 5-11h5"/></svg></div><div class="heart-copy"><div class="heart-detail" id="heartLabel">Awaiting checks</div><small id="heartSub">Waiting for scheduled check</small></div><svg class="ecg" id="ecgWave" viewBox="0 0 185 35" aria-hidden="true" focusable="false"><path id="ecgTrace" class="ecg-trace" d="M0 17.5 H185" /><circle id="ecgTurn" class="ecg-turn" cx="183" cy="17.5" r="2.4" opacity="0" /></svg></div>
     </div>
     <div class="section-head"><h3>Network health at a glance</h3><div class="hint">Scheduled monitoring · Manual checks are independent</div></div>
     <div class="stats">
@@ -522,12 +512,11 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     if(h==='degraded')return {title:'Preferred DNS health is degraded.',detail:`${n} of ${p.length} preferred resolvers passed. Refer to the detailed checks and event history.`,status:'degraded'};
     return {title:'DNS health is not fully verified.',detail:'Some enrolled resolvers were not observed in the last completed cycle.',status:'unknown'};
   }
-  // One sampled ECG waveform, with a short colour overlay ON the same path
-  // during its returning echo (not a second QRS spike). A completed scheduled
-  // cycle starts the entire out-and-back *replay*: this does not claim that a
-  // live DNS request is currently in flight or imply extra checks.
+  // One sampled ECG waveform for both directions, using the same QRS shape
+  // and one visible stroke. A completed scheduled cycle starts the entire
+  // out-and-back replay; it does not imply a new DNS request is in flight.
   const waveform=(() => {
-    const path=$('ecgTrace'), echo=$('ecgReturn'), turn=$('ecgTurn'), svg=$('ecgWave');
+    const path=$('ecgTrace'), turn=$('ecgTurn'), svg=$('ecgWave');
     const reduced=window.matchMedia('(prefers-reduced-motion: reduce)');
     let width=185; // SVG user units follow its measured CSS width.
     const midpoint=17.5, outboundMs=1450, returnMs=1550;
@@ -546,7 +535,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
         ? returning ? width+28-span*((elapsed-outboundMs)/returnMs)
                     : -28+span*(elapsed/outboundMs)
         : 0;
-      const points=[],echoPoints=[];
+      const points=[];
       const samples=Math.max(80,Math.min(360,Math.ceil(width/1.5)));
       for(let i=0;i<=samples;i++){
         const x=width*i/samples;
@@ -566,13 +555,8 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
         const y=Math.max(1.5,Math.min(33.5,midpoint+idle*(1-suppression)+beat));
         const point=x.toFixed(2)+' '+y.toFixed(2);
         points.push((i===0?'M':'L')+point);
-        // The echo trace follows the exact same geometry. Only a narrow
-        // section is coloured aqua/red; the rest of the ECG stays legible.
-        if(returning&&Math.abs(x-center)<=27)
-          echoPoints.push((echoPoints.length?'L':'M')+point);
       }
       path.setAttribute('d',points.join(' '));
-      echo.setAttribute('d',returning?echoPoints.join(' '):'');
       const bounce=returning?Math.max(0,1-(elapsed-outboundMs)/260):0;
       turn.setAttribute('opacity',bounce.toFixed(2));
     }
