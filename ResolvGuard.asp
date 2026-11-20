@@ -688,6 +688,26 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     if (/^DNS (?:RESOLVER EXCLUDED|FILTERED MEMBERSHIP|FAILOVER|POOL CHANGE|SWITCH FAILED|RECOVERY FAILED|ROLLBACK FAILED|RECOVERY ATTENTION|RECOVERY):/i.test(m)) return 'warning';
     return 'info';
   }
+  // Older builds recorded this static Monitoring Only condition on every
+  // scheduled check. Collapse that historical noise without deleting events,
+  // and keep independent failover/recovery transitions visible.
+  function distinctSwitchingModeEvents(events){
+    const result=[];
+    let disabledIndex=-1;
+    for(const e of events){
+      const message=String(e?.message||'').trim();
+      if(/^AUTOMATIC SWITCHING DISABLED: Monitoring Only; no WAN change\.$/i.test(message)){
+        // Keep the newest occurrence in chronological position.
+        if(disabledIndex>=0)result.splice(disabledIndex,1);
+        result.push(e);
+        disabledIndex=result.length-1;
+      }else{
+        result.push(e);
+        if(/^DNS (?:FAILOVER|FAILBACK|POOL CHANGE):/i.test(message))disabledIndex=-1;
+      }
+    }
+    return result;
+  }
   function renderEvent(e, recent=false){
     const kind=eventKind(e?.message);
     const symbol=kind==='recovery'?'✓':kind==='info'?'i':'!';
@@ -738,7 +758,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
         '<div class="empty">Active member identities could not be verified from the current WAN DNS configuration. Use SSH status to inspect the production pool.</div>';
     }
     $('resolverList').innerHTML=r.length?r.map(x=>`<button class="resolve-row" data-resolver="${esc(x.id)}"><div class="res-left"><span class="status-glyph ${x.state==='fail'?'bad':''}">${x.state==='ok'?'✓':x.state==='fail'?'!':'?'}</span><div><div class="res-name">${esc(x.tls||x.id)}</div><div class="res-ip">${esc(x.id)} · ${esc(x.ip)}:${esc(x.port)}</div></div></div><div class="res-right"><span class="res-state ${x.state==='ok'?'green':x.state==='fail'?'red':'amber'}">${x.state==='ok'?'PASS':x.state==='fail'?'FAIL':'NOT OBSERVED'}</span><span>›</span></div></button>`).join(''):'<div class="empty">No preferred resolver roster available. Enroll preferred WAN DNS before monitoring.</div>';
-    const ev=(d?.events||[]).slice(-5).reverse();
+    const ev=distinctSwitchingModeEvents(d?.events||[]).slice(-5).reverse();
     $('eventFeed').innerHTML=ev.length?ev.map(e=>renderEvent(e,true)).join(''):'<div class="empty">No switching or recovery events recorded since this router boot.</div>';
     renderHeat('overviewHeat','24');
   }
@@ -784,7 +804,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     $('histPreferred').textContent=String(pref(d).length||'—');
     $('histAxis').innerHTML=state.period==='24'?'<span>24 hours ago</span><span>12 hours ago</span><span>Now</span>':'<span>7 days ago</span><span>3.5 days ago</span><span>Now</span>';
     renderHeat('fullHeat',state.period);
-    const ev=(d?.events||[]).slice().reverse();
+    const ev=distinctSwitchingModeEvents(d?.events||[]).reverse();
     $('historyEvents').innerHTML=ev.length?ev.map(e=>renderEvent(e)).join(''):'<div class="empty">No logged recovery/failover events since the current boot.</div>';
   }
   async function fetchHistoryDetails(){

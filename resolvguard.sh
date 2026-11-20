@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.2
-readonly SCRIPT_VERSTAG="26112010"
+readonly SCRIPT_VERSTAG="26112011"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -2603,7 +2603,10 @@ _CheckLiveSwitchSafety_() {
 _CheckAutomaticRecoveryAuthorization_() {
   [ -f "$SCHEDULE_MARKER" ] && [ ! -L "$SCHEDULE_MARKER" ] &&
     [ -f "$AUTO_FAILOVER_MARKER" ] && [ ! -L "$AUTO_FAILOVER_MARKER" ] || {
-      _Say_ 'AUTOMATIC SWITCHING DISABLED: Monitoring Only; no WAN change.'
+      # Scheduled monitoring reports this operating mode once per transition,
+      # not on every unsuccessful resolver cycle.
+      [ "${RG_HEALTH_RUN_MODE:-}" = scheduled ] ||
+        _Say_ 'AUTOMATIC SWITCHING DISABLED: Monitoring Only; no WAN change.'
       return 1
     }
 }
@@ -2611,7 +2614,8 @@ _CheckAutomaticRecoveryAuthorization_() {
 _CheckAutomaticFailoverAuthorization_() {
   _CheckAutomaticRecoveryAuthorization_ || return 1
   if _RecursiveUnboundProduction_; then
-    _Say_ 'AUTOMATIC SWITCHING DISABLED: recursive Unbound uses Monitoring Only.'
+    [ "${RG_HEALTH_RUN_MODE:-}" = scheduled ] ||
+      _Say_ 'AUTOMATIC SWITCHING DISABLED: recursive Unbound uses Monitoring Only.'
     return 1
   fi
   _CheckPolicyAuthorization_
@@ -3410,6 +3414,7 @@ _RunDNSHealthCheck_() (
   local current backup selected pool result alt_rc mode
   local status1 status2 survivors proposed target eligible confirm_needed switch_failure
   mode="${1:-manual}"
+  RG_HEALTH_RUN_MODE="$mode"
   switch_failure=0
 
   # Never emit terminal escape codes into scheduled logs or captured output.
@@ -4560,6 +4565,8 @@ _DisableAutomaticFailover_() {
   _ConfirmYesNo_ 'Disable automatic DNS switching (keep monitoring)?' || return 1
   [ ! -L "$AUTO_FAILOVER_MARKER" ] || { _Fail_ 'Unsafe authorization marker'; return 1; }
   rm -f "$AUTO_FAILOVER_MARKER" || return 1
+  # Re-entering Monitoring Only is a new state transition for event history.
+  rm -f "$RUNTIME/switching-mode-notice" || :
   _LogEvent_ notice 'MONITORING ONLY: automatic WAN switching disabled; scheduled checks retained' >/dev/null
   _Say_ 'Automatic failover: OFF (monitoring remains ON)'
   [ "$(_GetActiveWANPool_ 2>/dev/null || :)" = preferred ] ||
@@ -4584,6 +4591,7 @@ _DisableScheduledMonitoring_() {
   # The services-start callback also restores the WebUI after reboot.
   # Do not delete it when DNS monitoring is disabled. Uninstall owns cleanup.
   rm -f "$SCHEDULE_MARKER" "$AUTO_FAILOVER_MARKER" || return 1
+  rm -f "$RUNTIME/switching-mode-notice" || :
   _LogEvent_ notice 'DNS MONITORING DISABLED: scheduler and automatic switching authorization removed' >/dev/null
   [ "$success_output" = quiet ] || _Say_ 'DNS monitoring: OFF (automatic failover OFF)'
 }
@@ -5829,6 +5837,32 @@ _RotateScheduleLog_() {
   rm -f "$staged"
 }
 
+# Record monitoring-only as an operating-mode transition, not a per-minute
+# health event. This volatile marker never changes WAN configuration or
+# persists to flash; the dashboard separately shows the current mode.
+_ReportScheduledSwitchingMode_() {
+  local state previous staged marker
+  marker="$RUNTIME/switching-mode-notice"
+  [ ! -L "$marker" ] || return 1
+  if [ -f "$AUTO_FAILOVER_MARKER" ] && [ ! -L "$AUTO_FAILOVER_MARKER" ]; then
+    state=automatic
+  elif [ -f "$SCHEDULE_MARKER" ] && [ ! -L "$SCHEDULE_MARKER" ] &&
+       [ ! -e "$AUTO_FAILOVER_MARKER" ] && [ ! -L "$AUTO_FAILOVER_MARKER" ]; then
+    state=monitoring
+  else
+    state=hold
+  fi
+  previous=''
+  [ ! -r "$marker" ] || previous="$(cat "$marker" 2>/dev/null)"
+  [ "$previous" != "$state" ] || return 0
+  staged="$marker.new.$$"
+  [ ! -e "$staged" ] && [ ! -L "$staged" ] || return 1
+  (umask 077; printf '%s\n' "$state" > "$staged") &&
+    mv "$staged" "$marker" || { rm -f "$staged"; return 1; }
+  [ "$state" != monitoring ] ||
+    _Say_ 'AUTOMATIC SWITCHING DISABLED: Monitoring Only; no WAN change.'
+}
+
 _RunScheduledCheck_() {
   local outcome
   [ -r "$SCHEDULE_MARKER" ] || { _Say_ 'SKIP: monitoring schedule not enabled'; return 0; }
@@ -5862,6 +5896,7 @@ _RunScheduledCheck_() {
   else outcome=$?
   fi
   RG_WEBUI_RECORD_POLICY_FAILURES=0
+  _ReportScheduledSwitchingMode_ || :
   # Preserve UTC for history and give the WebUI the router's actual local
   # clock and UTC offset at completion (independent of the viewing browser).
   _Say_ "SCHEDULE UTC END: $(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || _Say_ 'clock-unavailable') result=$outcome routerTime=$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || _Say_ 'clock-unavailable')"
