@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.2
-readonly SCRIPT_VERSTAG="26112006"
+readonly SCRIPT_VERSTAG="26112007"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -5155,8 +5155,47 @@ _RGWebUI_() (
   }
   # Unbound Manager path hints are read-only. Presence/configuration is not
   # proof of a live LAN DNS query, and never authorizes DNS switching.
+  # Resolve Unbound includes in place. Never execute configuration content.
+  # Bound the number, depth and total size of files read from the router.
+  unbound_expand() {
+    local file depth line trimmed path child matched bytes
+    file=$1;depth=$2
+    [ "$depth" -le 8 ] && [ -f "$file" ] && [ ! -L "$file" ] && [ -r "$file" ] || return 1
+    case "|$RG_UNBOUND_SEEN|" in *"|$file|"*) return 1 ;; esac
+    RG_UNBOUND_SEEN="$RG_UNBOUND_SEEN|$file"
+    RG_UNBOUND_FILES=$((RG_UNBOUND_FILES + 1))
+    [ "$RG_UNBOUND_FILES" -le 32 ] || return 1
+    bytes=$(wc -c < "$file") || return 1
+    RG_UNBOUND_BYTES=$((RG_UNBOUND_BYTES + bytes))
+    [ "$RG_UNBOUND_BYTES" -le 1048576 ] || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+      trimmed=${line#"${line%%[![:space:]]*}"}
+      case "$trimmed" in
+        include:*|include-toplevel:*)
+          case "$trimmed" in include-toplevel:*) printf 'RG-TOP-RESET:\n' ;; esac
+          path=${trimmed#*:};path=${path%%#*}
+          path=$(printf '%s' "$path" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+          case "$path" in
+            \"*\") path=${path#\"};path=${path%\"} ;;
+            \'*\') path=${path#\'};path=${path%\'} ;;
+          esac
+          # Absolute paths and simple globs only. Ambiguous paths fail closed.
+          case "$path" in /*) : ;; *) return 1 ;; esac
+          case "$path" in *..*|*[!A-Za-z0-9_./*-]*) return 1 ;; esac
+          matched=0
+          for child in $path; do
+            [ -f "$child" ] || return 1
+            unbound_expand "$child" "$((depth + 1))" || return 1
+            matched=1
+          done
+          [ "$matched" -eq 1 ] || return 1
+          ;;
+        *) printf '%s\n' "$line" ;;
+      esac
+    done < "$file"
+  }
   unbound_path() {
-    local config main marker present running port route upstream
+    local config main marker present running port route upstream expanded
     config=${RG_WEBUI_UNBOUND_CONFIG:-/opt/var/lib/unbound/unbound.conf}
     marker=${RG_WEBUI_UNBOUND_MARKER:-/jffs/addons/unbound/unbound.postconf}
     main=${RG_WEBUI_DNSMASQ_MAIN:-$DNSMASQ_MAIN}
@@ -5180,41 +5219,48 @@ _RGWebUI_() (
         }
       ' "$config")
       [ -n "$port" ] || port=unknown
-      upstream=$(LC_ALL=C awk '
-        function finish_zone() {
-          if (zone && root) {
-            roots++
-            if (addresses == 1 && stubby == 1) verified++
+      RG_UNBOUND_SEEN='';RG_UNBOUND_FILES=0;RG_UNBOUND_BYTES=0
+      if expanded=$(unbound_expand "$config" 0); then
+        upstream=$(printf '%s\n' "$expanded" | LC_ALL=C awk '
+          function finish_zone() {
+            if (zone && root) {
+              roots++
+              if (addresses + hosts > 0) configured++
+              if (addresses == 1 && stubby == 1 && hosts == 0 && !fallback) verified++
+            }
+            zone=0;root=0;addresses=0;stubby=0;hosts=0;fallback=0
           }
-          zone=0;root=0;addresses=0;stubby=0
-        }
-        /^[[:space:]]*#/ {next}
-        {
-          line=$0;sub(/[[:space:]]+#.*$/, "", line)
-          if (line ~ /^[[:space:]]*include[[:space:]]*:/ ||
-              line ~ /^[[:space:]]*include-toplevel[[:space:]]*:/) includes=1
-          if (line ~ /^forward-zone:/) {finish_zone();zone=1;next}
-          if (line ~ /^[^[:space:]]/ && zone) finish_zone()
-          if (!zone) next
-          if (line ~ /^[[:space:]]*name:[[:space:]]*/) {
-            name=line;sub(/^[[:space:]]*name:[[:space:]]*/, "", name)
-            sub(/[[:space:]]*$/, "", name)
-            if (name=="\".\"" || name=="." || name=="'.'") root=1
+          /^[[:space:]]*#/ {next}
+          {
+            line=$0;sub(/[[:space:]]+#.*$/, "", line)
+            if (line ~ /^forward-zone:[[:space:]]*$/) {finish_zone();zone=1;next}
+            if (line ~ /^[^[:space:]]/ && zone) finish_zone()
+            if (!zone) next
+            if (line ~ /^[[:space:]]*name:[[:space:]]*/) {
+              name=line;sub(/^[[:space:]]*name:[[:space:]]*/, "", name)
+              sub(/[[:space:]]*$/, "", name)
+              if (name=="\".\"" || name=="." || name=="'.'") root=1
+            }
+            if (line ~ /^[[:space:]]*forward-addr:[[:space:]]*/) {
+              addr=line;sub(/^[[:space:]]*forward-addr:[[:space:]]*/, "", addr)
+              sub(/[[:space:]]*$/, "", addr)
+              addresses++
+              if (addr=="127.0.1.1@53") stubby++
+            }
+            if (line ~ /^[[:space:]]*forward-host:[[:space:]]*/) hosts++
+            if (line ~ /^[[:space:]]*forward-first:[[:space:]]*yes[[:space:]]*$/) fallback=1
           }
-          if (line ~ /^[[:space:]]*forward-addr:[[:space:]]*/) {
-            addr=line;sub(/^[[:space:]]*forward-addr:[[:space:]]*/, "", addr)
-            sub(/[[:space:]]*$/, "", addr)
-            addresses++
-            if (addr=="127.0.1.1@53") stubby++
+          END {
+            finish_zone()
+            if (roots==0) print "recursive"
+            else if (roots==1 && verified==1) print "stubby"
+            else if (roots==1 && configured==1) print "other"
+            else print "unknown"
           }
-        }
-        END {
-          finish_zone()
-          if (roots>0) print (roots==1 && verified==1 && !includes) ? "stubby" : "other"
-          else if (includes) print "unknown"
-          else print "recursive"
-        }
-      ' "$config")
+        ')
+      else
+        upstream=unknown
+      fi
     fi
     # These describe DNSMasq / Unbound configuration, not verified traffic.
     if [ -f "$main" ] && [ ! -L "$main" ] && [ -r "$main" ]; then

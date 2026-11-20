@@ -878,7 +878,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     (viaStubby?show:hide)('pathStubbyNode');
     (viaStubby?show:hide)('pathStubbyArrow');
     const finalName=viaStubby?(pool==='unknown'?'WAN pool':pool):upstream==='recursive'?'Recursive DNS':'Upstream DNS';
-    $('pathRouteTitle').textContent=viaUnbound?'LAN → '+(direct?'Unbound':'DNSMasq → Unbound')+(viaStubby?' → Stubby → DoT upstream':' → upstream DNS'):ub&&d?.dnsmasqDefaultVerified!==true?'LAN route unverified · Unbound detected':'LAN → DNSMasq → Stubby → DoT upstream';
+    $('pathRouteTitle').textContent=viaUnbound?'LAN → '+(direct?'Unbound':'DNSMasq → Unbound')+(viaStubby?' → Stubby → DoT upstream':upstream==='recursive'?' → Recursive DNS':' → upstream DNS'):ub&&d?.dnsmasqDefaultVerified!==true?'LAN route unverified · Unbound detected':'LAN → DNSMasq → Stubby → DoT upstream';
     $('pathRouteDescription').textContent=viaUnbound?'Unbound configuration detected · LAN traffic not traced':'Configured forwarding route · selected WAN pool';
     $('pathPoolBadge').textContent=viaUnbound&&!viaStubby?'Unbound path':'Pool: '+pool;
     $('pathFeedBadge').textContent=!d?'Feed unavailable':fresh?'Current snapshot':'Stale snapshot';
