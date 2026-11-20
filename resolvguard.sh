@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.2
-readonly SCRIPT_VERSTAG="26112003"
+readonly SCRIPT_VERSTAG="26112004"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -4886,7 +4886,9 @@ _RGWebConfig_() (
         printf ',"port":%s}' "$rg_port"
         rg_sep=,
       done < "$EXTRA_PROVIDERS"
-      printf ']}\n'
+      printf '],"script":{"version":';rg_quote "$SCRIPT_VERSION"
+      printf ',"build":';rg_quote "$SCRIPT_VERSTAG"
+      printf ',"channel":';rg_quote "$UPDATE_CHANNEL";printf '}}\n'
     ) | rg_atomic "$rg_config"
   }
   rg_publish_result() {
@@ -4896,6 +4898,11 @@ _RGWebConfig_() (
       printf '{"schema":1,"requestId":';rg_quote "$rg_id"
       printf ',"status":';rg_quote "$rg_status"
       printf ',"message":';rg_quote "$rg_message"
+      case "${rg_op:-}" in script-check|script-install)
+        printf ',"latestVersion":';rg_quote "${rg_latest_version:-}"
+        printf ',"latestBuild":';rg_quote "${rg_latest_build:-}"
+        printf ',"channel":';rg_quote "$UPDATE_CHANNEL" ;;
+      esac
       printf ',"completedEpoch":%s}\n' "$(date +%s 2>/dev/null || printf 0)"
     ) | rg_atomic "$rg_result"
   }
@@ -5030,13 +5037,43 @@ EOF_RG_WEB_CONFIG
             if _InstallBackupPreset_ "$rg_a"; then rg_result_status=success;rg_message='Backup resolver pair saved; policy review required'; fi ;;
           esac
         fi ;;
+      script-check|script-install)
+        rg_message='Unable to check the selected update channel'
+        if [ -z "$rg_c" ] && [ -z "$rg_d" ] &&
+           { [ "$rg_op" = script-check ] || _IsValidVersion_ "$rg_a"; } &&
+           _ReadReleaseManifest_; then
+          rg_latest_version="$RELEASE_VERSION"
+          rg_latest_build="$RELEASE_VERSTAG"
+          rg_newer=0
+          if _IsNewerVersion_ "$RELEASE_VERSION" "$SCRIPT_VERSION" ||
+             { [ "$UPDATE_CHANNEL" = development ] &&
+               [ "$RELEASE_VERSION" = "$SCRIPT_VERSION" ] &&
+               _IsNewerBuildTag_ "$RELEASE_VERSTAG" "$SCRIPT_VERSTAG"; }; then
+            rg_newer=1
+          fi
+          if [ "$rg_op" = script-check ]; then
+            if [ "$rg_newer" = 1 ]; then
+              rg_result_status=available;rg_message='A script update is available'
+            else
+              rg_result_status=current;rg_message='ResolvGuard is up to date'
+            fi
+          elif [ "$rg_newer" != 1 ]; then
+            rg_message='No newer script version is available. Check again.'
+          elif [ "$rg_a" != "$RELEASE_VERSION" ] || [ "$rg_b" != "$RELEASE_VERSTAG" ]; then
+            rg_message='Available version changed. Check again before installing.'
+          elif _ApplyVerifiedUpdate_; then
+            rg_result_status=updated;rg_message='Script update installed and verified'
+          else
+            rg_message='Script update failed or was blocked. Inspect SSH status before retrying.'
+          fi
+        fi ;;
     esac
     if [ "$rg_result_status" = success ]; then
       rg_snapshot || rg_notice 'saved but snapshot publishing failed'
     fi
     rg_publish_result "$rg_id" "$rg_result_status" "$rg_message" || return 1
     printf '%s\n' "$rg_id" | rg_atomic "$rg_seen" || return 1
-    [ "$rg_result_status" = success ]
+    case "$rg_result_status" in success|available|current|updated) return 0 ;; *) return 1 ;; esac
   }
   case "${1:-}" in
     snapshot) rg_snapshot ;;

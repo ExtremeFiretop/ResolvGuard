@@ -355,6 +355,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
 .manual-panel[hidden]{display:none!important}.manual-head{padding:17px 20px;border-bottom:1px solid #31515a;display:flex;justify-content:space-between;align-items:flex-start;gap:12px}.manual-head strong{font-size:15px;color:#f0f8f5}.manual-help{font-size:12px;color:#a0c2c0;margin-top:5px}.manual-content{padding:15px 20px}.manual-foot{border-top:1px solid #29434a;padding:11px 20px;font-size:11px;color:#8aaeb0}.manual-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:9px}.manual-item{border:1px solid #36555b;background:#142b32;border-radius:9px;padding:11px}.manual-item strong{display:block;font-size:12px}.manual-item small{display:block;color:#9fbdc1;margin-top:5px;overflow-wrap:anywhere}.manual-status{font-weight:800;font-size:20px;margin:0 0 10px}.manual-log{margin-top:12px;max-height:290px;overflow:auto;border:1px solid #31515b;border-radius:9px}.manual-log details{border-bottom:1px solid #29434b;padding:9px 12px;font-size:12px}.manual-log details:last-child{border-bottom:0}.manual-log summary{cursor:pointer;color:#c5e8dd;font-weight:700}.manual-check{padding:8px 0 7px 10px;border-bottom:1px solid #223841;font-size:11px;overflow-wrap:anywhere}.manual-check:last-child{border:0}.manual-check .pass{color:#70e2b1}.manual-check .fail{color:#f7a677}.manual-inline-busy{display:inline-block;width:12px;height:12px;border-radius:50%;border:2px solid #527e77;border-top-color:#74f2bc;animation:rgmanual-spin .85s linear infinite;vertical-align:middle;margin-right:7px}@keyframes rgmanual-spin{to{transform:rotate(360deg)}}
 
 /* ResolvGuard settings and backup resolver controls */
+.rg-script-info{display:flex;flex-wrap:wrap;gap:24px}.rg-script-info div{display:flex;flex-direction:column;gap:3px}.rg-script-info strong{font-size:14px}#scriptUpdateFeedback.error{color:var(--red)}#scriptUpdateFeedback.success{color:var(--green)}#scriptInstall[hidden],#scriptReload[hidden]{display:none!important}
 .rg-config-note{margin:2px 0 0;line-height:1.65}.rg-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:13px 17px}.rg-fields label,.rg-setting-row label{font-size:12px;font-weight:700;color:#b5ced2;display:flex;flex-direction:column;gap:6px}.rg-input{width:100%;font:inherit;color:#ecf7f3;background:#0d1d25;border:1px solid #385660;border-radius:9px;padding:10px;min-width:0}.rg-input:focus-visible{outline:2px solid var(--green);outline-offset:1px}.rg-input:disabled{opacity:.6}.rg-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:16px}.rg-divider{border-top:1px solid var(--line);margin:20px 0}.rg-backup-row,.rg-setting-row{padding:14px 18px;border-bottom:1px solid #243c44;display:flex;align-items:center;justify-content:space-between;gap:15px}.rg-backup-row:last-child,.rg-setting-row:last-child{border-bottom:0}.rg-backup-info strong{font-size:13px;display:block}.rg-backup-info small{color:var(--sub);display:block;overflow-wrap:anywhere;margin-top:5px}.rg-setting-row .rg-control{display:flex;align-items:center;gap:9px}.rg-setting-row .rg-input{width:110px}.rg-configuration-status{position:sticky;bottom:10px;z-index:50;padding:13px 16px;margin-top:14px;border:1px solid #3c7260;border-radius:10px;background:#17352f;color:#c4ffe5;box-shadow:0 10px 22px #0006}.rg-configuration-status.error{border-color:#8d5a53;background:#3c2426;color:#ffd1c6}.rg-configuration-status[hidden]{display:none!important}@media(max-width:820px){.rg-fields{grid-template-columns:1fr}.rg-backup-row,.rg-setting-row{align-items:flex-start;flex-direction:column}.rg-setting-row .rg-control{width:100%}}
 </style>
 <script>document.body.classList.add('rg-embedded');</script>
@@ -456,6 +457,14 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
       <div class="card-head"><div><div class="card-title">Monitoring &amp; health-check parameters</div><div class="card-sub" id="settingsSummary">Loading saved configuration…</div></div></div>
       <div id="settingsRows"></div>
     </div>
+    <div class="card" style="margin-top:16px">
+      <div class="card-head"><div><div class="card-title">Script Maintenance</div><div class="card-sub">Check the selected ResolvGuard channel before installing</div></div></div>
+      <div class="card-pad">
+        <div class="rg-script-info"><div><span class="hint">Installed version</span><strong id="scriptInstalled">Loading…</strong></div><div><span class="hint">Update channel</span><strong id="scriptChannel">—</strong></div></div>
+        <div class="rg-actions"><button type="button" class="btn" id="scriptCheck" disabled>Check for Updates</button><button type="button" class="btn primary" id="scriptInstall" hidden disabled>Update Now</button><button type="button" class="btn" id="scriptReload" hidden>Reload WebUI</button></div>
+        <p class="desc" id="scriptUpdateFeedback" role="status" aria-live="polite">No update check performed.</p>
+      </div>
+    </div>
   </section>
   <div class="rg-configuration-status" id="configFeedback" role="status" aria-live="polite" hidden></div>
   <footer class="footer"><span>ResolvGuard dashboard · By ExtremeFiretop</span><span>Heartbeat follows completed scheduled cycles · History stored in /tmp</span></footer>
@@ -482,7 +491,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     return routerTimeLabel(event?.routerAt,short)||String(event?.at||'Unknown').replace('T',' ').replace(/Z$/,' UTC');
   }
   const since = v => {const d=Date.parse(v||'');if(!Number.isFinite(d))return 'No completed check';const sec=Math.max(0,Math.floor((Date.now()-d)/1000));return sec<60?sec+' seconds ago':Math.floor(sec/60)+' min ago';};
-  const state={tab:'overview',period:'24',snapshot:null,history:[],lastEnd:'',lastFetch:0,polling:false,feedConnected:false,historyPending:'',historyBaseline:'',historyAttempts:0,historyAdvanced:false,manualBusy:false,manualPolling:null,manualPreviousId:'',manualRequestedAt:0,manualRunId:'',config:null,configBusy:false,configFresh:false,configLoading:false,editingBackupId:'',historySelection:0,detailCache:null};
+  const state={tab:'overview',period:'24',snapshot:null,history:[],lastEnd:'',lastFetch:0,polling:false,feedConnected:false,historyPending:'',historyBaseline:'',historyAttempts:0,historyAdvanced:false,manualBusy:false,manualPolling:null,manualPreviousId:'',manualRequestedAt:0,manualRunId:'',config:null,configBusy:false,configFresh:false,configLoading:false,editingBackupId:'',historySelection:0,detailCache:null,updateBusy:false,updateVersion:'',updateBuild:'',updateAvailable:false};
   const hasRealChecks = d => (d?.resolvers||[]).some(r => r.policyPass+r.policyFail>0);
   function isStale(d){if(!d?.lastEnd)return true;const ms=Date.parse(d.lastEnd);return !Number.isFinite(ms)||Date.now()-ms>Math.max(150000,(d.scheduleMinutes||1)*150000);}
   function pref(d){return (d?.resolvers||[]).filter(r=>/^wan[0-9]+$/.test(r.id));}
@@ -985,10 +994,15 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
   function syncConfigControls(){
     const disabled=state.configBusy||state.configLoading||!state.config||!state.configFresh;
     document.querySelectorAll('#backups button,#settingsRows button').forEach(e=>e.disabled=disabled);
+    $('scriptCheck').disabled=disabled;
+    $('scriptInstall').disabled=disabled||state.updateBusy||!state.updateAvailable;
   }
   function controlsBusy(b){state.configBusy=Boolean(b);syncConfigControls();}
   function renderSettings(){
     const cfg=state.config;if(!cfg)return;
+    const script=cfg.script||{};
+    $('scriptInstalled').textContent=script.version?'v'+script.version+(script.channel==='development'?'_'+script.build:''):'Unavailable';
+    $('scriptChannel').textContent=script.channel||'Unknown';
     var summary=cfg.monitoringEnabled?'Monitoring enabled'+(cfg.autoFailoverEnabled?' · Automatic failover authorization exists':' · Monitoring only'):'Monitoring disabled';
     $('settingsSummary').textContent=summary+(cfg.generatedEpoch?' · Router snapshot: '+new Date(Number(cfg.generatedEpoch)*1000).toLocaleString():'');
     $('settingsRows').innerHTML=Object.entries(settingsDefs).map(([key,[title,options]])=>{
@@ -1076,6 +1090,61 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
       try { if(window.parent!==window && typeof window.parent.rgFinishConfiguration==='function') window.parent.rgFinishConfiguration(); }catch(e){}
     }
   }
+  function updateNotice(message,kind=''){
+    const e=$('scriptUpdateFeedback');e.textContent=message;e.className='desc '+kind;
+  }
+  async function scriptUpdate(mode){
+    if(state.configBusy||!state.configFresh||!state.config?.script)return;
+    const script=state.config.script;
+    if(mode==='script-install'){
+      if(!state.updateAvailable)return;
+      const target='v'+state.updateVersion+(script.channel==='development'?'_'+state.updateBuild:'');
+      if(!confirm('Install ResolvGuard '+target+' from the '+script.channel+' channel?\n\nThis replaces the installed script and WebUI ASP with GitHub copies. Local edits to these two files will be overwritten; saved DNS settings are preserved.'))return;
+    }
+    const parts=mode==='script-check'?['script-check']:
+      ['script-install',state.updateVersion].concat(script.channel==='development'?[state.updateBuild]:[]);
+    const payload=configPayload(parts),requestId=payload.split('|')[0];
+    state.updateBusy=true;controlsBusy(true);
+    $('scriptReload').hidden=true;
+    if(mode==='script-check'){
+      state.updateAvailable=false;$('scriptInstall').hidden=true;
+    }
+    updateNotice(mode==='script-check'?'Checking '+script.channel+' for updates…':'Installing verified script update…');
+    try{
+      if(window.parent===window||typeof window.parent.rgRequestConfiguration!=='function'||!window.parent.rgRequestConfiguration(payload))
+        throw Error('Open WAN → ResolvGuard to use authenticated updates.');
+      const started=Date.now();let result=null;
+      const timeout=mode==='script-install'?240000:120000;
+      while(Date.now()-started<timeout){
+        await new Promise(resolve=>setTimeout(resolve,1000));
+        try{const d=await load('/ext/ResolvGuard/config-action.htm');if(d.requestId===requestId){result=d;break;}}catch(e){}
+      }
+      if(!result)throw Error('No matching router response. Inspect the installed version in SSH before retrying.');
+      if(result.channel!==script.channel)throw Error('Update channel changed. Refresh and check again.');
+      const availableVersion=String(result.latestVersion||''),availableBuild=String(result.latestBuild||'');
+      if(result.status==='available'&&mode==='script-check'){
+        if(!/^\d+(\.\d+){1,3}$/.test(availableVersion)||
+           (script.channel==='development'&&!/^\d{8,14}$/.test(availableBuild)))throw Error('Invalid remote version.');
+        state.updateVersion=availableVersion;state.updateBuild=availableBuild;state.updateAvailable=true;
+        $('scriptInstall').hidden=false;
+        updateNotice('Available: v'+availableVersion+(script.channel==='development'?'_'+availableBuild:'')+'.','success');
+      }else if(result.status==='current'&&mode==='script-check'){
+        state.updateAvailable=false;updateNotice('ResolvGuard is up to date.','success');
+      }else if(result.status==='updated'&&mode==='script-install'){
+        state.updateAvailable=false;$('scriptInstall').hidden=true;$('scriptReload').hidden=false;
+        updateNotice('Update installed and verified. Reload the WebUI to use the new version.','success');
+      }else throw Error(result.message||'The router rejected the update request.');
+    }catch(e){
+      if(mode==='script-install'){state.updateAvailable=false;$('scriptInstall').hidden=true;}
+      updateNotice(e.message||'Update check failed.','error');
+    }finally{
+      state.updateBusy=false;controlsBusy(false);
+      try{if(window.parent!==window&&typeof window.parent.rgFinishConfiguration==='function')window.parent.rgFinishConfiguration();}catch(e){}
+    }
+  }
+  $('scriptCheck').addEventListener('click',()=>scriptUpdate('script-check'));
+  $('scriptInstall').addEventListener('click',()=>scriptUpdate('script-install'));
+  $('scriptReload').addEventListener('click',()=>window.parent.location.reload());
   $('backupReset').addEventListener('click',resetBackup);
   $('backupSave').addEventListener('click',()=>{
     const id=$('backupId').value.trim(),ip=$('backupIp').value.trim(),tls=$('backupTls').value.trim(),port=$('backupPort').value.trim();
