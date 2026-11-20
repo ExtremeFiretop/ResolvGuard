@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.2
-readonly SCRIPT_VERSTAG="26112004"
+readonly SCRIPT_VERSTAG="26112005"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -5294,8 +5294,7 @@ _RGWebUI_() (
     : > "$active_members" || return 1
     active_verified=false
     case "$current_pool" in
-      preferred|unknown) : ;;
-      filtered1|filtered2|backup[0-9]*|wanpool[0-9]*)
+      preferred|filtered1|filtered2|backup[0-9]*|wanpool[0-9]*)
         if [ "$(_GetActiveWANPool_ 2>/dev/null || :)" = "$current_pool" ] &&
            _GetPoolMembers_ "$current_pool" > "$active_members" 2>/dev/null &&
            [ -s "$active_members" ]; then
@@ -5305,6 +5304,16 @@ _RGWebUI_() (
         fi
         ;;
     esac
+    # Configuration checks only: these do not verify end-to-end LAN queries.
+    dnsmasq_verified=false
+    strict_dot_verified=false
+    if [ -f "$DNSMASQ_SERVERS" ] && [ ! -L "$DNSMASQ_SERVERS" ] &&
+       _ValidateDNSMasqUpstreamFile_ >/dev/null 2>&1; then
+      dnsmasq_verified=true
+    fi
+    if _IsStrictProductionDoT_ >/dev/null 2>&1; then
+      strict_dot_verified=true
+    fi
     # JSON is computed in volatile files and atomically published to the WebUI.
     tmp="$RG_DATA/status-$$.tmp"
     (
@@ -5315,6 +5324,7 @@ _RGWebUI_() (
       printf ',"pool":';jsonq "$current_pool"
       printf ',"mode":';jsonq "$mode"
       printf ',"scheduleMinutes":%s' "$(number "$interval")"
+      printf ',"dnsmasqDefaultVerified":%s,"strictDoTVerified":%s' "$dnsmasq_verified" "$strict_dot_verified"
       printf ',"exceptionsReadable":%s' "$( [ -f "$RG_SERVERS" ] && [ ! -L "$RG_SERVERS" ] && printf true || printf false )"
       printf ',"pendingTransaction":%s,"recoveryHold":%s,' \
         "$( [ -e "$RG_ROOT/state/pending-transaction" ] && printf true || printf false )" \

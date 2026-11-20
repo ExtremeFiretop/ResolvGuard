@@ -158,6 +158,7 @@ function rgDashboardLoaded() {
 @media(max-width:1150px){.main{padding:25px 23px 45px}.sidebar{width:210px}.main{width:calc(100% - 210px)}.stats{grid-template-columns:repeat(2,minmax(0,1fr))}.hero h2{font-size:31px}.two-col{grid-template-columns:1fr}.hero{grid-template-columns:1.25fr .75fr}}
 @media(max-width:760px){.app{display:block}.sidebar{width:auto;height:auto;position:relative;padding:15px 18px;border-right:0;border-bottom:1px solid #253f46}.logo{padding:0;margin:0}.sidebar .side-section,.sidebar .nav,.sidebar .side-bottom{display:none}.main{width:100%;padding:20px 15px 45px}.top{display:block;margin-bottom:16px}.page-title{font-size:26px}.top-tools{justify-content:flex-start;margin-top:15px}.hero{padding:22px;grid-template-columns:1fr;gap:9px;min-height:0}.hero h2{font-size:28px}.heartbeat{flex-direction:row;justify-content:flex-start;gap:15px;padding:12px 4px 0}.heart-ring{width:69px;height:69px;box-shadow:0 0 0 7px #43b18c0d}.heart-ring:after{inset:7px}.heart-ring svg{width:34px;height:34px}.heart-detail{margin:0}.heartbeat small{display:block}.ecg{width:95px}.stats{gap:8px}.stat{min-height:104px;padding:13px}.stat-val{font-size:24px}.path-flow{grid-template-columns:1fr;gap:5px}.flow-arrow{transform:rotate(90deg);text-align:center}.exception{grid-template-columns:1fr;gap:7px}.tabs-mobile{display:flex;gap:6px;overflow:auto;padding:0 0 14px}.m-tab{border:1px solid #344f56;background:#14242b;border-radius:9px;padding:9px 13px;color:#9bb6b9;white-space:nowrap}.m-tab.active{background:#1b4740;color:var(--green);border-color:#3d886b}.metrics-strip{grid-template-columns:1fr}.inspector{padding:24px}.event{gap:8px}}
 @media(prefers-reduced-motion:reduce){*,*:before,*:after{animation-duration:.01ms!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
+.path-node-verified{border-color:#326d5b;background:#17302e}.path-node-unverified{border-color:#6b5540}.path-node-backup{border-color:#94515a;background:#31272d}.path-node-filtered{border-color:#906d48;background:#302a26}.path-verification{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;padding:0 20px 20px}.path-check{background:#152832;border:1px solid #2d454e;border-radius:10px;padding:12px;display:flex;flex-direction:column;gap:4px}.path-check-label{font-size:11px;color:#a9c5c7;font-weight:750}.path-check strong{font-size:13px}.path-check small{font-size:10px;color:#819fa7}@media(max-width:760px){.path-verification{grid-template-columns:1fr}}
 
 /* Consistent event severity in both Recent Activity and full History.
    Keep the text legible: a narrow accent and a quiet tinted row, not solid fill. */
@@ -416,19 +417,24 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
   </section>
 
   <section id="paths" class="tab">
-    <div class="section-head" style="margin-top:0"><h3>Normal forwarding path</h3><span class="small-pill">Configuration-derived</span></div>
-    <div class="card"><div class="card-head"><div><div class="card-title">DNSMasq → Stubby → Strict DoT</div><div class="card-sub">Default DNS forwarding for queries received by the router</div></div></div><div class="path-flow">
-      <div class="path-node"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="4" width="20" height="14" rx="2"/><path d="M8 22h8m-4-4v4"/></svg><strong>LAN query</strong><small>To router DNS</small></div><div class="flow-arrow">→</div>
-      <div class="path-node"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="2" width="18" height="8" rx="2"/><rect x="3" y="14" width="18" height="8" rx="2"/><path d="M7 6h.01M7 18h.01"/></svg><strong>DNSMasq</strong><small>Local DNS</small></div><div class="flow-arrow">→</div>
-      <div class="path-node"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2 4 5v6c0 5 3.5 9 8 11 4.5-2 8-6 8-11V5l-8-3Z"/><path d="M9 12l2 2 4-4"/></svg><strong>Stubby</strong><small>Authenticated TLS</small></div><div class="flow-arrow">→</div>
-      <div class="path-node"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c-4 5-4 13 0 18M12 3c4 5 4 13 0 18"/></svg><strong>DoT upstream</strong><small>TCP port 853</small></div>
-    </div><div class="card-pad" style="padding-top:0"><div class="note">ResolvGuard separately queries resolvers through direct authenticated DoT for independent health assessments. Those intentional probes do not use the production Stubby instance to avoid disruptions.</div></div></div>
-    <div class="section-head"><h3>Configured Stubby-bypass exceptions</h3><span class="warn-pill">Bypass warning from Quick Setup</span></div>
-    <div class="card"><div class="card-head"><div><div class="card-title">Domain-scoped DNSMasq upstream rules</div><div class="card-sub">From <code>/tmp/resolv.dnsmasq</code> via <code>server=/domain/IP</code></div></div><div id="exceptionList"></div><div class="card-pad" style="padding-top:9px"><p class="desc">Read-only results from the same DNSMasq upstream file used by the installer warning.</p></div></div>
+    <div class="section-head" style="margin-top:0"><h3>Production DNS path</h3><span class="small-pill" id="pathPoolBadge">Pool: unknown</span></div>
+    <div class="card">
+      <div class="card-head"><div><div class="card-title">LAN → DNSMasq → Stubby → DoT upstream</div><div class="card-sub">Configured forwarding route · selected WAN pool</div></div><span class="tag" id="pathFeedBadge">Loading</span></div>
+      <div class="path-flow">
+        <div class="path-node"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="4" width="20" height="14" rx="2"/><path d="M8 22h8m-4-4v4"/></svg><strong>LAN query</strong><small>To router DNS</small></div><div class="flow-arrow">→</div>
+        <div class="path-node" id="pathDnsmasqNode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="2" width="18" height="8" rx="2"/><rect x="3" y="14" width="18" height="8" rx="2"/><path d="M7 6h.01M7 18h.01"/></svg><strong>DNSMasq</strong><small id="pathDnsmasqDetail">Checking default route</small></div><div class="flow-arrow">→</div>
+        <div class="path-node" id="pathStubbyNode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2 4 5v6c0 5 3.5 9 8 11 4.5-2 8-6 8-11V5l-8-3Z"/><path d="M9 12l2 2 4-4"/></svg><strong>Stubby</strong><small id="pathStubbyDetail">Checking Strict DoT</small></div><div class="flow-arrow">→</div>
+        <div class="path-node" id="pathWanNode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c-4 5-4 13 0 18M12 3c4 5 4 13 0 18"/></svg><strong id="pathWanName">WAN pool</strong><small id="pathWanDetail">Membership unknown</small></div>
+      </div>
+      <div class="path-verification" id="pathVerification" aria-live="polite"></div>
+      <div class="card-pad" style="padding-top:0"><div class="note">These checks verify configuration, not actual LAN query traffic.</div></div>
+    </div>
+    <div class="section-head"><h3>Domain-scoped exceptions</h3><span class="small-pill" id="pathExceptionCount">Checking…</span></div>
+    <div class="card"><div class="card-head"><div><div class="card-title">DNSMasq routes that bypass Stubby</div><div class="card-sub">Read-only <code>/tmp/resolv.dnsmasq</code> · <code>server=/domain/IP</code></div></div><div id="exceptionList"></div><div class="card-pad" style="padding-top:9px"><p class="desc">Only matching domains use the listed direct upstream. Other names follow the default route, if configured. These rules do not reveal actual client query activity.</p></div></div>
   </section>
   <section id="backups" class="tab">
     <div class="section-head" style="margin-top:0"><h3>Backup &amp; Alternate Resolvers</h3><span class="hint">ResolvGuard-managed encrypted DNS backups</span></div>
-    <div class="note rg-config-note">Primary/preferred DNS is configured through <strong>ASUS WAN → DNS Privacy</strong>, not here. These backup endpoints are used only according to ResolvGuard's approved failover policy. Editing backup configuration may require renewed policy approval.</div>
+    <div class="note rg-config-note">Primary/preferred DNS is configured through <strong>ASUS WAN → Internet Connection → DNS Privacy Protocol/strong>, not here. These backup endpoints are used only according to ResolvGuard's approved failover policy. Editing backup configuration may require renewed policy approval.</div>
     <div class="card" style="margin-top:16px">
       <div class="card-head"><div><div class="card-title">Configured backup resolvers</div><div class="card-sub">Configured endpoints are not assumed healthy until independently checked</div></div><div style="display:flex;gap:8px;flex-wrap:wrap"><span class="small-pill" id="backupPoolState">Pool: unknown</span><span class="small-pill" id="backupCount">—</span></div></div>
       <div id="backupRows"><div class="empty">Loading configuration…</div></div>
@@ -825,10 +831,34 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     }
   }
   function renderPaths(){
-    const d=state.snapshot,rows=d?.exceptions||[];
-    $('exceptionList').innerHTML=!d||!d.exceptionsReadable?'<div class="empty">DNSMasq upstream file is not available to the snapshot collector. Exceptions cannot be assessed.</div>':
-      rows.length?rows.map(r=>`<div class="exception"><div><div class="muted">Matching domain scope</div><strong>${esc(r.domain)}</strong></div><div><div class="muted">Configured upstream</div><code>${esc(r.upstream)}</code></div><span class="warn-pill">Bypasses Stubby</span></div>`).join(''):
-      '<div class="empty"><strong>No domain-scoped rules reported</strong>No matching DNSMasq exceptions found in the current readable upstream file.</div>';
+    const d=state.feedConnected?state.snapshot:null;
+    const fresh=!!d&&!isStale(d);
+    const pool=String(d?.pool||'unknown');
+    const verified=fresh&&d?.activePoolVerified===true;
+    const active=verified&&Array.isArray(d.activeResolvers)?d.activeResolvers:[];
+    const checks=[
+      {title:'DNSMasq default',ok:fresh&&d?.dnsmasqDefaultVerified===true,detail:'127.0.1.1 · Stubby listener'},
+      {title:'Stubby Strict DoT',ok:fresh&&d?.strictDoTVerified===true,detail:'Authenticated TLS configuration'},
+      {title:'WAN pool membership',ok:verified,detail:'Live WAN rulelist matches '+pool}
+    ];
+    $('pathPoolBadge').textContent='Pool: '+pool;
+    $('pathFeedBadge').textContent=!d?'Feed unavailable':fresh?'Current snapshot':'Stale snapshot';
+    $('pathDnsmasqDetail').textContent=checks[0].ok?'Default route verified':'Not verified';
+    $('pathStubbyDetail').textContent=checks[1].ok?'Strict DoT configured':'Not verified';
+    $('pathWanName').textContent=pool==='unknown'?'WAN pool':pool;
+    $('pathWanDetail').textContent=verified?active.length+' active member(s)':'Unverified membership';
+    ['pathDnsmasqNode','pathStubbyNode','pathWanNode'].forEach((id,i)=>{
+      $(id).classList.toggle('path-node-verified',checks[i].ok);
+      $(id).classList.toggle('path-node-unverified',!checks[i].ok);
+    });
+    $('pathWanNode').classList.toggle('path-node-backup',verified&&/^(backup|wanpool)[0-9]+$/.test(pool));
+    $('pathWanNode').classList.toggle('path-node-filtered',verified&&/^filtered[12]$/.test(pool));
+    $('pathVerification').innerHTML=checks.map(c=>`<div class="path-check"><span class="path-check-label">${esc(c.title)}</span><strong class="${c.ok?'green':'amber'}">${c.ok?'Verified':'Not verified'}</strong><small>${esc(c.detail)}</small></div>`).join('');
+    const rows=fresh?(d.exceptions||[]):[];
+    $('pathExceptionCount').textContent=!fresh||!d.exceptionsReadable?'Unknown':rows.length+' scoped rule'+(rows.length===1?'':'s');
+    $('exceptionList').innerHTML=!fresh||!d.exceptionsReadable?'<div class="empty">No fresh, readable DNSMasq snapshot; exception status cannot be verified.</div>':
+      rows.length?rows.map(r=>`<div class="exception"><div><div class="muted">Matching domain</div><strong>${esc(r.domain)}</strong><div class="muted">Domain and matching subdomains</div></div><div><div class="muted">Direct upstream · DNSMasq rule</div><code>${esc(r.upstream)}</code><div class="muted">Outside the default Stubby route</div></div><span class="warn-pill">Scoped bypass</span></div>`).join(''):
+      '<div class="empty"><strong>No domain-scoped upstream rules</strong>No matching bypass entries found in the readable DNSMasq file.</div>';
   }
   function openInspector(id){const d=state.snapshot,r=(d?.activeResolvers||[]).find(x=>x.id===id)||(d?.resolvers||[]).find(x=>x.id===id);if(!r)return;
     $('inspectContent').innerHTML=`<h2>${esc(r.tls||r.id)} · ${esc(r.id)}</h2><p class="desc">Latest completed scheduled observation</p><div class="inspect-field"><span>Status</span><strong>${r.state==='ok'?'PASS':r.state==='fail'?'FAIL':'NOT OBSERVED'}</strong></div><div class="inspect-field"><span>DNS address</span><strong>${esc(r.ip)}:${esc(r.port)}</strong></div><div class="inspect-field"><span>TLS authentication</span><strong>${esc(r.tls)}</strong></div><div class="inspect-field"><span>Passed policy records</span><strong>${Number(r.policyPass||0)}</strong></div><div class="inspect-field"><span>Failed policy records</span><strong>${Number(r.policyFail||0)}</strong></div><p class="desc" style="margin-top:24px">The totals include repeated fast-confirmation probes where applicable. They are not unique DNS-policy counts.</p>`;
@@ -840,7 +870,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     }
   }
   function closeInspector(){$('inspectBackdrop').classList.remove('open');$('inspector').classList.remove('open');$('inspector').setAttribute('aria-hidden','true');}
-  function tab(name){state.tab=name;waveform.setVisible(name==='overview');syncWaveSignal(state.snapshot,state.feedConnected);document.querySelectorAll('[data-tab]').forEach(el=>{const active=el.dataset.tab===name;el.classList.toggle('active',active);});document.querySelectorAll('.tab').forEach(el=>el.classList.toggle('active',el.id===name));const m={overview:['Dashboard overview','Your DNS reliability, clearly visible.'],history:['Health history','Observed DNS reliability'],paths:['DNS paths & exceptions','Inspect DNSMasq domain-scoped Stubby bypasses.'],backups:['Backup & alternate resolvers','Manage ResolvGuard backup DoT endpoints.'],settings:['ResolvGuard settings','Configure monitoring thresholds and timing using TLS authentication.']}[name];$('pageTitle').textContent=m[0];$('pageDesc').textContent=m[1];if(name==='history')renderHistory();if(name==='paths')renderPaths();if(name==='settings'||name==='backups')loadConfig();}
+  function tab(name){state.tab=name;waveform.setVisible(name==='overview');syncWaveSignal(state.snapshot,state.feedConnected);document.querySelectorAll('[data-tab]').forEach(el=>{const active=el.dataset.tab===name;el.classList.toggle('active',active);});document.querySelectorAll('.tab').forEach(el=>el.classList.toggle('active',el.id===name));const m={overview:['Dashboard overview','Your DNS reliability, clearly visible.'],history:['Health history','Observed DNS reliability'],paths:['DNS paths & exceptions','Inspect production routing, monitor probes, and scoped bypasses.'],backups:['Backup & alternate resolvers','Manage ResolvGuard backup DoT endpoints.'],settings:['ResolvGuard settings','Configure monitoring thresholds and timing using TLS authentication.']}[name];$('pageTitle').textContent=m[0];$('pageDesc').textContent=m[1];if(name==='history')renderHistory();if(name==='paths')renderPaths();if(name==='settings'||name==='backups')loadConfig();}
   async function load(url){const response=await fetch(url+'?t='+Date.now(),{cache:'no-store',credentials:'same-origin'});if(!response.ok)throw Error('HTTP '+response.status);const d=JSON.parse(await response.text());if(d.schema!==1)throw Error('Unsupported feed schema');return d;}
   async function refresh(){if(state.polling)return;state.polling=true;try{
       const d=await load('/ext/ResolvGuard/status.htm');
@@ -889,6 +919,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
       $('heroHeading').textContent='Cannot load ResolvGuard data.';
       $('heroText').textContent='The WebUI data feed is unavailable. No health state is assumed. Confirm the WebUI publisher is installed and a scheduled check has completed.';
       console.warn('ResolvGuard feed:',e.message);
+      if(state.tab==='paths')renderPaths();
     }finally{state.polling=false;}
   }
   document.addEventListener('click',e=>{
