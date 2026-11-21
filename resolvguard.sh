@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.2
-readonly SCRIPT_VERSTAG="26112110"
+readonly SCRIPT_VERSTAG="26112111"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -7732,26 +7732,6 @@ _ShowDiscoveredProvidersAndPools_() {
   fi
 }
 
-_ShowPolicyMenu_() {
-  local choice
-  while :; do
-    _ShowHeader_ 'Advanced Policy Administration'
-    _PrintMenuItem_ ap 'Review / Approve DNS Policy'
-    _PrintMenuItem_ rp 'Revoke DNS Policy'
-    _PrintMenuItem_ e 'Back'
-    _PrintMenuFooter_
-    IFS= read -r choice || return 0
-    choice="$(_NormalizeMenuChoice_ "$choice")"
-    printf '\n'
-    case "$choice" in
-      AP) _ApprovePolicy_; _PromptEnter_ ;;
-      RP) _RevokePolicy_; _PromptEnter_ ;;
-      E|EXIT) return 0 ;;
-      *) _ShowInvalidSelection_ ;;
-    esac
-  done
-}
-
 _ShowAdvancedSettingsMenu_() {
   local choice
   while :; do
@@ -8189,7 +8169,6 @@ _ShowAdvancedOptionsMenu_() {
     _ShowHeader_ 'Advanced Options'
     _PrintMenuItem_ dc 'DNS Configuration, Health Checks and Resolvers'
     _PrintMenuItem_ md 'Monitoring, Diagnostics & Logs'
-    _PrintMenuItem_ pa 'Policy Approval and Revocation'
     _PrintMenuItem_ mr 'Maintenance & Recovery'
     _PrintMenuItem_ e 'Back'
     _PrintMenuFooter_
@@ -8200,7 +8179,6 @@ _ShowAdvancedOptionsMenu_() {
       DC) _ShowConfigurationMenu_ ;;
       # Backwards-compatible hidden alias: dt opens the merged diagnostics menu.
       MD|DT) _ShowMonitoringDiagnosticsMenu_ ;;
-      PA) _ShowPolicyMenu_ ;;
       MR) _ShowAdvancedSettingsMenu_ ;;
       E|EXIT) return 0 ;;
       *) _ShowInvalidSelection_ ;;
@@ -8240,7 +8218,7 @@ _ToggleAutomaticFailover_() {
 # Blank Enter at any selection menu is invalid; only e/exit navigates.
 # Defaults and confirmation prompts intentionally retain their own Enter semantics.
 _MainMenu_() {
-  local choice state
+  local choice state policy_action
   while :; do
     _ShowHeader_ 'Main Menu'
     if ! _IsQuickSetupComplete_; then
@@ -8260,6 +8238,17 @@ _MainMenu_() {
     else
       _PrintMenuItem_ af "Automatic DNS Failover: $state (Toggle)"
     fi
+    # Read the approval record itself, not the failover marker: a CHANGED,
+    # MISSING, INVALID or BLOCKED approval needs review; only VALID can revoke.
+    # Remember the rendered action so a concurrent WebUI policy change cannot
+    # silently turn an expected approval into revocation (or vice versa).
+    if _GetPolicyApprovalState_ >/dev/null 2>&1; then
+      policy_action='revoke'
+      _PrintMenuItem_ pa 'DNS Policy Approval: REVOKE (Approved)'
+    else
+      policy_action='approve'
+      _PrintMenuItem_ pa 'DNS Policy Approval: APPROVE (Approval Required)'
+    fi
     _PrintMenuItem_ vs 'View Status'
     _PrintMenuItem_ ch 'Check DNS Health Now'
     _PrintMenuItem_ in 'Inspect Live DNS'
@@ -8278,6 +8267,29 @@ _MainMenu_() {
         fi
         _PromptEnter_ ;;
       AF) _ToggleAutomaticFailover_; _PromptEnter_ ;;
+      PA)
+        # Never choose the opposite operation when the policy has changed
+        # between rendering the menu and the administrator's selection.
+        if [ "$policy_action" = revoke ]; then
+          if _GetPolicyApprovalState_ >/dev/null 2>&1; then
+            _RevokePolicy_
+          else
+            _Say_ 'DNS policy changed since this menu was displayed. Review the refreshed menu.'
+          fi
+        else
+          if _GetPolicyApprovalState_ >/dev/null 2>&1; then
+            _Say_ 'DNS policy became approved since this menu was displayed. Review the refreshed menu.'
+          else
+            # Approval of a changed policy may release an existing safety hold
+            # when unattended switching was previously enabled. Make that
+            # effect explicit before the unchanged review/consent workflow.
+            if [ -r "$AUTO_FAILOVER_MARKER" ] && [ -r "$SCHEDULE_MARKER" ]; then
+              _Say_ 'WARNING: Reapproving this policy may immediately resume automatic WAN switching.'
+            fi
+            _ApprovePolicy_
+          fi
+        fi
+        _PromptEnter_ ;;
       VS) _ShowQuickStatus_; _PromptEnter_ ;;
       CH) _ValidateConfiguration_ >/dev/null && _RunDNSHealthCheck_; _PromptEnter_ ;;
       IN) _InspectAndSaveHealthCheck_; _PromptEnter_ ;;
@@ -8379,7 +8391,7 @@ probe is a read-only DNS response inspector. Main Menu IN option can save select
 Install and first run initialize missing config/settings.conf, config/checks.tsv and config/extra-providers.tsv without overwriting existing files.
 Quick Setup checks for Entware bind-dig and offers to install it with permission if missing. A separate onboarding completion record is written only after successful setup (including Monitoring Only or deliberately inactive operation). Run dependencies to check/install dig separately.
 Install creates a shared services-start hook for the independent WebUI. It does not enable cron, DNS monitoring, or automatic failover.
-Main Menu toggles Automatic DNS Failover; policy review and scheduling are integrated.
+Main Menu toggles Automatic DNS Failover and offers a single context-sensitive DNS Policy Approval action (Approve when not valid, Revoke when valid); policy review and explicit confirmation remain required.
 Unattended failover requires a persistent, operator-approved DNS policy.
 Unexpected answer data/count is monitored as resolver-health failure. Automatic WAN switching still requires corroboration, a safe independently verified destination, and approved policy. An uncorroborated or universally stale DNS policy cannot authorize a switch.
 On boot, startup re-registers cron and reconciles known WAN state without WAN writes.
