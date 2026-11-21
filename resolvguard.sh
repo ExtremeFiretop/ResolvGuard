@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.2
-readonly SCRIPT_VERSTAG="26112104"
+readonly SCRIPT_VERSTAG="26112105"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -7730,6 +7730,9 @@ _ShowQuickStatus_() {
   local active mode approval pool_summary sync_ok
   local pool_colour mode_colour approval_colour
 
+  # View Status must also work when Quick Setup preferred enrollment is declined.
+  # The optional filtered-pool note below reads active even in that state.
+  active='NOT ENROLLED'
   sync_ok=1
   _ShowHeader_ 'Protection Status'
 
