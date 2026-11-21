@@ -1001,11 +1001,14 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     const ubPort=String(d?.unboundPort||'unknown');
     const stubbyVerified=fresh&&d?.strictDoTVerified===true;
     const dnsmasqConfigured=fresh&&d?.dnsmasqDefaultVerified===true;
+    // Separate the read-only DNSMasq -> Unbound configuration check from the
+    // stricter WAN-switching readiness gate (which rejects recursive Unbound).
+    const unboundDnsmasqConfigured=fresh&&d?.dnsmasqUnboundConfigured===true;
     const wanVerified=verified&&viaStubby;
     const checks=[];
     if(viaUnbound){
-      checks.push({title:'DNSMasq route',state:direct?'Bypassed':dnsmasqConfigured?'Configuration verified':'Not verified',ok:!direct&&dnsmasqConfigured,
-        detail:direct?'DNSMasq DNS disabled in config':'Configured server: 127.0.0.1:53535 · LAN traffic not traced'});
+      checks.push({title:'DNSMasq route',state:direct?'Bypassed':unboundDnsmasqConfigured?'Configured':'Route detected',ok:!direct&&unboundDnsmasqConfigured,
+        detail:direct?'DNSMasq DNS disabled in config':unboundDnsmasqConfigured?'Exclusive default: 127.0.0.1:53535 · LAN traffic not traced':'Server: 127.0.0.1:53535 · exclusive default not verified; LAN traffic not traced'});
       checks.push({title:'Unbound',state:ubRunning?'Running':'Not running',ok:ubRunning,
         detail:ubPort==='unknown'?'Configured listener unknown':'Configured port '+ubPort+' · live listener not tested'});
       checks.push({title:'Unbound upstream',state:upstream==='stubby'?'Stubby forwarding':upstream==='recursive'?'Recursive mode':upstream==='other'?'Other forwarder':'Unknown',ok:upstream==='stubby'||upstream==='recursive',
@@ -1031,7 +1034,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     $('pathRouteDescription').textContent=viaUnbound?'Unbound configuration detected · LAN traffic not traced':'Configured forwarding route · selected WAN pool';
     $('pathPoolBadge').textContent=viaUnbound&&!viaStubby?'Unbound path':'Pool: '+pool;
     $('pathFeedBadge').textContent=!d?'Feed unavailable':fresh?'Current snapshot':'Stale snapshot';
-    $('pathDnsmasqDetail').textContent=viaUnbound?dnsmasqConfigured?'Unbound forwarding configuration verified':'Unbound forwarding unverified':checks[0].ok?'Default route verified':'Not verified';
+    $('pathDnsmasqDetail').textContent=viaUnbound?direct?'DNSMasq DNS bypassed':unboundDnsmasqConfigured?'Configured Unbound forwarding':'Unbound forwarding route detected; not fully verified':checks[0].ok?'Default route verified':'Not verified';
     $('pathUnboundDetail').textContent=ubRunning?'Process running · port '+ubPort:'Process not running';
     $('pathStubbyDetail').textContent=stubbyVerified?'Strict DoT configured':'Not verified';
     $('pathWanName').textContent=finalName;

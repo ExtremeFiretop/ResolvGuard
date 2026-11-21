@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.2
-readonly SCRIPT_VERSTAG="26112106"
+readonly SCRIPT_VERSTAG="26112107"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -5654,10 +5654,12 @@ _RGWebUI_() (
         fi
         ;;
     esac
-    # Configuration checks only: these do not verify end-to-end LAN queries.
-    # Use the same read-only forwarding validator as the WAN safety gate, so
-    # DNS Paths reports direct Stubby and Unbound -> Stubby consistently.
+    # Read-only configuration facts, NOT end-to-end LAN traffic tests.
+    # Keep strict production forwarding validation unchanged for WAN switching.
+    # A separate DNSMasq -> Unbound configuration fact is needed for recursive
+    # Unbound: its lack of Stubby forwarding must not mark DNSMasq as broken.
     dnsmasq_verified=false
+    dnsmasq_unbound_configured=false
     strict_dot_verified=false
     if _VerifyLANForwardingConfig_ >/dev/null 2>&1; then
       dnsmasq_verified=true
@@ -5666,6 +5668,10 @@ _RGWebUI_() (
     IFS='|' read -r unbound_present unbound_running unbound_port unbound_route unbound_upstream <<EOF_UNBOUND
 $unbound_info
 EOF_UNBOUND
+    if [ "$unbound_route" = dnsmasq ] &&
+       _VerifyDNSMasqUnboundConfig_ >/dev/null 2>&1; then
+      dnsmasq_unbound_configured=true
+    fi
     if _IsStrictProductionDoT_ >/dev/null 2>&1; then
       strict_dot_verified=true
     fi
@@ -5679,7 +5685,7 @@ EOF_UNBOUND
       printf ',"pool":';jsonq "$current_pool"
       printf ',"mode":';jsonq "$mode"
       printf ',"scheduleMinutes":%s' "$(number "$interval")"
-      printf ',"dnsmasqDefaultVerified":%s,"strictDoTVerified":%s' "$dnsmasq_verified" "$strict_dot_verified"
+      printf ',"dnsmasqDefaultVerified":%s,"dnsmasqUnboundConfigured":%s,"strictDoTVerified":%s' "$dnsmasq_verified" "$dnsmasq_unbound_configured" "$strict_dot_verified"
       printf ',"unboundDetected":%s,"unboundRunning":%s' "$unbound_present" "$unbound_running"
       printf ',"unboundPort":';jsonq "$unbound_port"
       printf ',"unboundRoute":';jsonq "$unbound_route"
