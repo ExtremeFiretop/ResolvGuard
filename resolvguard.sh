@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.2
-readonly SCRIPT_VERSTAG="26112108"
+readonly SCRIPT_VERSTAG="26112110"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -3225,9 +3225,15 @@ _ShowPolicyStatus_() {
 # a one-time claim that every upstream is healthy at this instant. Scheduled
 # health checks must independently prove safe endpoints before any WAN write.
 _ApprovePolicy_() (
-  local fingerprint staged approval_prompt view count
+  local fingerprint staged approval_prompt view count reviewed_fingerprint
   approval_prompt="${1:-Approve DNS policy?}"
   view="${2:-detail}"
+  reviewed_fingerprint="${3:-}"
+  if [ "$view" = web ]; then
+    case "$reviewed_fingerprint" in ''|*[!0-9a-f]*)
+      _Fail_ 'WebUI approval requires a reviewed SHA256 policy fingerprint'; return 1;; esac
+    [ "${#reviewed_fingerprint}" -eq 64 ] || return 1
+  fi
   RG_POLICY_CONFIG_HELD=0
   RG_POLICY_WAN_HELD=0
   RG_MAINTENANCE_PRIORITY_HELD=0
@@ -3260,6 +3266,15 @@ _ApprovePolicy_() (
     _Fail_ 'No alternate WAN-derived or independent backup pool configured; switching policy cannot be approved'; return 1; }
   fingerprint="$(_GetPolicyFingerprint_)" || {
     _Fail_ 'Unable to fingerprint the DNS policy'; return 1; }
+  if [ "$view" = web ]; then
+    # The browser explicitly reviewed THIS policy. Fail closed if even a single
+    # resolver, threshold, health check, or integration setting has changed.
+    [ "$fingerprint" = "$reviewed_fingerprint" ] || {
+      _Fail_ 'Policy changed since the WebUI review; refresh and review again'; return 1; }
+    if _RecursiveUnboundProduction_; then
+      _Fail_ 'Automatic failover policy cannot be approved for recursive Unbound'; return 1
+    fi
+  fi
   if [ "$view" = quick ]; then
     printf '  Preferred DNS: %sStrict authenticated DoT verified%s\n' "$RG_GREEN" "$RG_RESET"
     printf '  Alternate groups: %s configured\n' "$count"
@@ -3274,30 +3289,34 @@ _ApprovePolicy_() (
     done < "$CHECKS"
   fi
   _Say_ ''
-  # Never hold a WAN lock, config lock, or priority reservation while an
-  # administrator reads the policy or considers the approval prompt.
-  # Monitoring therefore runs normally during an arbitrarily long review.
-  _ReleasePolicyConfigLock_ || {
-    _Fail_ 'Unable to release configuration lock before confirmation'
-    return 1
-  }
-  _ReleasePolicyWANLock_ || {
-    _Fail_ 'Unable to release DNS lock before confirmation'
-    return 1
-  }
-  _ReleaseMaintenancePriority_ || {
-    _Fail_ 'Unable to release interactive priority before confirmation'
-    return 1
-  }
-  if [ "$view" = quick ]; then
-    _ConfirmYesNo_ "$approval_prompt" quiet || return 1
-  else
-    _ConfirmYesNo_ "$approval_prompt" || return 1
+  if [ "$view" != web ]; then
+    # Never hold a WAN lock, config lock, or priority reservation while an
+    # administrator reads the policy or considers the approval prompt.
+    # Monitoring therefore runs normally during an arbitrarily long review.
+    _ReleasePolicyConfigLock_ || {
+      _Fail_ 'Unable to release configuration lock before confirmation'
+      return 1
+    }
+    _ReleasePolicyWANLock_ || {
+      _Fail_ 'Unable to release DNS lock before confirmation'
+      return 1
+    }
+    _ReleaseMaintenancePriority_ || {
+      _Fail_ 'Unable to release interactive priority before confirmation'
+      return 1
+    }
+    if [ "$view" = quick ]; then
+      _ConfirmYesNo_ "$approval_prompt" quiet || return 1
+    else
+      _ConfirmYesNo_ "$approval_prompt" || return 1
+    fi
   fi
   # Re-establish priority after consent, then verify the reviewed policy
   # under both locks before persisting any approval.
-  _AcquireWANLockForPolicy_ || return 1
-  _AcquireConfigLockForPolicy_ || return 1
+  if [ "$view" != web ]; then
+    _AcquireWANLockForPolicy_ || return 1
+    _AcquireConfigLockForPolicy_ || return 1
+  fi
   [ ! -e "$PENDING_TRANSACTION" ] && [ ! -L "$PENDING_TRANSACTION" ] &&
     [ ! -e "$RECOVERY_HOLD" ] && [ ! -L "$RECOVERY_HOLD" ] || {
     _Fail_ 'WAN recovery state changed during review; approval refused'; return 1; }
@@ -5192,7 +5211,59 @@ _RGWebConfig_() (
           rg_hold=true
         fi
       fi
-      printf '},"monitoringEnabled":%s,"autoFailoverEnabled":%s,"requiresPolicyReview":%s,"policySafetyHold":%s,' \
+      # Review data is a read-only representation of the same v5 policy
+      # fingerprint accepted by the CLI. The approval operation rechecks it
+      # under WAN/config locks; these fields never grant permission themselves.
+      rg_approval="$(_GetPolicyApprovalState_ 2>/dev/null || :)"
+      rg_approval_code="${rg_approval%% *}"
+      case "$rg_approval_code" in VALID|MISSING|CHANGED|INVALID|BLOCKED) :;; *) rg_approval_code=BLOCKED;; esac
+      rg_fingerprint="$(_GetPolicyFingerprint_ 2>/dev/null || :)"
+      case "$rg_fingerprint" in ''|*[!0-9a-f]*) rg_fingerprint='';; esac
+      [ "${#rg_fingerprint}" -eq 64 ] || rg_fingerprint=''
+      rg_pool="$(_GetActiveWANPool_ 2>/dev/null || :)"
+      rg_reviewable=false
+      if [ "$rg_recursive" = false ] && [ "$rg_pool" = preferred ] &&
+         [ -n "$rg_fingerprint" ] && [ ! -e "$PENDING_TRANSACTION" ] &&
+         [ ! -e "$RECOVERY_HOLD" ]; then rg_reviewable=true; fi
+      printf '},"policy":{"approval":'; rg_quote "$rg_approval_code"
+      printf ',"message":'; rg_quote "$rg_approval"
+      printf ',"fingerprint":'; rg_quote "$rg_fingerprint"
+      printf ',"preferredRulelist":'; rg_quote "$(cat "$PREF_RULELIST" 2>/dev/null || :)"
+      printf ',"stubbyConfig":'; rg_quote "$WAN_STUBBY_CONFIG"
+      printf ',"caFile":'; rg_quote "$CA_FILE"
+      printf ',"reviewable":%s,"recursiveUnbound":%s,"automaticMarker":%s,' \
+        "$rg_reviewable" "$rg_recursive" \
+        "$( [ -f "$AUTO_FAILOVER_MARKER" ] && [ ! -L "$AUTO_FAILOVER_MARKER" ] && printf true || printf false )"
+      printf '"preferred":['
+      rg_sep=''
+      if [ -s "$PREF_PROVIDERS" ] && [ ! -L "$PREF_PROVIDERS" ]; then
+        while IFS='|' read -r rg_pid rg_pip rg_ptls rg_pinternal rg_pport rg_extra; do
+          case "$rg_pid" in wan[0-9]*) :;; *) continue;; esac
+          [ -z "$rg_extra" ] || continue
+          printf '%s{"id":' "$rg_sep"; rg_quote "$rg_pid"
+          printf ',"ip":';rg_quote "$rg_pip"
+          printf ',"tls":';rg_quote "$rg_ptls"
+          printf ',"port":';rg_quote "$rg_pport"
+          printf '}'
+          rg_sep=,
+        done < "$PREF_PROVIDERS"
+      fi
+      printf '],"checks":['
+      rg_sep=''
+      if [ -f "$CHECKS" ] && [ ! -L "$CHECKS" ]; then
+        while IFS='|' read -r rg_hostname rg_type rg_rcode rg_count rg_expected rg_extra; do
+          case "$rg_hostname" in ''|\#*) continue;; esac
+          [ -z "$rg_extra" ] || continue
+          printf '%s{"name":' "$rg_sep";rg_quote "$rg_hostname"
+          printf ',"type":';rg_quote "$rg_type"
+          printf ',"rcode":';rg_quote "$rg_rcode"
+          printf ',"minAnswers":';rg_quote "$rg_count"
+          printf ',"expected":';rg_quote "$rg_expected"
+          printf '}'
+          rg_sep=,
+        done < "$CHECKS"
+      fi
+      printf ']},"monitoringEnabled":%s,"autoFailoverEnabled":%s,"requiresPolicyReview":%s,"policySafetyHold":%s,' \
         "$( [ -f "$SCHEDULE_MARKER" ] && [ ! -L "$SCHEDULE_MARKER" ] && printf true || printf false )" \
         "$rg_auto" "$rg_hold" "$rg_hold"
       printf '"backups":['
@@ -5358,6 +5429,20 @@ EOF_RG_WEB_CONFIG
           case "$rg_a" in GO|CS|QS)
             if _InstallBackupPreset_ "$rg_a"; then rg_result_status=success;rg_message='Backup resolver pair saved; policy review required'; fi ;;
           esac
+        fi ;;
+      policy-approve)
+        rg_message='Policy approval blocked. Review the current policy and check /tmp/resolvguard-webui-config.log.'
+        if [ -z "$rg_b" ] && [ -z "$rg_c" ] && [ -z "$rg_d" ] &&
+           [ "${#rg_a}" -eq 64 ]; then
+          case "$rg_a" in ''|*[!0-9a-f]*) :;; *)
+            if _ApprovePolicy_ 'Approve reviewed WAN DNS policy?' web "$rg_a"; then
+              rg_result_status=success
+              if [ -f "$AUTO_FAILOVER_MARKER" ] && [ ! -L "$AUTO_FAILOVER_MARKER" ]; then
+                rg_message='Reviewed policy approved; existing failover authorization marker may resume switching'
+              else
+                rg_message='Reviewed policy approved; automatic failover remains disabled until enabled separately'
+              fi
+            fi;; esac
         fi ;;
       script-check|script-install)
         rg_message='Unable to check the selected update channel'
