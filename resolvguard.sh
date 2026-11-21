@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.2
-readonly SCRIPT_VERSTAG="26112012"
+readonly SCRIPT_VERSTAG="26112013"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -2371,8 +2371,7 @@ _WaitForProductionPool_() {
        _StubbyDaemonRunning_ &&
        _DNSMasqDaemonRunning_ &&
        _VerifyLANForwardingConfig_ &&
-       { [ "$mode" = monitoring ] ||
-         { _VerifyStubbyListenerResponse_ && _VerifyLANForwarding_; }; }; then
+       { [ "$mode" = monitoring ] || _VerifyTransactionForwardingResponses_; }; then
       if [ "$success_output" != quiet ]; then
         if [ "$mode" = monitoring ]; then
           _Say_ "Production Strict DoT service/configuration verified for $pool; monitoring can diagnose unhealthy upstreams."
@@ -2526,7 +2525,7 @@ unbound_path() {
           line=$0;sub(/[[:space:]]+#.*$/, "", line)
           # Unbound Manager writes "forward-zone:#Stubby" (marker attached
           # directly to the colon), not only "forward-zone:".
-          if (line ~ /^forward-zone:[[:space:]]*(#.*)?$/) {finish_zone();zone=1;next}
+          if (line ~ /^forward-zone:[[:space:]]*(#.*)?$/) {finish_zone();zones++;zone=1;next}
           # Unbound Manager emits unindented name/forward-addr lines.
           # These are zone members, not new top-level configuration blocks.
           if (line ~ /^[^[:space:]]/ && zone &&
@@ -2551,8 +2550,8 @@ unbound_path() {
         END {
           finish_zone()
           if (roots==0) print "recursive"
-          else if (roots==1 && verified==1) print "stubby"
-          else if (roots==1 && configured==1) print "other"
+          else if (roots==1 && verified==1 && zones==1) print "stubby"
+          else if (roots==1 && configured==1 && zones==1) print "other"
           else print "unknown"
         }
       ')
@@ -2587,6 +2586,72 @@ EOF_RG_UNBOUND_MODE
   return 1
 }
 
+# Stubby forwarding through Unbound is eligible for switching only when
+# Unbound Manager's complete effective root forwarding configuration has been
+# identified, its listener port is expected, and both daemons are running.
+# A mere #Stubby edit marker must never authorize WAN writes.
+_UnboundStubbyProduction_() {
+  local info present running port route upstream
+  info="$(unbound_path)" || return 1
+  IFS='|' read -r present running port route upstream <<EOF_RG_UNBOUND_STUBBY
+$info
+EOF_RG_UNBOUND_STUBBY
+  [ "$present" = true ] && [ "$running" = true ] &&
+    [ "$port" = 53535 ] && [ "$route" = dnsmasq ] &&
+    [ "$upstream" = stubby ]
+}
+
+# Unbound Manager replaces the direct Stubby servers-file declaration with
+# a single DNSMasq default forwarding endpoint. Reject any competing default
+# or domain-specific resolver, resolv-file, alternate upstream file or port=0;
+# otherwise a seemingly healthy LAN query might bypass monitored Stubby.
+_VerifyDNSMasqUnboundConfig_() {
+  [ -f "$DNSMASQ_MAIN" ] && [ ! -L "$DNSMASQ_MAIN" ] &&
+    [ -r "$DNSMASQ_MAIN" ] || return 1
+  LC_ALL=C awk '
+    {
+      line=$0
+      sub(/^[[:space:]]+/, "", line)
+      sub(/[[:space:]]+#.*$/, "", line)
+      sub(/[[:space:]]+$/, "", line)
+      if (line=="no-resolv") {no_resolv++; next}
+      if (line=="server=127.0.0.1#53535") {forwarders++; next}
+      if (line ~ /^(server=|servers-file=|resolv-file=|port=0([[:space:]]|$))/) invalid=1
+    }
+    END {exit !(no_resolv==1 && forwarders==1 && !invalid)}
+  ' "$DNSMASQ_MAIN" || {
+    _Say_ 'LAN DNS NOT READY: DNSMasq Unbound path has conflicting or missing forwarding rules'
+    return 1
+  }
+  return 0
+}
+
+# Unbound can advertise an additional IPv6 local Stubby listener. A selected
+# IPv6 loopback must respond as well; an unavailable listener fails closed.
+_UnboundStubbyIPv6Configured_() {
+  local config expanded
+  config=${RG_WEBUI_UNBOUND_CONFIG:-/opt/var/lib/unbound/unbound.conf}
+  RG_UNBOUND_SEEN='';RG_UNBOUND_FILES=0;RG_UNBOUND_BYTES=0
+  expanded=$(unbound_expand "$config" 0) || return 2
+  printf '%s\n' "$expanded" |
+    grep -Eq '^[[:space:]]*forward-addr:[[:space:]]*0::1@5453([[:space:]]|$)'
+}
+
+_VerifyUnboundStubbyListeners_() {
+  local ipv6_result
+  _VerifyStubbyListenerResponse_ || return 1
+  if _UnboundStubbyIPv6Configured_; then
+    _VerifyLocalDNSResponse_ '::1' stubby-ipv6 5453 || return 1
+  else
+    ipv6_result=$?
+    [ "$ipv6_result" -eq 1 ] || {
+      _Say_ 'INFRASTRUCTURE NOT READY: Unbound forwarding includes unavailable configuration files'
+      return 1
+    }
+  fi
+  _VerifyLocalDNSResponse_ 127.0.0.1 unbound 53535
+}
+
 _CheckLiveSwitchSafety_() {
   if _RecursiveUnboundProduction_; then
     _Fail_ 'WAN failover disabled in recursive Unbound mode; use Unbound Manager Integrate with Stubby'
@@ -2607,6 +2672,16 @@ _CheckLiveSwitchSafety_() {
     _VerifyLANForwardingConfig_ || {
       _Fail_ 'WAN switch blocked: local Strict DoT/DNSMasq forwarding ownership unverified'; return 1;
     }
+  # For an additional Unbound forwarding layer, authorization requires a
+  # live listener and LAN response as well as configuration ownership.
+  # The direct DNSMasq -> Stubby activation path is unchanged.
+  if grep -Eq '^[[:space:]]*server=127\.0\.0\.1#53535[[:space:]]*$' "$DNSMASQ_MAIN"; then
+    _VerifyLANForwarding_ || {
+      _Fail_ 'WAN switch blocked: Unbound -> Stubby listeners or LAN DNS are not ready'
+      return 1
+    }
+  fi
+  return 0
 }
 
 _CheckAutomaticRecoveryAuthorization_() {
@@ -2634,14 +2709,16 @@ _CheckAutomaticFailoverAuthorization_() {
 # SERVFAIL/NXDOMAIN/NOERROR can all be legitimate from an alive listener.
 # Unexpected/malformed data, dig failures or missing QR header fail closed.
 _VerifyLocalDNSResponse_() {
-  local server tag out got count flags
-  server="$1"; tag="$2"
+  local server tag port out got count flags
+  server="$1"; tag="$2"; port="${3:-}"
   out="$RUNTIME/infra-$tag-$$"
   # Query the DNS root (.) for NS records instead of generating arbitrary
   # subdomains beneath example.com. This only verifies a well-formed local
   # listener response; authenticated upstream health is checked separately.
   # Cached root NS data is acceptable for this local-listener readiness test.
-  if ! "$DIG" "@$server" . NS +time="$TIMEOUT_SECONDS" +tries=1 +noall +comments +answer +authority > "$out" 2>&1; then
+  set -- "@$server"
+  [ -z "$port" ] || set -- "$@" -p "$port"
+  if ! "$DIG" "$@" . NS +time="$TIMEOUT_SECONDS" +tries=1 +noall +comments +answer +authority > "$out" 2>&1; then
     _Say_ "INFRASTRUCTURE NOT READY: $tag listener did not answer"
     rm -f "$out"; return 1
   fi
@@ -2784,6 +2861,13 @@ EOF_DNSMASQ_SCOPED_SERVERS
 _ShowDNSMasqScopedSetupWarning_() {
   local domain_exceptions domain upstream
 
+  # On Unbound Manager's path, DNSMasq does not consume this direct-Stubby
+  # servers file. Avoid disclosing stale, non-production exceptions.
+  if [ -r "$DNSMASQ_MAIN" ] &&
+     grep -Eq '^[[:space:]]*server=127\.0\.0\.1#53535[[:space:]]*$' "$DNSMASQ_MAIN"; then
+    return 0
+  fi
+
   # The wizard and its authorization helper may both call this routine.
   # A disclosure and acknowledgement are needed only once per invocation.
   if [ "${RG_SCOPED_WARNING_SHOWN:-0}" = 1 ]; then
@@ -2861,24 +2945,33 @@ _VerifyLANForwardingConfig_() {
     return 1
   fi
 
-  if [ ! -r "$DNSMASQ_MAIN" ]; then
+  if [ ! -f "$DNSMASQ_MAIN" ] || [ -L "$DNSMASQ_MAIN" ] ||
+     [ ! -r "$DNSMASQ_MAIN" ]; then
     _Say_ "LAN DNS NOT READY: DNSMasq main configuration not readable: $DNSMASQ_MAIN"
     return 1
   fi
 
-  if [ ! -r "$DNSMASQ_SERVERS" ]; then
-    _Say_ "LAN DNS NOT READY: DNSMasq upstream servers file not readable: $DNSMASQ_SERVERS"
-    return 1
-  fi
-
-  if ! _ValidateDNSMasqUpstreamFile_; then
-    return 1
-  fi
-
-  if ! grep -Eq '^[[:space:]]*no-resolv[[:space:]]*$' "$DNSMASQ_MAIN" ||
-     ! grep -Eq '^[[:space:]]*servers-file=/tmp/resolv\.dnsmasq[[:space:]]*$' "$DNSMASQ_MAIN"; then
-    _Say_ 'LAN DNS NOT READY: DNSMasq does not declare its strict forwarding file'
-    return 1
+  if grep -Eq '^[[:space:]]*server=127\.0\.0\.1#53535[[:space:]]*$' "$DNSMASQ_MAIN"; then
+    # Validate DNSMasq's exclusive Unbound default first, then the effective
+    # Unbound root zone. Fail closed on recursion, forwarding elsewhere,
+    # missing/unreadable include files or an unavailable Unbound daemon.
+    _VerifyDNSMasqUnboundConfig_ || return 1
+    _UnboundStubbyProduction_ || {
+      _Say_ 'LAN DNS NOT READY: active Unbound root forwarding to Stubby is unverified'
+      return 1
+    }
+  else
+    # Preserve the original direct DNSMasq -> Stubby safety gate.
+    if [ ! -r "$DNSMASQ_SERVERS" ]; then
+      _Say_ "LAN DNS NOT READY: DNSMasq upstream servers file not readable: $DNSMASQ_SERVERS"
+      return 1
+    fi
+    _ValidateDNSMasqUpstreamFile_ || return 1
+    if ! grep -Eq '^[[:space:]]*no-resolv[[:space:]]*$' "$DNSMASQ_MAIN" ||
+       ! grep -Eq '^[[:space:]]*servers-file=/tmp/resolv\.dnsmasq[[:space:]]*$' "$DNSMASQ_MAIN"; then
+      _Say_ 'LAN DNS NOT READY: DNSMasq does not declare its strict forwarding file'
+      return 1
+    fi
   fi
 
   lan="$(_ReadNVRAM_ lan_ipaddr)"
@@ -2893,8 +2986,22 @@ _VerifyLANForwardingConfig_() {
 _VerifyLANForwarding_() {
   local lan
   _VerifyLANForwardingConfig_ || return 1
+  if grep -Eq '^[[:space:]]*server=127\.0\.0\.1#53535[[:space:]]*$' "$DNSMASQ_MAIN"; then
+    _UnboundStubbyProduction_ && _VerifyUnboundStubbyListeners_ || return 1
+  fi
   lan="$(_ReadNVRAM_ lan_ipaddr)"
   _VerifyLocalDNSResponse_ "$lan" lan
+}
+
+# One local-readiness chain per transaction attempt. Unbound mode verifies
+# both configured Stubby loopbacks, Unbound's real listener and LAN DNSMasq.
+# Direct Stubby preserves the original Stubby + LAN probe sequence.
+_VerifyTransactionForwardingResponses_() {
+  if grep -Eq '^[[:space:]]*server=127\.0\.0\.1#53535[[:space:]]*$' "$DNSMASQ_MAIN"; then
+    _VerifyLANForwarding_
+  else
+    _VerifyStubbyListenerResponse_ && _VerifyLANForwarding_
+  fi
 }
 
 # Persist the complete switching intent before touching WAN NVRAM.
@@ -5497,14 +5604,11 @@ _RGWebUI_() (
         ;;
     esac
     # Configuration checks only: these do not verify end-to-end LAN queries.
+    # Use the same read-only forwarding validator as the WAN safety gate, so
+    # DNS Paths reports direct Stubby and Unbound -> Stubby consistently.
     dnsmasq_verified=false
     strict_dot_verified=false
-    if [ -f "$DNSMASQ_SERVERS" ] && [ ! -L "$DNSMASQ_SERVERS" ] &&
-       [ -f "$DNSMASQ_MAIN" ] && [ ! -L "$DNSMASQ_MAIN" ] &&
-       grep -Eq '^[[:space:]]*no-resolv[[:space:]]*$' "$DNSMASQ_MAIN" &&
-       grep -Eq '^[[:space:]]*servers-file=/tmp/resolv\.dnsmasq[[:space:]]*$' "$DNSMASQ_MAIN" &&
-       ! grep -Eq '^[[:space:]]*(port=0|server=[^/])' "$DNSMASQ_MAIN" &&
-       _ValidateDNSMasqUpstreamFile_ >/dev/null 2>&1; then
+    if _VerifyLANForwardingConfig_ >/dev/null 2>&1; then
       dnsmasq_verified=true
     fi
     unbound_info=$(unbound_path)
