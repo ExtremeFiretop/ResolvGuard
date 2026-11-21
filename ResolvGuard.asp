@@ -24,6 +24,34 @@
 #rg-shell-title { color:#eff5f5; padding:14px 18px 0; background:#101d24; font-size:17px; font-weight:bold; }
 #rg-shell-subtitle { padding:4px 18px 10px; background:#101d24; color:#9ab3b9; font-size:12px; }
 #rg-native-host { padding:8px; background:#26353a; }
+/* The ASUS action_wait spinner is a timer, not a completion signal. The
+   embedded dashboard uses its own correlated-result progress dialog. */
+#Loading { display:none!important; }
+#rg-progress-backdrop[hidden] { display:none!important; }
+#rg-progress-backdrop { position:fixed; inset:0; z-index:30000; display:flex;
+  align-items:center; justify-content:center; background:rgba(4,11,15,.78);
+  padding:20px; backdrop-filter:blur(3px); }
+#rg-progress-dialog { width:min(410px,100%); padding:25px; background:#14242c;
+  color:#edf6f5; border:1px solid #40616a; border-radius:16px;
+  box-shadow:0 22px 65px rgba(0,0,0,.6); font:14px/1.5 Inter,Arial,sans-serif; }
+#rg-progress-top { display:flex; align-items:center; gap:15px; }
+#rg-progress-spin { width:38px; height:38px; flex-shrink:0; border-radius:50%;
+  border:4px solid #33565b; border-top-color:#63e8b6; animation:rg-progress-spin .8s linear infinite; }
+#rg-progress-spin.rg-done { animation:none; border-color:#63e8b6; }
+#rg-progress-spin.rg-error { animation:none; border-color:#ff817e; }
+@keyframes rg-progress-spin { to { transform:rotate(360deg); } }
+#rg-progress-title { font-weight:750; font-size:17px; line-height:1.3; }
+#rg-progress-status { margin-top:8px; font-size:12px; color:#b7d0d0; min-height:32px; }
+#rg-progress-track { width:100%; height:9px; margin-top:14px; overflow:hidden;
+  background:#283f46; border-radius:8px; }
+#rg-progress-fill { width:0; height:100%; border-radius:8px; background:#63e8b6;
+  transition:width .35s ease; }
+#rg-progress-number { margin-top:8px; text-align:right; font-weight:750; color:#c0f6e0; }
+#rg-progress-caption { font-size:11px; color:#94aeb4; margin:2px 0 0; }
+#rg-progress-close { display:block; margin:16px 0 0 auto; background:#1c4953;
+  color:#f2faf8; border:1px solid #4e7883; padding:8px 18px; border-radius:10px; cursor:pointer; }
+#rg-progress-close[hidden] { display:none!important; }
+@media(prefers-reduced-motion:reduce) { #rg-progress-spin { animation:none; } #rg-progress-fill {transition:none;} }
 </style>
 <script type="text/javascript">
 function rgRequestManualCheck() {
@@ -66,6 +94,64 @@ function rgFinishConfiguration() {
   try { if (typeof hideLoading === 'function') hideLoading(); } catch(e) {}
   var overlay=document.getElementById('Loading');
   if (overlay) overlay.style.display='none';
+}
+// Router results, not action_wait, determine when this reaches 100%.
+// The intermediate percentage is an estimate; it never claims a completed
+// update or configuration change before the matching request is acknowledged.
+var rgOperation={active:false,timer:null,closeTimer:null,started:0,timeout:0,percent:0};
+function rgProgressPaint(percent,detail) {
+  if(!rgOperation.active) return;
+  rgOperation.percent=Math.max(rgOperation.percent,Math.min(100,Math.floor(percent)));
+  document.getElementById('rg-progress-fill').style.width=rgOperation.percent+'%';
+  document.getElementById('rg-progress-number').textContent=rgOperation.percent+'%';
+  document.getElementById('rg-progress-track').setAttribute('aria-valuenow',String(rgOperation.percent));
+  if(typeof detail==='string') document.getElementById('rg-progress-status').textContent=detail;
+}
+function rgProgressDismiss() {
+  if(rgOperation.timer) clearInterval(rgOperation.timer);
+  if(rgOperation.closeTimer) clearTimeout(rgOperation.closeTimer);
+  rgOperation.timer=null;rgOperation.closeTimer=null;rgOperation.active=false;
+  document.getElementById('rg-progress-backdrop').hidden=true;
+}
+function rgBeginOperation(label,timeout) {
+  if(rgOperation.active) return false;
+  if(rgOperation.timer) clearInterval(rgOperation.timer);
+  if(rgOperation.closeTimer) clearTimeout(rgOperation.closeTimer);
+  rgOperation={active:true,timer:null,closeTimer:null,started:Date.now(),
+    timeout:Math.max(1000,Number(timeout)||25000),percent:0};
+  document.getElementById('rg-progress-title').textContent=label;
+  document.getElementById('rg-progress-spin').className='';
+  document.getElementById('rg-progress-close').hidden=true;
+  document.getElementById('rg-progress-caption').textContent='Progress estimated while waiting; 100% requires a router response.';
+  document.getElementById('rg-progress-backdrop').hidden=false;
+  rgProgressPaint(10,'Submitting an authenticated request to the router…');
+  rgOperation.timer=setInterval(function(){
+    // Stop short of 100%; the router's matched result controls completion.
+    var elapsed=Date.now()-rgOperation.started;
+    var estimate=10+80*(1-Math.exp(-elapsed/(rgOperation.timeout*.35)));
+    rgProgressPaint(Math.min(90,estimate));
+  },500);
+  return true;
+}
+function rgProgressStage(detail,percent) { rgProgressPaint(Math.min(95,Number(percent)||rgOperation.percent),detail); }
+function rgEndOperation(succeeded,detail,confirmed) {
+  if(!rgOperation.active) return;
+  if(rgOperation.timer) clearInterval(rgOperation.timer);
+  rgOperation.timer=null;
+  var spinner=document.getElementById('rg-progress-spin');
+  spinner.className=succeeded?'rg-done':'rg-error';
+  if(confirmed){
+    rgProgressPaint(100,detail||(succeeded?'Router confirmed completion.':'Router reported an error.'));
+    document.getElementById('rg-progress-caption').textContent=succeeded?'Completed and confirmed by router.':'Router responded; this operation needs attention.';
+  }else{
+    rgProgressPaint(rgOperation.percent,detail||'Router confirmation missing. Check SSH before retrying.');
+    document.getElementById('rg-progress-caption').textContent='Unable to confirm completion; percentage intentionally stopped below 100%.';
+  }
+  if(succeeded&&confirmed){
+    rgOperation.closeTimer=setTimeout(rgProgressDismiss,1600);
+  }else{
+    document.getElementById('rg-progress-close').hidden=false;
+  }
 }
 function initial() {
   if (typeof show_menu === 'function') show_menu();
@@ -111,6 +197,15 @@ function rgDashboardLoaded() {
 <body class="bg" onload="initial();">
 <div id="TopBanner"></div>
 <div id="Loading" class="popup_bg"></div>
+<div id="rg-progress-backdrop" hidden>
+  <div id="rg-progress-dialog" role="dialog" aria-modal="true" aria-labelledby="rg-progress-title" aria-describedby="rg-progress-status">
+    <div id="rg-progress-top"><div id="rg-progress-spin" aria-hidden="true"></div><div id="rg-progress-title">Working…</div></div>
+    <div id="rg-progress-status" role="status" aria-live="polite">Waiting for router…</div>
+    <div id="rg-progress-track" role="progressbar" aria-label="Estimated operation progress" aria-valuemin="0" aria-valuemax="100"><div id="rg-progress-fill"></div></div>
+    <div id="rg-progress-number">0%</div><p id="rg-progress-caption"></p>
+    <button type="button" id="rg-progress-close" onclick="rgProgressDismiss()" hidden>Dismiss</button>
+  </div>
+</div>
 <table class="content" cellpadding="0" cellspacing="0" style="margin:0 auto;">
 <tr><td width="17">&nbsp;</td><td width="202" valign="top">
 <div id="mainMenu"></div><div id="subMenu"></div>
@@ -144,7 +239,7 @@ function rgDashboardLoaded() {
   <input type="hidden" name="action_script" value="" />
   <input type="hidden" name="amng_custom" value="" />
   <input type="hidden" name="action_mode" value="apply" />
-  <input type="hidden" name="action_wait" value="10" />
+  <input type="hidden" name="action_wait" value="0" />
   <input type="hidden" name="current_page" value="" />
   <input type="hidden" name="next_page" value="" />
   <input type="hidden" name="modified" value="0" />
@@ -494,16 +589,16 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     <div class="section-head" style="margin-top:0"><h3>ResolvGuard settings</h3></div>
     <div class="note rg-config-note">These settings govern ResolvGuard's monitoring behavior.</div>
     <div class="card" style="margin-top:16px">
-      <div class="card-head"><div><div class="card-title">Monitoring &amp; health-check parameters</div><div class="card-sub" id="settingsSummary">Loading saved configuration…</div></div></div>
-      <div id="settingsRows"></div>
-    </div>
-    <div class="card" style="margin-top:16px">
       <div class="card-head"><div><div class="card-title">Script Maintenance</div><div class="card-sub">Check the selected ResolvGuard channel before installing</div></div></div>
       <div class="card-pad">
         <div class="rg-script-info"><div><span class="hint">Installed version</span><strong id="scriptInstalled">Loading…</strong></div><div><span class="hint">Update channel</span><strong id="scriptChannel">—</strong></div></div>
         <div class="rg-actions"><button type="button" class="btn" id="scriptCheck" disabled>Check for Updates</button><button type="button" class="btn primary" id="scriptInstall" hidden disabled>Update Now</button><button type="button" class="btn" id="scriptReload" hidden>Reload WebUI</button></div>
         <p class="desc" id="scriptUpdateFeedback" role="status" aria-live="polite">No update check performed.</p>
       </div>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <div class="card-head"><div><div class="card-title">Monitoring &amp; health-check parameters</div><div class="card-sub" id="settingsSummary">Loading saved configuration…</div></div></div>
+      <div id="settingsRows"></div>
     </div>
   </section>
   <div class="rg-configuration-status" id="configFeedback" role="status" aria-live="polite" hidden></div>
@@ -1407,23 +1502,34 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     const requestId=payload.split('|')[0];
     const previousRevision=Number(state.config.revision||0);
     controlsBusy(true);configNotice('Submitting configuration request to Merlin…');
+    let received=null,finishOk=false,finishMsg='';
     try {
-      if(window.parent===window || typeof window.parent.rgRequestConfiguration!=='function' || !window.parent.rgRequestConfiguration(payload))
+      if(window.parent===window || typeof window.parent.rgBeginOperation!=='function' ||
+         !window.parent.rgBeginOperation('Applying ResolvGuard settings',25000))
+        throw Error('Unable to open authenticated configuration progress.');
+      if(typeof window.parent.rgProgressStage==='function') window.parent.rgProgressStage('Waiting for configuration confirmation…',15);
+      if(typeof window.parent.rgRequestConfiguration!=='function' || !window.parent.rgRequestConfiguration(payload))
         throw Error('Open this page through WAN → ResolvGuard to use authenticated settings.');
-      const began=Date.now();let received=null;
+      const began=Date.now();
       while(Date.now()-began<25000){
         await new Promise(resolve=>setTimeout(resolve,1000));
         try{const d=await load('/ext/ResolvGuard/config-action.htm');if(d.requestId===requestId){received=d;break;}}catch(e){}
       }
       if(!received)throw Error('No matching response from the router. Check /tmp/resolvguard-webui-config.log; do not assume the setting was saved.');
       if(received.status!=='success')throw Error(received.message||'The router rejected the configuration request.');
+      if(typeof window.parent.rgProgressStage==='function') window.parent.rgProgressStage('Router confirmed the save. Refreshing settings…',95);
       configNotice(received.message||'Configuration saved');
-      if(!await loadConfig(previousRevision))
+      const snapshotOk=await loadConfig(previousRevision);
+      if(!snapshotOk)
         configNotice('Router confirmed the save, but the new configuration snapshot is unavailable. Further edits are disabled until refreshed.',true);
       await refresh();
       resetBackup();
-    }catch(e){configNotice(e.message,true);}finally{
+      finishOk=snapshotOk;
+      finishMsg=snapshotOk?'Configuration saved and refreshed.':'Saved, but the refreshed configuration is unavailable.';
+    }catch(e){finishMsg=e.message||'Configuration request failed.';configNotice(finishMsg,true);}finally{
       controlsBusy(false);
+      try{if(window.parent!==window&&typeof window.parent.rgEndOperation==='function')
+        window.parent.rgEndOperation(finishOk,finishMsg,!!received);}catch(e){}
       // The firmware may keep its 'Complete' overlay after the action has
       // already finished. Never leave a blocking spinner over the dashboard.
       try { if(window.parent!==window && typeof window.parent.rgFinishConfiguration==='function') window.parent.rgFinishConfiguration(); }catch(e){}
@@ -1449,11 +1555,17 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
       state.updateAvailable=false;$('scriptInstall').hidden=true;
     }
     updateNotice(mode==='script-check'?'Checking '+script.channel+' for updates…':'Installing verified script update…');
+    let result=null,finishOk=false,finishMsg='';
     try{
-      if(window.parent===window||typeof window.parent.rgRequestConfiguration!=='function'||!window.parent.rgRequestConfiguration(payload))
-        throw Error('Open WAN → ResolvGuard to use authenticated updates.');
-      const started=Date.now();let result=null;
+      const title=mode==='script-check'?'Checking ResolvGuard updates':'Installing ResolvGuard update';
       const timeout=mode==='script-install'?240000:120000;
+      if(window.parent===window||typeof window.parent.rgBeginOperation!=='function'||
+         !window.parent.rgBeginOperation(title,timeout))
+        throw Error('Unable to open authenticated update progress.');
+      if(typeof window.parent.rgProgressStage==='function') window.parent.rgProgressStage('Waiting for the selected update channel…',15);
+      if(typeof window.parent.rgRequestConfiguration!=='function'||!window.parent.rgRequestConfiguration(payload))
+        throw Error('Open WAN → ResolvGuard to use authenticated updates.');
+      const started=Date.now();
       while(Date.now()-started<timeout){
         await new Promise(resolve=>setTimeout(resolve,1000));
         try{const d=await load('/ext/ResolvGuard/config-action.htm');if(d.requestId===requestId){result=d;break;}}catch(e){}
@@ -1461,6 +1573,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
       if(!result)throw Error('No matching router response. Inspect the installed version in SSH before retrying.');
       if(result.channel!==script.channel)throw Error('Update channel changed. Refresh and check again.');
       const availableVersion=String(result.latestVersion||''),availableBuild=String(result.latestBuild||'');
+      if(typeof window.parent.rgProgressStage==='function') window.parent.rgProgressStage('Router returned an update result. Verifying…',95);
       if(result.status==='available'&&mode==='script-check'){
         if(!/^\d+(\.\d+){1,3}$/.test(availableVersion)||
            (script.channel==='development'&&!/^\d{8,14}$/.test(availableBuild)))throw Error('Invalid remote version.');
@@ -1473,11 +1586,16 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
         state.updateAvailable=false;$('scriptInstall').hidden=true;$('scriptReload').hidden=false;
         updateNotice('Update installed and verified. Reload the WebUI to use the new version.','success');
       }else throw Error(result.message||'The router rejected the update request.');
+      finishOk=true;
+      finishMsg=mode==='script-install'?'Update installed and verified. Reload WebUI to use it.':
+        (result.status==='available'?'Update available.':'Update check complete.');
     }catch(e){
       if(mode==='script-install'){state.updateAvailable=false;$('scriptInstall').hidden=true;}
-      updateNotice(e.message||'Update check failed.','error');
+      finishMsg=e.message||'Update check failed.';updateNotice(finishMsg,'error');
     }finally{
       state.updateBusy=false;controlsBusy(false);
+      try{if(window.parent!==window&&typeof window.parent.rgEndOperation==='function')
+        window.parent.rgEndOperation(finishOk,finishMsg,!!result);}catch(e){}
       try{if(window.parent!==window&&typeof window.parent.rgFinishConfiguration==='function')window.parent.rgFinishConfiguration();}catch(e){}
     }
   }
