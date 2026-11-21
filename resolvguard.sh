@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.2
-readonly SCRIPT_VERSTAG="26112013"
+readonly SCRIPT_VERSTAG="26112014"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -3582,6 +3582,20 @@ _RunDNSHealthCheck_() (
   _SyncPreferredWANLocked_ || return 1
   _ValidateConfiguration_ >/dev/null || return 1
   _PrepareResolverPools_ || return 1
+  # Record the preferred endpoint identities *with this scheduled cycle*.
+  # wanN is only a roster position: after an ASUS WAN edit it may refer to a
+  # different TLS endpoint. Never reconstruct old identities using a newer
+  # preferred-providers file at WebUI publication time.
+  if [ "$mode" = scheduled ] && [ -f "$PREF_PROVIDERS" ] &&
+     [ ! -L "$PREF_PROVIDERS" ]; then
+    LC_ALL=C awk -F'|' '
+      $1 ~ /^wan[0-9]+$/ && $2 ~ /^[0-9a-fA-F:.]+$/ &&
+      $3 ~ /^[A-Za-z0-9_.-]+$/ && $5 ~ /^[0-9]+$/ &&
+      ($5+0)>0 && ($5+0)<=65535 {
+        print "WEBUI RESOLVER IDENTITY|"$1"|"$2"|"$3"|"$5
+      }
+    ' "$PREF_PROVIDERS"
+  fi
   # Capture both the checks and the policy fingerprint under CONFIG_LOCK.
   # Once this snapshot is prepared, lengthy DNS probes need no config lock.
   RG_MONITOR_CHECKS="$RUNTIME/monitor-checks-$$"
@@ -5535,13 +5549,26 @@ _RGWebUI_() (
     [ -f "$RG_DATA/last-end" ] && old_end=$(cat "$RG_DATA/last-end")
     if [ -n "$done_at" ] && [ "$done_at" != "$old_end" ]; then
       [ ! -L "$RG_DATA/history.tsv" ] || { err 'unsafe history'; return 1; }
-      if [ -f "$providers" ] && [ ! -L "$providers" ]; then
-        awk -F'|' 'NR==FNR {state[$1]=$2; next}
-          $1~/^wan[0-9]+$/ {print $1"|"(state[$1]!=""?state[$1]:"unknown")}
-        ' "$observations" "$providers" | while IFS='|' read -r id status; do
-          printf '%s|%s|%s|%s\n' "$done_at" "$id" "$status" "$router_end"
-        done >> "$RG_DATA/history.tsv"
-      fi
+      # Keep actual endpoint identity alongside each completed observation.
+      # The captured cycle metadata was emitted under the monitor config lock,
+      # not reconstructed from today's potentially renumbered wanN roster.
+      awk -F'|' -v finished="$done_at" -v router="$router_end" '
+        FILENAME==ARGV[1] {
+          if ($1=="WEBUI RESOLVER IDENTITY" && $2 ~ /^wan[0-9]+$/ &&
+              $3 ~ /^[0-9a-fA-F:.]+$/ && $4 ~ /^[A-Za-z0-9_.-]+$/ &&
+              $5 ~ /^[0-9]+$/ && !known[$2]++) {
+            ids[++n]=$2; ip[$2]=$3; tls[$2]=$4; port[$2]=$5
+          }
+          next
+        }
+        $1 ~ /^wan[0-9]+$/ && $2 ~ /^(ok|fail|unknown)$/ {state[$1]=$2}
+        END {
+          for(i=1;i<=n;i++) {
+            id=ids[i]; result=(id in state)?state[id]:"unknown"
+            print finished"|"id"|"result"|"router"|"ip[id]"|"tls[id]"|"port[id]
+          }
+        }
+      ' "$cycle" "$observations" >> "$RG_DATA/history.tsv" || return 1
       # Preserve the newest 40,320 rows; trim only every 60 completed cycles
       # instead of rewriting the entire file every minute.
       old_trim_count=0
@@ -5570,11 +5597,16 @@ _RGWebUI_() (
       # scheduled cycle. Historical records before this feature may only have
       # resolver-level PASS/FAIL; never infer missing policy details.
       awk -F'|' -v cycle_end="$done_at" '
+        $1=="WEBUI RESOLVER IDENTITY" && NF==5 &&
+          $2 ~ /^wan[0-9]+$/ && $3 ~ /^[0-9a-fA-F:.]+$/ &&
+          $4 ~ /^[A-Za-z0-9_.-]+$/ && $5 ~ /^[0-9]+$/ {
+            ip[$2]=$3; tls[$2]=$4; port[$2]=$5; next
+          }
         $1=="WEBUI POLICY FAILURE" && NF==8 &&
         $2 ~ /^[0-9][0-9][0-9][0-9]-/ &&
         $5 ~ /^[A-Za-z][A-Za-z0-9_-]*$/ &&
-        $7 ~ /^[A-Za-z0-9_-]+$/ {
-          print cycle_end "|" $2 "|" $3 "|" $4 "|" $5 "|" $6 "|" $7 "|" $8
+        $7 ~ /^[A-Za-z0-9_-]+$/ && ($5 in ip) {
+          print cycle_end "|" $2 "|" $3 "|" $4 "|" $5 "|" $6 "|" $7 "|" $8 "|" ip[$5] "|" tls[$5] "|" port[$5]
         }
       ' "$cycle" >> "$RG_DATA/history-failures.tsv" || return 1
       # Keep only the latest 8,192 failure details in volatile RAM. Unlike
@@ -5717,27 +5749,36 @@ EOF_UNBOUND
     (
       printf '{"schema":1,"buckets":['
       if [ -f "$RG_DATA/history.tsv" ] && [ ! -L "$RG_DATA/history.tsv" ]; then
-        awk -F'|' '
-          function emit(bucket,id,state,n,fail,unknown) {
+        LC_ALL=C awk -F'|' '
+          function emit(bucket,id,state,n,fail,unknown,ip,tls,port,legacy) {
             if (commas++) printf ","
-            printf "{\"at\":\"%s\",\"id\":\"%s\",\"state\":\"%s\",\"samples\":%d,\"failures\":%d,\"unknowns\":%d}",bucket,id,state,n,fail,unknown
+            printf "{\"at\":\"%s\",\"id\":\"%s\",\"state\":\"%s\",\"samples\":%d,\"failures\":%d,\"unknowns\":%d,\"ip\":\"%s\",\"tls\":\"%s\",\"port\":\"%s\",\"legacy\":%s}",bucket,id,state,n,fail,unknown,ip,tls,port,legacy
           }
-          $1 ~ /^[0-9]{4}-/ { }
-          (NF==3 || NF==4) && $1 ~ /^[0-9][0-9][0-9][0-9]-/ && $2 ~ /^wan[0-9]+$/ && $3 ~ /^(ok|fail|unknown)$/ {
-            # yyyy-mm-ddThh:mm:ssZ, all timestamps from ResolvGuard UTC cron.
+          (NF==4 || NF==3 || NF==7) && $1 ~ /^[0-9][0-9][0-9][0-9]-/ &&
+          $2 ~ /^wan[0-9]+$/ && $3 ~ /^(ok|fail|unknown)$/ {
+            # Old observations only contain wanN: their actual endpoint is
+            # unrecoverable after roster changes. Keep them, but never attach
+            # them to any current resolver identity.
+            legacy=NF!=7
+            if (!legacy && ($5 !~ /^[0-9a-fA-F:.]+$/ ||
+                            $6 !~ /^[A-Za-z0-9_.-]+$/ ||
+                            $7 !~ /^[0-9]+$/)) next
             t=substr($1,1,13)
             half=substr($1,15,2)+0 < 30 ? "00" : "30"
             bucket=t ":" half ":00Z"
-            key=bucket SUBSEP $2
-            if (!(key in seen)) { seen[key]=1; keys[++count]=key; bs[key]=bucket; ids[key]=$2 }
+            scope=legacy?("old:"$2):("endpoint:"tolower($5)"|"tolower($6)"|"$7)
+            key=bucket SUBSEP scope
+            if (!(key in seen)) {
+              seen[key]=1; keys[++count]=key; bs[key]=bucket; ids[key]=$2
+              ips[key]=legacy?"":$5; hosts[key]=legacy?"":$6
+              ports[key]=legacy?"":$7; old[key]=legacy?"true":"false"
+            }
             n[key]++; if($3=="fail") f[key]++; else if($3=="unknown") u[key]++
           }
           END {
-            # Deterministic chronological ordering is inherited from append-only
-            # observations. Sort not required for chronological record history.
             for (i=1;i<=count;i++) {
               key=keys[i]; state=f[key]>0?"fail":(u[key]>0?"unknown":"ok")
-              emit(bs[key],ids[key],state,n[key],f[key],u[key])
+              emit(bs[key],ids[key],state,n[key],f[key],u[key],ips[key],hosts[key],ports[key],old[key])
             }
           }
         ' "$RG_DATA/history.tsv"
