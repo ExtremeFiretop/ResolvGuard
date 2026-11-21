@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.2
-readonly SCRIPT_VERSTAG="26112102"
+readonly SCRIPT_VERSTAG="26112103"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -4723,6 +4723,12 @@ _DisableScheduledMonitoring_() {
   rm -f "$SCHEDULE_MARKER" "$AUTO_FAILOVER_MARKER" || return 1
   rm -f "$RUNTIME/switching-mode-notice" || :
   _LogEvent_ notice 'DNS MONITORING DISABLED: scheduler and automatic switching authorization removed' >/dev/null
+  # Monitoring is OFF, so there will be no next scheduled cycle to refresh the
+  # dashboard. Publish the new operating mode once using existing observations
+  # (no new DNS probes, WAN writes, or recurring status job).
+  if [ -f "$ROOT/ResolvGuard.asp" ] && [ ! -L "$ROOT/ResolvGuard.asp" ]; then
+    _RGWebUI_ publish >/dev/null 2>&1 || :
+  fi
   [ "$success_output" = quiet ] || _Say_ 'DNS monitoring: OFF (automatic failover OFF)'
 }
 

@@ -408,7 +408,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
       <div class="stat"><div class="stat-label" id="statPoolLabel">Active production pool</div><div class="stat-val" id="statPool" style="font-size:23px">unknown</div><div class="stat-sub" id="statPoolSub">WAN DNS configuration</div></div>
       <div class="stat"><div class="stat-label">Next scheduled cycle</div><div class="stat-val" id="statCountdown">—</div><div class="stat-sub" id="statSeq">No completed check yet</div></div>
     </div>
-    <div class="section-head"><h3>Live resolver view</h3><button class="text-link" data-tab="history">Explore full history →</button></div>
+    <div class="section-head"><h3 id="resolverViewHeading">Live resolver view</h3><button class="text-link" data-tab="history">Explore full history →</button></div>
     <div class="card" id="activePoolCard" hidden style="margin-bottom:15px">
       <div class="card-head"><div><div class="card-title" id="activePoolTitle">Active production DNS resolvers</div><div class="card-sub" id="activePoolDescription">Verified membership of the current WAN DNS pool</div></div><span class="small-pill" id="activePoolCount">—</span></div>
       <div id="activeResolverList"></div>
@@ -532,8 +532,11 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
   function topState(d){
     if(!d)return {title:'Connecting to ResolvGuard…',detail:'Waiting for the first status snapshot.',status:'unknown'};
     if(d.pendingTransaction||d.recoveryHold)return {title:'Critical — DNS recovery requires attention.',detail:'A pending transaction or recovery hold exists. Check SSH technical status before making changes.',status:'critical'};
-    if(d.mode==='hold')return {title:'Policy safety hold — automatic failover suspended.',detail:'The approved DNS policy no longer matches the configured providers or settings, or authorization could not be verified. Scheduled DNS checks continue, but unattended WAN switching is blocked. Reapprove the current policy through SSH before restoring failover.',status:'critical'};
+    // Operating mode is a separately published configuration fact, not a DNS
+    // health result. An old policy hold must not masquerade as current status.
+    if(d.mode==='inactive')return {title:'Monitoring is inactive.',detail:'Scheduled DNS checks and automatic WAN switching are disabled. Results below are from the last completed check, not current DNS health.',status:'unknown'};
     if(isStale(d))return {title:'Monitoring data is stale.',detail:'No recent completed health evaluation is available. This is not a passing result.',status:'unknown'};
+    if(d.mode==='hold')return {title:'Policy safety hold — automatic failover suspended.',detail:'The approved DNS policy no longer matches the configured providers or settings, or authorization could not be verified. Scheduled DNS checks continue, but unattended WAN switching is blocked. Reapprove the current policy through SSH before restoring failover.',status:'critical'};
     if(!hasRealChecks(d))return {title:'Waiting for health results.',detail:'The latest completed cycle had no DNS policy observations.',status:'unknown'};
     const p=pref(d), n=p.filter(r=>r.state==='ok').length;
     const allPreferredHealthy=p.length>0&&n===p.length;
@@ -672,8 +675,8 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     };
   })();
   function syncWaveSignal(d, feedConnected=true){
-    const live=feedConnected && !!d?.lastEnd && !isStale(d) && hasRealChecks(d);
-    const alert=feedConnected && !!d && (d.pendingTransaction||d.recoveryHold||d.mode==='hold');
+    const live=feedConnected && d?.mode!=='inactive' && !!d?.lastEnd && !isStale(d) && hasRealChecks(d);
+    const alert=feedConnected && !!d && (d.pendingTransaction||d.recoveryHold||(d.mode==='hold'&&!isStale(d)));
     const node=$('heartbeat');
     node.classList.toggle('no-signal',!live&&!alert);
     const summary=alert?'critical':live?topState(d).status:'unknown';
@@ -687,7 +690,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
   document.addEventListener('visibilitychange',()=>syncWaveSignal(state.snapshot,state.feedConnected));
   function pulseCompletedCheck(){
     // A newly completed observed cycle is the only trigger (never UI motion).
-    if(!state.feedConnected||isStale(state.snapshot)||!hasRealChecks(state.snapshot))return;
+    if(!state.feedConnected||state.snapshot?.mode==='inactive'||isStale(state.snapshot)||!hasRealChecks(state.snapshot))return;
     const ring=$('heartRing');
     ring.classList.remove('pulse');
     void ring.getBoundingClientRect().width;
@@ -757,38 +760,42 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
   }
   function renderOverview(){
     const d=state.snapshot,s=topState(d),r=pref(d),n=r.filter(x=>x.state==='ok').length;
+    const inactive=d?.mode==='inactive',historical=inactive||!d||isStale(d);
+    const recoveryAlert=!!(d?.pendingTransaction||d?.recoveryHold);
     const recursive=recursiveUnbound(d);
     $('unboundOverviewNotice').classList.toggle('hidden',!recursive);
-    $('overviewMetricsHeading').textContent=recursive?'External DoT checks at a glance':'Network health at a glance';
+    $('overviewMetricsHeading').textContent=historical?'Last recorded DNS results':recursive?'External DoT checks at a glance':'Network health at a glance';
+    $('resolverViewHeading').textContent=historical?'Last recorded resolver results':'Live resolver view';
     $('recentActivityDescription').textContent=recursive?'WAN DNS events · not Unbound recovery':'Actual completed failover and recovery events';
-    $('resolverScopeNote').innerHTML=recursive?'Direct authenticated DoT probes; not Unbound DNS health.':'These are <strong>direct authenticated DoT probes</strong>. Production LAN DNS still uses DNSMasq → Stubby by default.';
+    $('resolverScopeNote').innerHTML=(historical?'<strong>Historical observations only — no current health is implied.</strong> ':'')+(recursive?'Direct authenticated DoT probes; not Unbound DNS health.':'These are <strong>direct authenticated DoT probes</strong>. Production LAN DNS still uses DNSMasq → Stubby by default.');
     syncWaveSignal(d,state.feedConnected);
     $('heroHeading').textContent=s.title; $('heroText').textContent=s.detail;
-    $('heroKicker').textContent=d?.mode==='hold'?'AUTOMATIC FAILOVER SUSPENDED':recursive
+    $('heroKicker').textContent=recoveryAlert?'DNS RECOVERY ATTENTION':inactive?'MONITORING INACTIVE':(d?.mode==='hold'&&!historical)?'AUTOMATIC FAILOVER SUSPENDED':recursive
       ? s.status==='healthy'?'External DoT checks healthy':s.status==='degraded'?'External DoT checks degraded':s.status==='critical'?'External DoT checks failing':'External DoT monitoring'
       : s.status==='healthy'?'Monitoring healthy':s.status==='degraded'?'DNS degraded — operating':s.status==='critical'?'DNS CRITICAL':'Verification pending';
     paintOverviewSeverity(s.status);
     $('poolPill').textContent=(recursive?'WAN pool: ':'Active pool: ')+(d?.pool||'unknown');
-    $('modePill').textContent=recursive?'WAN failover disabled in recursive mode':(({'monitoring':'Monitoring Only','automatic':'Auto Failover configured','inactive':'Monitoring inactive','hold':'Policy safety hold'})[d?.mode]||'Unknown mode');
-    $('heartLabel').textContent=d?.mode==='hold'?'Protection paused · Policy hold':s.status==='healthy'?'Check complete · Healthy':s.status==='degraded'?'Check complete · Degraded':s.status==='critical'?'Critical · Attention needed':'Awaiting reliable check';
+    const reportedMode=recursive?'WAN failover disabled in recursive mode':(({'monitoring':'Monitoring Only','automatic':'Auto Failover configured','inactive':'Monitoring inactive','hold':'Policy safety hold'})[d?.mode]||'Unknown mode');
+    $('modePill').textContent=historical&&!inactive?'Last reported: '+reportedMode+' · stale':reportedMode;
+    $('heartLabel').textContent=recoveryAlert?'Recovery attention required':inactive?'Monitoring stopped · No heartbeat':(d?.mode==='hold'&&!historical)?'Protection paused · Policy hold':s.status==='healthy'?'Check complete · Healthy':s.status==='degraded'?'Check complete · Degraded':s.status==='critical'?'Critical · Attention needed':'Awaiting reliable check';
     if(recursive&&s.status!=='unknown')$('heartLabel').textContent='DoT checks · '+(s.status==='healthy'?'Healthy':s.status==='degraded'?'Degraded':'Failing');
     $('heartSub').textContent=d?.lastEnd?'Last completed '+(routerTimeLabel(d.lastEndRouter)||String(d.lastEnd).replace('T',' ').replace(/Z$/,' UTC')):'No completed cycle recorded';
     $('statResolvers').textContent=d&&r.length?`${n} / ${r.length}`:'—';
-    const prefColour=!d||isStale(d)||!hasRealChecks(d)||r.some(x=>x.state==='unknown')?'':
+    const prefColour=historical||!hasRealChecks(d)||r.some(x=>x.state==='unknown')?'':
       n===r.length&&r.length?'green':n>0?'amber':'red';
     $('statResolvers').classList.remove('green','amber','red');
     if(prefColour)$('statResolvers').classList.add(prefColour);
-    $('statResolversSub').textContent='Preferred members passing observed policy';
+    $('statResolversSub').textContent=historical?'Historical results · not current DNS health':'Preferred members passing observed policy';
     const pol=r.reduce((z,x)=>z+x.policyPass,0),fail=r.reduce((z,x)=>z+x.policyFail,0);
     $('statPolicies').textContent=d&&pol+fail?`${pol} / ${pol+fail}`:'—';
     const alternate=!!d?.pool && d.pool!=='preferred';
     $('statPoliciesLabel').textContent=alternate?'Preferred DNS probe attempts':'DNS probe results';
-    $('statPoliciesDescription').textContent=alternate?'Passed / total · may include repeat checks':'Passed / total attempts · latest cycle';
+    $('statPoliciesDescription').textContent=historical?'Historical totals · last completed check':alternate?'Passed / total · may include repeat checks':'Passed / total attempts · latest cycle';
     $('statPool').textContent=d?.pool||'unknown';
     $('statPoolLabel').textContent=recursive?'ResolvGuard WAN pool':'Active production pool';
     $('statPoolSub').textContent=recursive?'Not used by recursive Unbound':'Read-only managed pool state';
-    $('statSeq').textContent=d?.lastEnd?'Completed '+(routerTimeLabel(d.lastEndRouter)||String(d.lastEnd).replace('T',' ').replace(/Z$/,' UTC')):'No completed check yet';
-    $('preferredCount').textContent=r.length?`${n}/${r.length} passing`:'Unenrolled / unknown';
+    $('statSeq').textContent=(inactive?'Schedule OFF · ':historical?'No recent check · ':'')+(d?.lastEnd?'Completed '+(routerTimeLabel(d.lastEndRouter)||String(d.lastEnd).replace('T',' ').replace(/Z$/,' UTC')):'No completed check yet');
+    $('preferredCount').textContent=r.length?(historical?`${n}/${r.length} at last check`:`${n}/${r.length} passing`):'Unenrolled / unknown';
     const activeCard=$('activePoolCard');
     activeCard.hidden=!alternate||recursive;
     if(alternate&&!recursive){
@@ -801,7 +808,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
       $('activeResolverList').innerHTML=active.length?active.map(x=>`<button class="resolve-row" data-resolver="${esc(x.id)}"><div class="res-left"><span class="status-glyph ${x.state==='fail'?'bad':''}">${x.state==='ok'?'✓':x.state==='fail'?'!':'?'}</span><div><div class="res-name">${esc(x.tls||x.id)}</div><div class="res-ip">${esc(x.id)} · ${esc(x.ip)}:${esc(x.port)}</div></div></div><div class="res-right"><span class="res-state ${x.state==='ok'?'green':x.state==='fail'?'red':'amber'}">${x.state==='ok'?'PASS':x.state==='fail'?'FAIL':'NOT OBSERVED'}</span><span>›</span></div></button>`).join(''):
         '<div class="empty">Active member identities could not be verified from the current WAN DNS configuration. Use SSH status to inspect the production pool.</div>';
     }
-    $('resolverList').innerHTML=r.length?r.map(x=>`<button class="resolve-row" data-resolver="${esc(x.id)}"><div class="res-left"><span class="status-glyph ${x.state==='fail'?'bad':''}">${x.state==='ok'?'✓':x.state==='fail'?'!':'?'}</span><div><div class="res-name">${esc(x.tls||x.id)}</div><div class="res-ip">${esc(x.id)} · ${esc(x.ip)}:${esc(x.port)}</div></div></div><div class="res-right"><span class="res-state ${x.state==='ok'?'green':x.state==='fail'?'red':'amber'}">${x.state==='ok'?'PASS':x.state==='fail'?'FAIL':'NOT OBSERVED'}</span><span>›</span></div></button>`).join(''):'<div class="empty">No preferred resolver roster available. Enroll preferred WAN DNS before monitoring.</div>';
+    $('resolverList').innerHTML=r.length?r.map(x=>`<button class="resolve-row" data-resolver="${esc(x.id)}"><div class="res-left"><span class="status-glyph ${x.state==='fail'?'bad':''}">${x.state==='ok'?'✓':x.state==='fail'?'!':'?'}</span><div><div class="res-name">${esc(x.tls||x.id)}</div><div class="res-ip">${esc(x.id)} · ${esc(x.ip)}:${esc(x.port)}</div></div></div><div class="res-right"><span class="res-state ${x.state==='ok'?'green':x.state==='fail'?'red':'amber'}">${x.state==='ok'?(historical?'LAST PASS':'PASS'):x.state==='fail'?(historical?'LAST FAIL':'FAIL'):'NOT OBSERVED'}</span><span>›</span></div></button>`).join(''):'<div class="empty">No preferred resolver roster available. Enroll preferred WAN DNS before monitoring.</div>';
     const ev=distinctSwitchingModeEvents(d?.events||[]).slice(-5).reverse();
     $('eventFeed').innerHTML=ev.length?ev.map(e=>renderEvent(e,true)).join(''):'<div class="empty">No switching or recovery events recorded since this router boot.</div>';
     renderHeat('overviewHeat','24');
@@ -1045,8 +1052,8 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
       if(changed)state.detailCache=null;
       const first=state.snapshot===null;
       state.snapshot=d;state.lastFetch=Date.now();state.feedConnected=true;
-      $('feedStatus').textContent='ROUTER FEED · '+(isStale(d)?'STALE':'CONNECTED');
-      $('feedStatus').classList.toggle('demo',isStale(d));
+      $('feedStatus').textContent='ROUTER FEED · '+(d.mode==='inactive'?'MONITORING OFF':isStale(d)?'STALE':'CONNECTED');
+      $('feedStatus').classList.toggle('demo',d.mode!=='inactive'&&isStale(d));
       state.historyAdvanced=false;
       if(changed&&!first){
         state.historyPending=d.lastEnd;
@@ -1386,8 +1393,9 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
   document.addEventListener('keydown',e=>{if(e.key==='Escape')closeInspector();});
   setInterval(()=>{
     const d=state.snapshot;const period=Number(d?.scheduleMinutes||1)*60;
-    $('statCountdown').textContent=d?.lastEnd ? Math.max(0,Math.floor((Date.parse(d.lastEnd)+period*1000-Date.now())/1000))+'s' : '—';
-    if(d&&isStale(d)){$('feedStatus').textContent='ROUTER FEED · STALE';$('feedStatus').classList.add('demo');}
+    $('statCountdown').textContent=d?.mode==='inactive'?'OFF':d?.lastEnd&&!isStale(d)?Math.max(0,Math.floor((Date.parse(d.lastEnd)+period*1000-Date.now())/1000))+'s':'—';
+    if(d?.mode==='inactive'){$('feedStatus').textContent='ROUTER FEED · MONITORING OFF';$('feedStatus').classList.remove('demo');}
+    else if(d&&isStale(d)){$('feedStatus').textContent='ROUTER FEED · STALE';$('feedStatus').classList.add('demo');}
     if(d)syncWaveSignal(d,state.feedConnected);
   },1000);
   setInterval(refresh,8000);
