@@ -20,9 +20,10 @@ CONFIG_SCHEMA=5
 set -u
 
 ## Set version for each Production Release ##
-readonly SCRIPT_VERSION=0.2.1
-readonly SCRIPT_VERSTAG="26111602"
+readonly SCRIPT_VERSION=0.2.2
+readonly SCRIPT_VERSTAG="26112104"
 readonly SCRIPT_NAME="ResolvGuard"
+# RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
 SCRIPT_BRANCH="master"
 
@@ -1099,6 +1100,30 @@ _PrintHealthCheckResult_() {
       # belonging to the active filtered pool. Preserve that distinction.
       RG_HEALTH_FAILURE_PHASES="${RG_HEALTH_FAILURE_PHASES:-}|$resolver_id:${RG_HEALTH_PROBE_PHASE:-active}|"
     fi
+  fi
+
+  # Record the precise time and policy reason of scheduled failures for
+  # WebUI history drill-down. This is diagnostic output only: no DNS probes,
+  # switching decisions or monitoring counters are changed.
+  if [ "$result" = FAIL ] && [ "${RG_WEBUI_RECORD_POLICY_FAILURES:-0}" = 1 ]; then
+    local tail qname qtype reason
+    resolver_id="${details%% *}"
+    tail="${details#* }"
+    qname="${tail%% *}"
+    tail="${tail#* }"
+    qtype="${tail%%:*}"
+    reason="${tail#*: }"
+    case "$resolver_id:$qtype" in
+      *'|'*|*' '*|*'<'*|*'>'*) : ;;
+      *)
+        # The checked hostname/type come from validated monitoring policy.
+        # Do not put arbitrary delimiters into the volatile history feed.
+        case "$qname:$reason" in
+          *'|'*) : ;;
+          *) _Say_ "WEBUI POLICY FAILURE|$(date -u '+%Y-%m-%dT%H:%M:%SZ')|$(date '+%Y-%m-%dT%H:%M:%S%z')|${RG_HEALTH_PROBE_PHASE:-active}|$resolver_id|$qname|$qtype|$reason" ;;
+        esac
+        ;;
+    esac
   fi
 
   if [ "${RG_HEALTH_COLOR_ENABLED:-0}" != 1 ]; then
@@ -2346,8 +2371,7 @@ _WaitForProductionPool_() {
        _StubbyDaemonRunning_ &&
        _DNSMasqDaemonRunning_ &&
        _VerifyLANForwardingConfig_ &&
-       { [ "$mode" = monitoring ] ||
-         { _VerifyStubbyListenerResponse_ && _VerifyLANForwarding_; }; }; then
+       { [ "$mode" = monitoring ] || _VerifyTransactionForwardingResponses_; }; then
       if [ "$success_output" != quiet ]; then
         if [ "$mode" = monitoring ]; then
           _Say_ "Production Strict DoT service/configuration verified for $pool; monitoring can diagnose unhealthy upstreams."
@@ -2417,7 +2441,222 @@ _MarkDNSRecoveryHold_() {
   }
 }
 
+# Unbound Manager path hints are read-only. Presence/configuration is not
+# proof of a live LAN DNS query, and never authorizes DNS switching.
+# Resolve Unbound includes in place. Never execute configuration content.
+# Bound the number, depth and total size of files read from the router.
+unbound_expand() {
+  local file depth line trimmed path child matched bytes
+  file=$1;depth=$2
+  [ "$depth" -le 8 ] && [ -f "$file" ] && [ ! -L "$file" ] && [ -r "$file" ] || return 1
+  case "|$RG_UNBOUND_SEEN|" in *"|$file|"*) return 1 ;; esac
+  RG_UNBOUND_SEEN="$RG_UNBOUND_SEEN|$file"
+  RG_UNBOUND_FILES=$((RG_UNBOUND_FILES + 1))
+  [ "$RG_UNBOUND_FILES" -le 32 ] || return 1
+  bytes=$(wc -c < "$file") || return 1
+  RG_UNBOUND_BYTES=$((RG_UNBOUND_BYTES + bytes))
+  [ "$RG_UNBOUND_BYTES" -le 1048576 ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    trimmed=${line#"${line%%[![:space:]]*}"}
+    case "$trimmed" in
+      include:*|include-toplevel:*)
+        case "$trimmed" in include-toplevel:*) printf 'RG-TOP-RESET:\n' ;; esac
+        path=${trimmed#*:};path=${path%%#*}
+        path=$(printf '%s' "$path" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        case "$path" in
+          \"*\") path=${path#\"};path=${path%\"} ;;
+          \'*\') path=${path#\'};path=${path%\'} ;;
+        esac
+        # Absolute paths and simple globs only. Ambiguous paths fail closed.
+        case "$path" in /*) : ;; *) return 1 ;; esac
+        case "$path" in *..*|*[!A-Za-z0-9_./*-]*) return 1 ;; esac
+        matched=0
+        for child in $path; do
+          [ -f "$child" ] || return 1
+          unbound_expand "$child" "$((depth + 1))" || return 1
+          matched=1
+        done
+        [ "$matched" -eq 1 ] || return 1
+        ;;
+      *) printf '%s\n' "$line" ;;
+    esac
+  done < "$file"
+}
+unbound_path() {
+  local config main marker present running port route upstream expanded
+  config=${RG_WEBUI_UNBOUND_CONFIG:-/opt/var/lib/unbound/unbound.conf}
+  marker=${RG_WEBUI_UNBOUND_MARKER:-/jffs/addons/unbound/unbound.postconf}
+  main=${RG_WEBUI_DNSMASQ_MAIN:-$DNSMASQ_MAIN}
+  present=false;running=false;port=unknown;route=none;upstream=unknown
+  if { [ -f "$config" ] && [ ! -L "$config" ]; } ||
+     { [ -f "$marker" ] && [ ! -L "$marker" ]; }; then
+    present=true
+  fi
+  if pidof unbound >/dev/null 2>&1; then
+    present=true;running=true
+  fi
+  if [ -f "$config" ] && [ ! -L "$config" ] && [ -r "$config" ]; then
+    port=$(LC_ALL=C awk '
+      /^[[:space:]]*#/ {next}
+      { line=$0; sub(/[[:space:]]+#.*$/, "", line)
+        if (line ~ /^[[:space:]]*port:[[:space:]]*[0-9]+[[:space:]]*$/) {
+          sub(/^.*port:[[:space:]]*/, "", line)
+          sub(/[[:space:]]*$/, "", line)
+          if (line=="53" || line=="53535") {print line; exit}
+        }
+      }
+    ' "$config")
+    [ -n "$port" ] || port=unknown
+    RG_UNBOUND_SEEN='';RG_UNBOUND_FILES=0;RG_UNBOUND_BYTES=0
+    if expanded=$(unbound_expand "$config" 0); then
+      upstream=$(printf '%s\n' "$expanded" | LC_ALL=C awk '
+        function finish_zone() {
+          if (zone && root) {
+            roots++
+            if (addresses + hosts > 0) configured++
+            # Every root forwarding destination must be a known local Stubby
+            # listener. Unbound Manager may configure both IPv4 and IPv6.
+            if (addresses > 0 && stubby == addresses && hosts == 0 && !fallback) verified++
+          }
+          zone=0;root=0;addresses=0;stubby=0;hosts=0;fallback=0
+        }
+        /^[[:space:]]*#/ {next}
+        {
+          line=$0;sub(/[[:space:]]+#.*$/, "", line)
+          # Unbound Manager writes "forward-zone:#Stubby" (marker attached
+          # directly to the colon), not only "forward-zone:".
+          if (line ~ /^forward-zone:[[:space:]]*(#.*)?$/) {finish_zone();zones++;zone=1;next}
+          # Unbound Manager emits unindented name/forward-addr lines.
+          # These are zone members, not new top-level configuration blocks.
+          if (line ~ /^[^[:space:]]/ && zone &&
+              line !~ /^(name|forward-addr|forward-host|forward-first):/) finish_zone()
+          if (!zone) next
+          if (line ~ /^[[:space:]]*name:[[:space:]]*/) {
+            name=line;sub(/^[[:space:]]*name:[[:space:]]*/, "", name)
+            sub(/[[:space:]]*$/, "", name)
+            if (name=="\".\"" || name=="." || name=="'.'") root=1
+          }
+          if (line ~ /^[[:space:]]*forward-addr:[[:space:]]*/) {
+            addr=line;sub(/^[[:space:]]*forward-addr:[[:space:]]*/, "", addr)
+            sub(/[[:space:]]*$/, "", addr)
+            addresses++
+            # Both loopback listeners are used by Unbound Manager
+            # Integrate with Stubby option on supported routers.
+            if (addr=="127.0.1.1@53" || addr=="0::1@5453") stubby++
+          }
+          if (line ~ /^[[:space:]]*forward-host:[[:space:]]*/) hosts++
+          if (line ~ /^[[:space:]]*forward-first:[[:space:]]*yes[[:space:]]*$/) fallback=1
+        }
+        END {
+          finish_zone()
+          if (roots==0) print "recursive"
+          else if (roots==1 && verified==1 && zones==1) print "stubby"
+          else if (roots==1 && configured==1 && zones==1) print "other"
+          else print "unknown"
+        }
+      ')
+    else
+      upstream=unknown
+    fi
+  fi
+  # These describe DNSMasq / Unbound configuration, not verified traffic.
+  if [ -f "$main" ] && [ ! -L "$main" ] && [ -r "$main" ]; then
+    if grep -Eq '^[[:space:]]*server=127\.0\.0\.1#53535[[:space:]]*$' "$main"; then
+      route=dnsmasq
+    elif [ "$port" = 53 ] &&
+         grep -Eq '^[[:space:]]*port=0[[:space:]]*$' "$main"; then
+      route=direct
+    fi
+  fi
+  printf '%s|%s|%s|%s|%s\n' "$present" "$running" "$port" "$route" "$upstream"
+}
+
+# Treat recursive Unbound as monitoring-only. This inspects configuration,
+# never modifies Unbound or tests client DNS traffic.
+_RecursiveUnboundProduction_() {
+  local info present running port route upstream
+  info="$(unbound_path)" || return 1
+  IFS='|' read -r present running port route upstream <<EOF_RG_UNBOUND_MODE
+$info
+EOF_RG_UNBOUND_MODE
+  [ "$present" = true ] || return 1
+  case "$route:$upstream" in
+    dnsmasq:recursive|direct:recursive) return 0 ;;
+  esac
+  return 1
+}
+
+# Stubby forwarding through Unbound is eligible for switching only when
+# Unbound Manager's complete effective root forwarding configuration has been
+# identified, its listener port is expected, and both daemons are running.
+# A mere #Stubby edit marker must never authorize WAN writes.
+_UnboundStubbyProduction_() {
+  local info present running port route upstream
+  info="$(unbound_path)" || return 1
+  IFS='|' read -r present running port route upstream <<EOF_RG_UNBOUND_STUBBY
+$info
+EOF_RG_UNBOUND_STUBBY
+  [ "$present" = true ] && [ "$running" = true ] &&
+    [ "$port" = 53535 ] && [ "$route" = dnsmasq ] &&
+    [ "$upstream" = stubby ]
+}
+
+# Unbound Manager replaces the direct Stubby servers-file declaration with
+# a single DNSMasq default forwarding endpoint. Reject any competing default
+# or domain-specific resolver, resolv-file, alternate upstream file or port=0;
+# otherwise a seemingly healthy LAN query might bypass monitored Stubby.
+_VerifyDNSMasqUnboundConfig_() {
+  [ -f "$DNSMASQ_MAIN" ] && [ ! -L "$DNSMASQ_MAIN" ] &&
+    [ -r "$DNSMASQ_MAIN" ] || return 1
+  LC_ALL=C awk '
+    {
+      line=$0
+      sub(/^[[:space:]]+/, "", line)
+      sub(/[[:space:]]+#.*$/, "", line)
+      sub(/[[:space:]]+$/, "", line)
+      if (line=="no-resolv") {no_resolv++; next}
+      if (line=="server=127.0.0.1#53535") {forwarders++; next}
+      if (line ~ /^(server=|servers-file=|resolv-file=|port=0([[:space:]]|$))/) invalid=1
+    }
+    END {exit !(no_resolv==1 && forwarders==1 && !invalid)}
+  ' "$DNSMASQ_MAIN" || {
+    _Say_ 'LAN DNS NOT READY: DNSMasq Unbound path has conflicting or missing forwarding rules'
+    return 1
+  }
+  return 0
+}
+
+# Unbound can advertise an additional IPv6 local Stubby listener. A selected
+# IPv6 loopback must respond as well; an unavailable listener fails closed.
+_UnboundStubbyIPv6Configured_() {
+  local config expanded
+  config=${RG_WEBUI_UNBOUND_CONFIG:-/opt/var/lib/unbound/unbound.conf}
+  RG_UNBOUND_SEEN='';RG_UNBOUND_FILES=0;RG_UNBOUND_BYTES=0
+  expanded=$(unbound_expand "$config" 0) || return 2
+  printf '%s\n' "$expanded" |
+    grep -Eq '^[[:space:]]*forward-addr:[[:space:]]*0::1@5453([[:space:]]|$)'
+}
+
+_VerifyUnboundStubbyListeners_() {
+  local ipv6_result
+  _VerifyStubbyListenerResponse_ || return 1
+  if _UnboundStubbyIPv6Configured_; then
+    _VerifyLocalDNSResponse_ '::1' stubby-ipv6 5453 || return 1
+  else
+    ipv6_result=$?
+    [ "$ipv6_result" -eq 1 ] || {
+      _Say_ 'INFRASTRUCTURE NOT READY: Unbound forwarding includes unavailable configuration files'
+      return 1
+    }
+  fi
+  _VerifyLocalDNSResponse_ 127.0.0.1 unbound 53535
+}
+
 _CheckLiveSwitchSafety_() {
+  if _RecursiveUnboundProduction_; then
+    _Fail_ 'WAN failover disabled in recursive Unbound mode; use Unbound Manager Integrate with Stubby'
+    return 1
+  fi
   [ "$(_ReadNVRAM_ dnspriv_enable)" = 1 ] || { _Fail_ 'DNS Privacy disabled; refusing WAN switch'; return 1; }
   [ -r "$PREF_RULELIST" ] && [ -r "$PREF_PROVIDERS" ] || { _Fail_ 'No preferred snapshot; run enroll first'; return 1; }
   if ! _ValidatePreferredSnapshot_; then
@@ -2433,32 +2672,53 @@ _CheckLiveSwitchSafety_() {
     _VerifyLANForwardingConfig_ || {
       _Fail_ 'WAN switch blocked: local Strict DoT/DNSMasq forwarding ownership unverified'; return 1;
     }
+  # For an additional Unbound forwarding layer, authorization requires a
+  # live listener and LAN response as well as configuration ownership.
+  # The direct DNSMasq -> Stubby activation path is unchanged.
+  if grep -Eq '^[[:space:]]*server=127\.0\.0\.1#53535[[:space:]]*$' "$DNSMASQ_MAIN"; then
+    _VerifyLANForwarding_ || {
+      _Fail_ 'WAN switch blocked: Unbound -> Stubby listeners or LAN DNS are not ready'
+      return 1
+    }
+  fi
+  return 0
 }
 
 _CheckAutomaticRecoveryAuthorization_() {
   [ -f "$SCHEDULE_MARKER" ] && [ ! -L "$SCHEDULE_MARKER" ] &&
     [ -f "$AUTO_FAILOVER_MARKER" ] && [ ! -L "$AUTO_FAILOVER_MARKER" ] || {
-      _Say_ 'AUTOMATIC SWITCHING DISABLED: Monitoring Only; no WAN change.'
+      # Scheduled monitoring reports this operating mode once per transition,
+      # not on every unsuccessful resolver cycle.
+      [ "${RG_HEALTH_RUN_MODE:-}" = scheduled ] ||
+        _Say_ 'AUTOMATIC SWITCHING DISABLED: Monitoring Only; no WAN change.'
       return 1
     }
 }
 
 _CheckAutomaticFailoverAuthorization_() {
-  _CheckAutomaticRecoveryAuthorization_ && _CheckPolicyAuthorization_
+  _CheckAutomaticRecoveryAuthorization_ || return 1
+  if _RecursiveUnboundProduction_; then
+    [ "${RG_HEALTH_RUN_MODE:-}" = scheduled ] ||
+      _Say_ 'AUTOMATIC SWITCHING DISABLED: recursive Unbound uses Monitoring Only.'
+    return 1
+  fi
+  _CheckPolicyAuthorization_
 }
 
 # Transport-level local DNS response, not an upstream policy decision.
 # SERVFAIL/NXDOMAIN/NOERROR can all be legitimate from an alive listener.
 # Unexpected/malformed data, dig failures or missing QR header fail closed.
 _VerifyLocalDNSResponse_() {
-  local server tag out got count flags
-  server="$1"; tag="$2"
+  local server tag port out got count flags
+  server="$1"; tag="$2"; port="${3:-}"
   out="$RUNTIME/infra-$tag-$$"
   # Query the DNS root (.) for NS records instead of generating arbitrary
   # subdomains beneath example.com. This only verifies a well-formed local
   # listener response; authenticated upstream health is checked separately.
   # Cached root NS data is acceptable for this local-listener readiness test.
-  if ! "$DIG" "@$server" . NS +time="$TIMEOUT_SECONDS" +tries=1 +noall +comments +answer +authority > "$out" 2>&1; then
+  set -- "@$server"
+  [ -z "$port" ] || set -- "$@" -p "$port"
+  if ! "$DIG" "$@" . NS +time="$TIMEOUT_SECONDS" +tries=1 +noall +comments +answer +authority > "$out" 2>&1; then
     _Say_ "INFRASTRUCTURE NOT READY: $tag listener did not answer"
     rm -f "$out"; return 1
   fi
@@ -2601,6 +2861,13 @@ EOF_DNSMASQ_SCOPED_SERVERS
 _ShowDNSMasqScopedSetupWarning_() {
   local domain_exceptions domain upstream
 
+  # On Unbound Manager's path, DNSMasq does not consume this direct-Stubby
+  # servers file. Avoid disclosing stale, non-production exceptions.
+  if [ -r "$DNSMASQ_MAIN" ] &&
+     grep -Eq '^[[:space:]]*server=127\.0\.0\.1#53535[[:space:]]*$' "$DNSMASQ_MAIN"; then
+    return 0
+  fi
+
   # The wizard and its authorization helper may both call this routine.
   # A disclosure and acknowledgement are needed only once per invocation.
   if [ "${RG_SCOPED_WARNING_SHOWN:-0}" = 1 ]; then
@@ -2678,24 +2945,33 @@ _VerifyLANForwardingConfig_() {
     return 1
   fi
 
-  if [ ! -r "$DNSMASQ_MAIN" ]; then
+  if [ ! -f "$DNSMASQ_MAIN" ] || [ -L "$DNSMASQ_MAIN" ] ||
+     [ ! -r "$DNSMASQ_MAIN" ]; then
     _Say_ "LAN DNS NOT READY: DNSMasq main configuration not readable: $DNSMASQ_MAIN"
     return 1
   fi
 
-  if [ ! -r "$DNSMASQ_SERVERS" ]; then
-    _Say_ "LAN DNS NOT READY: DNSMasq upstream servers file not readable: $DNSMASQ_SERVERS"
-    return 1
-  fi
-
-  if ! _ValidateDNSMasqUpstreamFile_; then
-    return 1
-  fi
-
-  if ! grep -Eq '^[[:space:]]*no-resolv[[:space:]]*$' "$DNSMASQ_MAIN" ||
-     ! grep -Eq '^[[:space:]]*servers-file=/tmp/resolv\.dnsmasq[[:space:]]*$' "$DNSMASQ_MAIN"; then
-    _Say_ 'LAN DNS NOT READY: DNSMasq does not declare its strict forwarding file'
-    return 1
+  if grep -Eq '^[[:space:]]*server=127\.0\.0\.1#53535[[:space:]]*$' "$DNSMASQ_MAIN"; then
+    # Validate DNSMasq's exclusive Unbound default first, then the effective
+    # Unbound root zone. Fail closed on recursion, forwarding elsewhere,
+    # missing/unreadable include files or an unavailable Unbound daemon.
+    _VerifyDNSMasqUnboundConfig_ || return 1
+    _UnboundStubbyProduction_ || {
+      _Say_ 'LAN DNS NOT READY: active Unbound root forwarding to Stubby is unverified'
+      return 1
+    }
+  else
+    # Preserve the original direct DNSMasq -> Stubby safety gate.
+    if [ ! -r "$DNSMASQ_SERVERS" ]; then
+      _Say_ "LAN DNS NOT READY: DNSMasq upstream servers file not readable: $DNSMASQ_SERVERS"
+      return 1
+    fi
+    _ValidateDNSMasqUpstreamFile_ || return 1
+    if ! grep -Eq '^[[:space:]]*no-resolv[[:space:]]*$' "$DNSMASQ_MAIN" ||
+       ! grep -Eq '^[[:space:]]*servers-file=/tmp/resolv\.dnsmasq[[:space:]]*$' "$DNSMASQ_MAIN"; then
+      _Say_ 'LAN DNS NOT READY: DNSMasq does not declare its strict forwarding file'
+      return 1
+    fi
   fi
 
   lan="$(_ReadNVRAM_ lan_ipaddr)"
@@ -2710,8 +2986,22 @@ _VerifyLANForwardingConfig_() {
 _VerifyLANForwarding_() {
   local lan
   _VerifyLANForwardingConfig_ || return 1
+  if grep -Eq '^[[:space:]]*server=127\.0\.0\.1#53535[[:space:]]*$' "$DNSMASQ_MAIN"; then
+    _UnboundStubbyProduction_ && _VerifyUnboundStubbyListeners_ || return 1
+  fi
   lan="$(_ReadNVRAM_ lan_ipaddr)"
   _VerifyLocalDNSResponse_ "$lan" lan
+}
+
+# One local-readiness chain per transaction attempt. Unbound mode verifies
+# both configured Stubby loopbacks, Unbound's real listener and LAN DNSMasq.
+# Direct Stubby preserves the original Stubby + LAN probe sequence.
+_VerifyTransactionForwardingResponses_() {
+  if grep -Eq '^[[:space:]]*server=127\.0\.0\.1#53535[[:space:]]*$' "$DNSMASQ_MAIN"; then
+    _VerifyLANForwarding_
+  else
+    _VerifyStubbyListenerResponse_ && _VerifyLANForwarding_
+  fi
 }
 
 # Persist the complete switching intent before touching WAN NVRAM.
@@ -3240,6 +3530,7 @@ _RunDNSHealthCheck_() (
   local current backup selected pool result alt_rc mode
   local status1 status2 survivors proposed target eligible confirm_needed switch_failure
   mode="${1:-manual}"
+  RG_HEALTH_RUN_MODE="$mode"
   switch_failure=0
 
   # Never emit terminal escape codes into scheduled logs or captured output.
@@ -3291,6 +3582,20 @@ _RunDNSHealthCheck_() (
   _SyncPreferredWANLocked_ || return 1
   _ValidateConfiguration_ >/dev/null || return 1
   _PrepareResolverPools_ || return 1
+  # Record the preferred endpoint identities *with this scheduled cycle*.
+  # wanN is only a roster position: after an ASUS WAN edit it may refer to a
+  # different TLS endpoint. Never reconstruct old identities using a newer
+  # preferred-providers file at WebUI publication time.
+  if [ "$mode" = scheduled ] && [ -f "$PREF_PROVIDERS" ] &&
+     [ ! -L "$PREF_PROVIDERS" ]; then
+    LC_ALL=C awk -F'|' '
+      $1 ~ /^wan[0-9]+$/ && $2 ~ /^[0-9a-fA-F:.]+$/ &&
+      $3 ~ /^[A-Za-z0-9_.-]+$/ && $5 ~ /^[0-9]+$/ &&
+      ($5+0)>0 && ($5+0)<=65535 {
+        print "WEBUI RESOLVER IDENTITY|"$1"|"$2"|"$3"|"$5
+      }
+    ' "$PREF_PROVIDERS"
+  fi
   # Capture both the checks and the policy fingerprint under CONFIG_LOCK.
   # Once this snapshot is prepared, lengthy DNS probes need no config lock.
   RG_MONITOR_CHECKS="$RUNTIME/monitor-checks-$$"
@@ -3578,7 +3883,8 @@ _InstallProgressPause_() {
 }
 
 # AMTM-style installation lifecycle. The installer performs no DNS enrollment,
-# cron writes, WAN changes, or automatic-failover approval. Quick Setup remains
+# cron writes, WAN changes, or automatic-failover approval. It installs the
+# independent services-start hook required to restore the WebUI after reboot. Quick Setup remains
 # the separate, operator-driven next step.
 _IsInstallationComplete_() {
   [ "$ROOT" = "$INSTALL_ROOT" ] &&
@@ -3601,6 +3907,170 @@ _InstallPrerequisites_() {
   return 0
 }
 
+# The WebUI is a GitHub raw-repository companion file installed beside resolvguard.sh. The HTML
+# includes its own dashboard CSS/JS; only live JSON feeds remain under /ext.
+_WebUIAssetURL_() {
+  case "$1" in
+    development) printf '%s/refs/heads/dev/ResolvGuard.asp' "$SCRIPT_URL_BASE" ;;
+    stable) printf '%s/refs/heads/main/ResolvGuard.asp' "$SCRIPT_URL_BASE" ;;
+    *) return 1 ;;
+  esac
+}
+# No ASP build tag synchronization: update downloads the current ASP from the
+# selected channel whenever a script update is applied. Preserve the extra
+# arguments accepted by historical callers, but do not inspect their values.
+_VerifyWebUIAsset_() {
+  local candidate
+  candidate="$1"
+  [ -f "$candidate" ] && [ ! -L "$candidate" ] && [ -s "$candidate" ] || return 1
+  [ "$(wc -c < "$candidate")" -le 262144 ] || return 1
+  grep -Fx '<!-- ResolvGuard WebUI Integration v1 -->' "$candidate" >/dev/null 2>&1 &&
+    grep -F '<template id="rg_inline_dashboard">' "$candidate" >/dev/null 2>&1 &&
+    grep -F 'function rgRequestManualCheck()' "$candidate" >/dev/null 2>&1 &&
+    grep -F 'id="runHealthCheck"' "$candidate" >/dev/null 2>&1 &&
+    grep -F 'rgLoadEmbedded();' "$candidate" >/dev/null 2>&1 &&
+    ! grep -F '/ext/ResolvGuard/dashboard.htm' "$candidate" >/dev/null 2>&1
+}
+_FetchWebUIAsset_() {
+  local dest version tag channel url
+  dest="$1";version="$2";tag="$3";channel="$4"
+  [ ! -e "$dest" ] && [ ! -L "$dest" ] || return 1
+  # Always fetch the independent companion ASP from the selected branch's
+  # raw GitHub URL. A stale local checkout must never shadow that source.
+  url="$(_WebUIAssetURL_ "$channel" "$version")" || return 1
+  _FetchHTTPS_ "$url" "$dest" || return 1
+  if ! _VerifyWebUIAsset_ "$dest" "$version" "$tag" "$channel"; then
+    rm -f "$dest"
+    _Fail_ 'Downloaded WebUI ASP failed identity, content or size verification'
+    return 1
+  fi
+  # The ASP is an independent raw-branch companion. Feature support in its
+  # UI must never block installation of an otherwise valid dashboard.
+  chmod 644 "$dest" || return 1
+}
+
+# For an already complete installation, repair a missing single-file WebUI
+# without touching DNS state or changing a preexisting unexpected file.
+_EnsureInstalledWebUIAsset_() (
+  target="$INSTALL_ROOT/ResolvGuard.asp"
+  channel="$UPDATE_CHANNEL"
+  if [ -f "$target" ] && [ ! -L "$target" ] &&
+     _VerifyWebUIAsset_ "$target" "$SCRIPT_VERSION" "$SCRIPT_VERSTAG" "$channel"; then
+    exit 0
+  fi
+  # Fresh-install and missing-file self-healing only. Do not migrate unshipped
+  # development candidate assets or replace unexpected existing files.
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    _Fail_ 'Existing WebUI ASP failed integrity validation; refusing to overwrite it'
+    exit 1
+  fi
+  stage="$INSTALL_ROOT/.ResolvGuard.asp.install.$$"
+  [ ! -e "$stage" ] && [ ! -L "$stage" ] || exit 1
+  trap 'rm -f "$stage"' EXIT HUP INT TERM
+  _FetchWebUIAsset_ "$stage" "$SCRIPT_VERSION" "$SCRIPT_VERSTAG" "$channel" || exit 1
+  [ ! -e "$target" ] && [ ! -L "$target" ] || exit 1
+  mv "$stage" "$target" || exit 1
+  if ! _VerifyWebUIAsset_ "$target" "$SCRIPT_VERSION" "$SCRIPT_VERSTAG" "$channel"; then
+    _Fail_ 'Newly installed WebUI ASP failed verification'
+    rm -f "$target" || :
+    exit 1
+  fi
+)
+# Determine whether Merlin is actually serving our current installed ASP.
+# Checking the persistent file alone is insufficient: /www and the WAN menu
+# are volatile and can be absent after a legacy script-only update.
+_IsInstalledWebUIMounted_() (
+  target="$INSTALL_ROOT/ResolvGuard.asp"
+  [ -f "$target" ] && [ ! -L "$target" ] || exit 1
+  [ -f /www/require/modules/menuTree.js ] &&
+    grep -Fq 'tabName: "ResolvGuard"' /www/require/modules/menuTree.js || exit 1
+  _RGManual_ hook-current >/dev/null 2>&1 || exit 1
+  _RGWebConfig_ hook-current >/dev/null 2>&1 || exit 1
+  for title in /www/user/user*.title; do
+    [ -f "$title" ] || continue
+    [ "$(cat "$title" 2>/dev/null)" = ResolvGuard ] || continue
+    page="${title%.title}.asp"
+    [ -f "$page" ] && cmp -s "$target" "$page" && exit 0
+  done
+  exit 1
+)
+
+# Best-effort migration for installs previously updated by a script-only
+# updater. The ASP is independently downloaded from the current raw branch,
+# then the authenticated Merlin page is registered. Failure must never block
+# the existing SSH menu, scheduled DNS checks or recovery mechanisms.
+_BootstrapExistingWebUI_() (
+  [ "$ROOT" = "$INSTALL_ROOT" ] && _IsInstallationComplete_ || exit 0
+  bootstrap_lock="$RUNTIME/webui-bootstrap.lock"
+  if [ -L "$bootstrap_lock" ] ||
+     { [ -e "$bootstrap_lock" ] && [ ! -f "$bootstrap_lock" ]; }; then
+    _Say_ 'NOTICE: unexpected WebUI bootstrap lock; skipped for safety'
+    exit 1
+  fi
+  exec 7> "$bootstrap_lock" || exit 1
+  # Another normal menu, boot hook, or installer can finish this in parallel.
+  flock -n 7 || exit 0
+
+  # UI and DNS monitoring share one startup callback but not an enrollment.
+  # Always keep it installed, even for monitoring-disabled installations.
+  if ! _InstallScheduleHook_ quiet; then
+    _Say_ 'NOTICE: Could not register ResolvGuard services-start; reboot recovery unavailable'
+    exit 1
+  fi
+  if ! _EnsureInstalledWebUIAsset_; then
+    _Say_ 'NOTICE: WebUI asset bootstrap failed; DNS monitoring and CLI remain available'
+    exit 1
+  fi
+  _IsInstalledWebUIMounted_ && exit 0
+  if [ ! -d /www/user ] || [ ! -f /www/require/modules/menuTree.js ]; then
+    _Say_ 'NOTICE: Merlin WebUI not ready; mounting deferred until next startup or menu'
+    exit 1
+  fi
+  if ! _RGWebUI_ mount > /tmp/resolvguard-webui-bootstrap-mount.log 2>&1; then
+    _Say_ 'NOTICE: WebUI mounting failed; see /tmp/resolvguard-webui-bootstrap-mount.log'
+    exit 1
+  fi
+  _RGWebUI_ publish > /tmp/resolvguard-webui-bootstrap-publish.log 2>&1 ||
+    _Say_ 'NOTICE: WebUI mounted, but the initial snapshot is not yet available'
+  _Say_ 'ResolvGuard WebUI installed and mounted in Merlin WAN menu.'
+)
+
+# Repair an ASP that was omitted by an old script-only updater. This must run
+# from the NEW installed script on a subsequent ordinary invocation, regardless
+# of whether DNS monitoring is enabled. It deliberately does not run during
+# uninstall, a channel switch to a DIFFERENT branch, or an amtm offline probe.
+# In unattended contexts, never delay or alter a DNS check's result: spawn a
+# best-effort repair with a dedicated /tmp log. The bootstrap's nonblocking
+# flock serializes simultaneous manual, cron and startup attempts.
+_MaybeRepairWebUIOnInvocation_() {
+  local hook
+  [ "$ROOT" = "$INSTALL_ROOT" ] && _IsInstallationComplete_ || return 0
+  # Both the volatile Merlin mount AND the persistent services-start hook
+  # must be present. A manually mounted page with no boot hook also needs
+  # repair, or it will disappear on the next reboot.
+  hook="$HOOK_DIR/services-start"
+  if _VerifyWebUIAsset_ "$INSTALL_ROOT/ResolvGuard.asp" &&
+     _IsInstalledWebUIMounted_ &&
+     [ -f "$hook" ] && [ ! -L "$hook" ] &&
+     grep -Fqx "$(_StartupHookLine_)" "$hook" &&
+     _CheckOwnedStartupHook_ >/dev/null 2>&1; then
+    return 0
+  fi
+  case "${1:-normal}" in
+    background)
+      ( _BootstrapExistingWebUI_ ) > /tmp/resolvguard-webui-selfheal.log 2>&1 &
+      ;;
+    *)
+      if [ -t 0 ] && [ -t 1 ]; then
+        _BootstrapExistingWebUI_ || :
+      else
+        ( _BootstrapExistingWebUI_ ) > /tmp/resolvguard-webui-selfheal.log 2>&1 &
+      fi
+      ;;
+  esac
+  return 0
+}
+
 _InstallResolvGuard_() (
   # The EXIT trap runs after shell function-local variables may have gone out
   # of scope on BusyBox ash. This function already runs in a subshell, so
@@ -3609,6 +4079,9 @@ _InstallResolvGuard_() (
   source_lock="$INSTALL_ROOT/.install-in-progress"
   stage="$INSTALL_ROOT/.resolvguard.install.$$"
   marker_stage="$STATE_DIR/.installation-complete.$$"
+  asp_target="$INSTALL_ROOT/ResolvGuard.asp"
+  asp_stage="$INSTALL_ROOT/.ResolvGuard.asp.install.$$"
+  asp_installed=0
   new_install=0
   created_marker=0
   owned_lock=0
@@ -3616,6 +4089,9 @@ _InstallResolvGuard_() (
   if _IsInstallationComplete_; then
     _InstallPrerequisites_ || exit 1
     _InitializeMissingConfiguration_ || exit 1
+    # Repair AND mount the WebUI after an older script-only channel update.
+    # Mount failure is visual only; never block existing DNS functionality.
+    _BootstrapExistingWebUI_ || :
     _Say_ 'ResolvGuard is already installed; existing configuration preserved.'
     _InstallLauncher_ || :
     exit 0
@@ -3653,7 +4129,10 @@ _InstallResolvGuard_() (
   _ShowInstallStage_ 1 'Checking router prerequisites and DNS dependency'
   _InstallationCleanup_() {
     cleanup_rc=$?
-    rm -f "$stage" "$marker_stage" 2>/dev/null || :
+    rm -f "$stage" "$marker_stage" "$asp_stage" 2>/dev/null || :
+    if [ "$cleanup_rc" -ne 0 ] && [ "$asp_installed" = 1 ]; then
+      rm -f "$asp_target" || :
+    fi
     if [ "$cleanup_rc" -ne 0 ] && [ "$created_marker" = 1 ]; then
       rm -f "$INSTALL_MARKER" || :
     fi
@@ -3706,6 +4185,19 @@ _InstallResolvGuard_() (
       _Fail_ 'Main script target appeared during installation; refusing to overwrite'; exit 1;
     }
   fi
+  # No completed installation marker until the single WebUI page is safely
+  # present. Never overwrite a preexisting unknown asset during fresh install.
+  if [ -e "$asp_target" ] || [ -L "$asp_target" ]; then
+    [ -f "$asp_target" ] && [ ! -L "$asp_target" ] &&
+      _VerifyWebUIAsset_ "$asp_target" "$SCRIPT_VERSION" "$SCRIPT_VERSTAG" "$UPDATE_CHANNEL" || {
+      _Fail_ 'Incomplete install contains unexpected WebUI ASP; inspect it before retrying';exit 1;
+    }
+  else
+    _FetchWebUIAsset_ "$asp_stage" "$SCRIPT_VERSION" "$SCRIPT_VERSTAG" "$UPDATE_CHANNEL" || exit 1
+    [ ! -e "$asp_target" ] && [ ! -L "$asp_target" ] || exit 1
+    mv "$asp_stage" "$asp_target" || { _Fail_ 'Could not publish WebUI ASP';exit 1; }
+    asp_installed=1
+  fi
   mv "$marker_stage" "$INSTALL_MARKER" || { _Fail_ 'Cannot record installation readiness'; exit 1; }
   created_marker=1
   if [ "$SOURCE_FILE" != "$target" ]; then
@@ -3716,6 +4208,17 @@ _InstallResolvGuard_() (
   fi
   _IsInstallationComplete_ || { _Fail_ 'Installation verification failed'; exit 1; }
   printf '  %sResolvGuard installed successfully:%s %s\n' "$RG_GREEN" "$RG_RESET" "$target"
+  if ! _InstallScheduleHook_ quiet; then
+    _Say_ '  NOTICE: Persistent WebUI startup registration failed; check JFFS custom scripts.'
+  fi
+  # Native WebUI mounting is best-effort: its ASP has already been fetched and
+  # verified, while firmware's /www tree may not be ready until startup.
+  if _RGWebUI_ mount >/tmp/resolvguard-webui-install-mount.log 2>&1; then
+    _RGWebUI_ publish >/dev/null 2>&1 || :
+    _Say_ '  ResolvGuard WebUI mounted under WAN.'
+  else
+    _Say_ '  NOTICE: WebUI asset installed; page mount will retry at router startup.'
+  fi
   _InstallProgressPause_
   _ShowInstallStage_ 4 'Preparing the optional command launcher'
   _InstallLauncher_ || _Say_ 'NOTICE: Optional launcher could not be installed.'
@@ -3929,60 +4432,82 @@ _RegisterScheduleCron_() {
     _Fail_ 'Registered cron job could not be verified'; return 1; }
 }
 
+# Keep the startup entry as a single, exactly owned line. Legacy blocks
+# from an existing installed ResolvGuard may be replaced only if unmodified.
+_StartupHookLine_() {
+  printf '%s/resolvguard.sh startup & # RESOLVGUARD STARTUP\n' "$ROOT"
+}
+
 _CheckOwnedStartupHook_() {
-  local hook begin end
+  local hook line n_line n_begin n_end n_refs actual expected
   hook="$HOOK_DIR/services-start"
   [ ! -e "$hook" ] && [ ! -L "$hook" ] && return 0
-  [ -f "$hook" ] && [ ! -L "$hook" ] || { _Fail_ 'Unsafe services-start hook (not a regular file)'; return 1; }
-  begin="$(grep -Fxc '# RESOLVGUARD BEGIN' "$hook" || :)"
-  end="$(grep -Fxc '# RESOLVGUARD END' "$hook" || :)"
-  [ "$begin" = "$end" ] && [ "$begin" -le 1 ] || { _Fail_ 'Ambiguous ResolvGuard services-start markers'; return 1; }
-  # Do not allow a misplaced closing marker to silently consume other code.
-  if [ "$begin" = 1 ]; then
-    awk '/^# RESOLVGUARD BEGIN$/ {b=NR} /^# RESOLVGUARD END$/ {e=NR} END {exit(e>b)?0:1}' "$hook" || {
-      _Fail_ 'Out-of-order ResolvGuard services-start markers'; return 1; }
-    grep -Fqx "/bin/sh $ROOT/resolvguard.sh startup >> /tmp/resolvguard-startup.log 2>&1 &" "$hook" || {
-      _Fail_ 'Existing ResolvGuard startup hook content differs; review manually'; return 1; }
+  [ -f "$hook" ] && [ ! -L "$hook" ] || { _Fail_ 'Unsafe services-start hook'; return 1; }
+  line="$(_StartupHookLine_)"
+  n_line="$(grep -Fc '# RESOLVGUARD STARTUP' "$hook" || :)"
+  n_begin="$(grep -Fxc '# RESOLVGUARD BEGIN' "$hook" || :)"
+  n_end="$(grep -Fxc '# RESOLVGUARD END' "$hook" || :)"
+  [ "$n_line" -le 1 ] && [ "$n_begin" = "$n_end" ] && [ "$n_begin" -le 1 ] &&
+    [ $((n_line+n_begin)) -le 1 ] || { _Fail_ 'Ambiguous ResolvGuard startup hook'; return 1; }
+  if [ "$n_line" = 1 ]; then
+    grep -Fqx "$line" "$hook" || { _Fail_ 'Modified ResolvGuard startup hook'; return 1; }
+  elif [ "$n_begin" = 1 ]; then
+    expected="$(printf '%s\n' '# RESOLVGUARD BEGIN' \
+      "/bin/sh $ROOT/resolvguard.sh startup >> /tmp/resolvguard-startup.log 2>&1 &" \
+      '# RESOLVGUARD END')"
+    actual="$(sed -n '/^# RESOLVGUARD BEGIN$/,/^# RESOLVGUARD END$/p' "$hook")"
+    [ "$actual" = "$expected" ] || { _Fail_ 'Modified ResolvGuard startup block'; return 1; }
   fi
+  # The one owned entry is the only permitted startup invocation.
+  n_refs="$(grep -Fc "$ROOT/resolvguard.sh startup" "$hook" || :)"
+  [ "$n_refs" -eq $((n_line+n_begin)) ] || {
+    _Fail_ 'Unrecognized ResolvGuard startup command'; return 1;
+  }
 }
 
 _InstallScheduleHook_() {
-  local hook staged success_output
+  local hook staged line success_output
   success_output="${1:-verbose}"
   hook="$HOOK_DIR/services-start"
   _CheckOwnedStartupHook_ || return 1
   [ -d "$HOOK_DIR" ] && [ -w "$HOOK_DIR" ] || { _Fail_ "Hook directory unavailable: $HOOK_DIR"; return 1; }
-  if [ -f "$hook" ] && grep -Fqx '# RESOLVGUARD BEGIN' "$hook"; then
+  line="$(_StartupHookLine_)"
+  if [ -f "$hook" ] && grep -Fqx "$line" "$hook"; then
     [ "$success_output" = quiet ] || _Say_ 'Startup hook: already installed'
     return 0
   fi
   staged="$HOOK_DIR/.services-start-resolvguard-$$"
+  [ ! -e "$staged" ] && [ ! -L "$staged" ] || return 1
   if [ -f "$hook" ]; then
-    cp -p "$hook" "$staged" || return 1
+    if grep -Fqx '# RESOLVGUARD BEGIN' "$hook"; then
+      sed '/^# RESOLVGUARD BEGIN$/,/^# RESOLVGUARD END$/d' "$hook" > "$staged" || return 1
+    else
+      cat "$hook" > "$staged" || return 1
+    fi
   else
     (umask 077; printf '#!/bin/sh\n' > "$staged") || return 1
   fi
-  {
-    printf '%s\n' '# RESOLVGUARD BEGIN'
-    printf '/bin/sh %s/resolvguard.sh startup >> /tmp/resolvguard-startup.log 2>&1 &\n' "$ROOT"
-    printf '%s\n' '# RESOLVGUARD END'
-  } >> "$staged" || { rm -f "$staged"; return 1; }
-  chmod +x "$staged" && mv "$staged" "$hook" || {
-    rm -f "$staged"; return 1; }
+  printf '\n%s\n' "$line" >> "$staged" || { rm -f "$staged"; return 1; }
+  chmod 755 "$staged" && mv -f "$staged" "$hook" || { rm -f "$staged"; return 1; }
 }
 
 _RemoveScheduleHook_() {
-  local hook staged
+  local hook staged line
   hook="$HOOK_DIR/services-start"
   _CheckOwnedStartupHook_ || return 1
   [ -f "$hook" ] || return 0
-  grep -Fqx '# RESOLVGUARD BEGIN' "$hook" || return 0
+  line="$(_StartupHookLine_)"
+  if ! grep -Fqx "$line" "$hook" && ! grep -Fqx '# RESOLVGUARD BEGIN' "$hook"; then
+    return 0
+  fi
   staged="$HOOK_DIR/.services-start-uninstall-$$"
-  cp -p "$hook" "$staged" || return 1
-  sed '/^# RESOLVGUARD BEGIN$/,/^# RESOLVGUARD END$/d' "$hook" > "$staged" || {
-    rm -f "$staged"; return 1; }
-  chmod +x "$staged" && mv "$staged" "$hook" || {
-    rm -f "$staged"; return 1; }
+  [ ! -e "$staged" ] && [ ! -L "$staged" ] || return 1
+  if grep -Fqx '# RESOLVGUARD BEGIN' "$hook"; then
+    sed '/^# RESOLVGUARD BEGIN$/,/^# RESOLVGUARD END$/d' "$hook" > "$staged" || return 1
+  else
+    awk -v owned="$line" '$0 != owned {print}' "$hook" > "$staged" || return 1
+  fi
+  chmod 755 "$staged" && mv -f "$staged" "$hook" || { rm -f "$staged"; return 1; }
 }
 
 _ShowScheduleStatus_() {
@@ -3996,7 +4521,7 @@ _ShowScheduleStatus_() {
   fi
   _Say_ "Readiness: NTP and WAN connectivity required"
   if [ -r "$SCHEDULE_MARKER" ]; then
-    if [ -f "$HOOK_DIR/services-start" ] && grep -Fqx '# RESOLVGUARD BEGIN' "$HOOK_DIR/services-start"; then
+    if [ -f "$HOOK_DIR/services-start" ] && grep -Fqx "$(_StartupHookLine_)" "$HOOK_DIR/services-start"; then
       _Say_ 'Boot hook: installed (services-start)'
     else _Say_ 'WARNING: boot hook missing'; fi
     if cru l 2>/dev/null | grep -F "$SCHEDULE_JOB" >/dev/null; then
@@ -4079,7 +4604,7 @@ _EnableScheduledMonitoring_() {
     _InstallScheduleHook_ quiet || return 1
     if ! _RegisterScheduleCron_; then
       cru d "$SCHEDULE_JOB" >/dev/null 2>&1 || :
-      _RemoveScheduleHook_ || :
+      # Leave the shared startup hook intact if cron fails.
       _Fail_ 'Monitoring was not enabled because cron registration failed'
       return 1
     fi
@@ -4088,7 +4613,7 @@ _EnableScheduledMonitoring_() {
        ! mv "$staged" "$SCHEDULE_MARKER"; then
       rm -f "$staged"
       cru d "$SCHEDULE_JOB" >/dev/null 2>&1 || :
-      _RemoveScheduleHook_ || :
+      # The shared startup hook is independent of monitoring enrollment.
       _Fail_ 'Monitoring authorization could not be saved'; return 1
     fi
   fi
@@ -4100,6 +4625,10 @@ _EnableScheduledMonitoring_() {
 _EnableAutomaticFailover_() {
   local approval_status staged view
   view="${1:-detail}"
+  if _RecursiveUnboundProduction_; then
+    _Fail_ 'WAN failover is disabled in recursive Unbound mode. Use Monitoring Only or enable Unbound Manager Integrate with Stubby.'
+    return 1
+  fi
   [ ! -e "$PENDING_TRANSACTION" ] && [ ! -e "$RECOVERY_HOLD" ] || {
     _Fail_ 'Unresolved recovery state; automatic switching blocked'; return 1; }
   _SyncPreferredWAN_ || return 1
@@ -4142,8 +4671,9 @@ _EnableAutomaticFailover_() {
   (
     trap '_ReleaseWANLock_ >/dev/null 2>&1 || :' EXIT HUP INT TERM
     [ ! -e "$PENDING_TRANSACTION" ] && [ ! -e "$RECOVERY_HOLD" ] &&
-      [ "$(_GetActiveWANPool_ 2>/dev/null)" = preferred ] && _CheckPolicyAuthorization_ || {
-        _Fail_ 'WAN/policy changed during authorization'; exit 1; }
+      [ "$(_GetActiveWANPool_ 2>/dev/null)" = preferred ] &&
+      ! _RecursiveUnboundProduction_ && _CheckPolicyAuthorization_ || {
+        _Fail_ 'WAN/policy or Unbound mode changed during authorization'; exit 1; }
     [ ! -L "$AUTO_FAILOVER_MARKER" ] || { _Fail_ 'Unsafe authorization marker'; exit 1; }
     failures=0; recoveries=0
     _WriteMonitoringState_ || { _Fail_ 'Unable to reset monitoring counters'; exit 1; }
@@ -4165,6 +4695,8 @@ _DisableAutomaticFailover_() {
   _ConfirmYesNo_ 'Disable automatic DNS switching (keep monitoring)?' || return 1
   [ ! -L "$AUTO_FAILOVER_MARKER" ] || { _Fail_ 'Unsafe authorization marker'; return 1; }
   rm -f "$AUTO_FAILOVER_MARKER" || return 1
+  # Re-entering Monitoring Only is a new state transition for event history.
+  rm -f "$RUNTIME/switching-mode-notice" || :
   _LogEvent_ notice 'MONITORING ONLY: automatic WAN switching disabled; scheduled checks retained' >/dev/null
   _Say_ 'Automatic failover: OFF (monitoring remains ON)'
   [ "$(_GetActiveWANPool_ 2>/dev/null || :)" = preferred ] ||
@@ -4186,9 +4718,17 @@ _DisableScheduledMonitoring_() {
     fi
     rm -f "$RUNTIME/cron-list-$$"
   fi
-  _RemoveScheduleHook_ || return 1
+  # The services-start callback also restores the WebUI after reboot.
+  # Do not delete it when DNS monitoring is disabled. Uninstall owns cleanup.
   rm -f "$SCHEDULE_MARKER" "$AUTO_FAILOVER_MARKER" || return 1
+  rm -f "$RUNTIME/switching-mode-notice" || :
   _LogEvent_ notice 'DNS MONITORING DISABLED: scheduler and automatic switching authorization removed' >/dev/null
+  # Monitoring is OFF, so there will be no next scheduled cycle to refresh the
+  # dashboard. Publish the new operating mode once using existing observations
+  # (no new DNS probes, WAN writes, or recurring status job).
+  if [ -f "$ROOT/ResolvGuard.asp" ] && [ ! -L "$ROOT/ResolvGuard.asp" ]; then
+    _RGWebUI_ publish >/dev/null 2>&1 || :
+  fi
   [ "$success_output" = quiet ] || _Say_ 'DNS monitoring: OFF (automatic failover OFF)'
 }
 
@@ -4247,6 +4787,24 @@ _ReconcileBootState_() {
   current="$(_ReadWANRulelist_)" || return 1
   preferred="$(cat "$PREF_RULELIST")"
   if [ "$current" = "$preferred" ]; then
+    # Recursive Unbound owns LAN DNS, so the direct DNSMasq -> Stubby
+    # readiness test does not describe this production path. Only bypass that
+    # test for a clean, read-only Monitoring Only state with independently
+    # verified Strict DoT endpoint identities. Never clear a journal/hold or
+    # permit an automatic WAN write through this exception.
+    if _RecursiveUnboundProduction_ &&
+       [ ! -e "$PENDING_TRANSACTION" ] && [ ! -L "$PENDING_TRANSACTION" ] &&
+       [ ! -e "$RECOVERY_HOLD" ] && [ ! -L "$RECOVERY_HOLD" ]; then
+      if _AllowMonitoringOnlyWithoutLANForwarding_; then
+        _WriteBootReport_ 'MONITORING ONLY - recursive Unbound owns LAN DNS; external DoT checks separate; WAN switching disabled' || :
+        [ "$success_output" = quiet ] ||
+          _Say_ 'BOOT: recursive Unbound owns LAN DNS; external DoT monitoring ready; WAN switching disabled.'
+        return 0
+      fi
+      _WriteBootReport_ 'WAIT - recursive Unbound Monitoring Only prerequisites not verified; no WAN writes' || :
+      _Say_ 'BOOT: recursive Unbound detected; Monitoring Only prerequisites unverified; no WAN writes.'
+      return 1
+    fi
     # Do not clear a journal or recovery hold based only on matching NVRAM/YAML.
     # This was a confirmed safety gap during the November 11 Stubby outage.
     if [ ! -e "$PENDING_TRANSACTION" ] && [ ! -L "$PENDING_TRANSACTION" ] &&
@@ -4316,7 +4874,1122 @@ _ReconcileBootState_() {
   return 1
 }
 
+# RESOLVGUARD WEBUI MANUAL CHECK BEGIN
+# Manual WebUI checks reuse the policy/authenticated-DoT probe engine but never
+# the DNS health watchdog/failover state machine. All work runs in subshells.
+_RGManual_() (
+  umask 077
+  RG_M_DATA="${RUNTIME}/webui"
+  RG_M_HOOK=/jffs/scripts/service-event
+  RG_M_LOCK=/tmp/addonwebui.lock
+  RG_M_BEG='# RESOLVGUARD WEBUI MANUAL BEGIN'
+  RG_M_END='# RESOLVGUARD WEBUI MANUAL END'
+
+  message() { printf '%s\n' "ResolvGuard WebUI manual: $*" >&2; }
+  quote() {
+    printf '%s' "$1" | LC_ALL=C awk '
+      BEGIN{printf "\""}
+      {
+        if(NR>1)printf "\\n"
+        for(i=1;i<=length($0);i++) {
+          c=substr($0,i,1)
+          if(c=="\\")printf "\\\\"
+          else if(c=="\"")printf "\\\""
+          else if(c==sprintf("%c",9))printf "\\t"
+          else if(c==sprintf("%c",13))printf "\\r"
+          else if(c=="<")printf "\\u003c"
+          else if(c==">")printf "\\u003e"
+          else if(c=="&")printf "\\u0026"
+          else printf "%s",c
+        }
+      }
+      END{printf "\""}
+    '
+  }
+  epoch() { date +%s 2>/dev/null || printf '0'; }
+  atomic() {
+    # All published documents are bounded, validated JSON in volatile /tmp.
+    [ -d "$RG_M_DATA" ] && [ ! -L "$RG_M_DATA" ] || return 1
+    [ ! -L "$RG_M_DATA/manual.htm" ] || return 1
+    staged="$RG_M_DATA/.manual-$$.new"
+    [ ! -e "$staged" ] && [ ! -L "$staged" ] || return 1
+    cat > "$staged" && mv -f "$staged" "$RG_M_DATA/manual.htm"
+  }
+  error_result() {
+    completed=$(epoch)
+    {
+      printf '{"schema":1,"requestId":';quote "$RG_M_ID"
+      printf ',"status":"error","startedEpoch":%s,"completedEpoch":%s,"message":' "$RG_M_STARTED" "$completed"
+      quote "$1"
+      printf ',"checks":[],"resolvers":[]}\n'
+    } | atomic
+    message "$1"
+    return 1
+  }
+  hook_body() {
+    printf '%s\n' 'case "$1:$2" in start:ResolvGuardManualCheck) /jffs/addons/ResolvGuard.d/resolvguard.sh webui manual-run & ;; esac # RESOLVGUARD MANUAL'
+  }
+  hook_current() {
+    [ -f "$RG_M_HOOK" ] && [ ! -L "$RG_M_HOOK" ] || return 1
+    [ "$(grep -Fc '# RESOLVGUARD MANUAL' "$RG_M_HOOK" || :)" = 1 ] &&
+      grep -Fqx "$(hook_body)" "$RG_M_HOOK"
+  }
+  update_hook() {
+    action="$1"
+    [ "$ROOT" = /jffs/addons/ResolvGuard.d ] || { message 'expected installed ResolvGuard path'; return 1; }
+    [ ! -L "$RG_M_HOOK" ] && { [ ! -e "$RG_M_HOOK" ] || [ -f "$RG_M_HOOK" ]; } || {
+      message 'unsafe service-event file'; return 1;
+    }
+    [ -d /jffs/scripts ] && [ ! -L /jffs/scripts ] || { message 'scripts directory missing or unsafe'; return 1; }
+    exec 9> "$RG_M_LOCK" && flock -x 9 || return 1
+    compact="$(hook_body)"
+    count_compact=0;count_begin=0;count_end=0
+    if [ -f "$RG_M_HOOK" ]; then
+      count_compact=$(grep -Fc '# RESOLVGUARD MANUAL' "$RG_M_HOOK" || :)
+      count_begin=$(grep -Fxc "$RG_M_BEG" "$RG_M_HOOK" || :)
+      count_end=$(grep -Fxc "$RG_M_END" "$RG_M_HOOK" || :)
+    fi
+    [ "$count_compact" -le 1 ] && [ "$count_begin" = "$count_end" ] &&
+      [ "$count_begin" -le 1 ] && [ $((count_compact+count_begin)) -le 1 ] &&
+      [ "$(grep -Fc ResolvGuardManualCheck "$RG_M_HOOK" 2>/dev/null || :)" -eq $((count_compact+count_begin)) ] || {
+        message 'ambiguous service-event manual hook'; return 1;
+      }
+    if [ "$count_compact" = 1 ]; then
+      grep -Fqx "$compact" "$RG_M_HOOK" || { message 'modified manual hook'; return 1; }
+      [ "$action" = install ] && return 0
+    elif [ "$count_begin" = 1 ]; then
+      actual=$(sed -n '/^# RESOLVGUARD WEBUI MANUAL BEGIN$/,/^# RESOLVGUARD WEBUI MANUAL END$/p' "$RG_M_HOOK")
+      expected="$(printf '%s\n' "$RG_M_BEG" \
+        'if [ "$1" = "start" ] && [ "$2" = "ResolvGuardManualCheck" ]; then' \
+        '  /bin/sh /jffs/addons/ResolvGuard.d/resolvguard.sh webui manual-run >/tmp/resolvguard-webui-manual.log 2>&1 &' \
+        'fi' "$RG_M_END")"
+      [ "$actual" = "$expected" ] || { message 'modified manual hook block'; return 1; }
+    elif [ "$action" = remove ]; then
+      return 0
+    fi
+    # An unowned action must not be overwritten or duplicated.
+    if [ "$count_compact" = 0 ] && [ "$count_begin" = 0 ] && [ -f "$RG_M_HOOK" ] &&
+       grep -F 'ResolvGuardManualCheck' "$RG_M_HOOK" >/dev/null; then
+      message 'unrecognized manual action'; return 1
+    fi
+    staged=/jffs/scripts/.service-event-resolvguard-manual-$$
+    [ ! -e "$staged" ] && [ ! -L "$staged" ] || return 1
+    if [ -f "$RG_M_HOOK" ]; then
+      if [ "$count_begin" = 1 ]; then
+        sed '/^# RESOLVGUARD WEBUI MANUAL BEGIN$/,/^# RESOLVGUARD WEBUI MANUAL END$/d' "$RG_M_HOOK" > "$staged" || return 1
+      elif [ "$count_compact" = 1 ]; then
+        awk -v owned="$compact" '$0 != owned {print}' "$RG_M_HOOK" > "$staged" || return 1
+      else
+        cat "$RG_M_HOOK" > "$staged" || return 1
+      fi
+    else
+      printf '#!/bin/sh\n' > "$staged" || return 1
+    fi
+    if [ "$action" = install ]; then
+      printf '\n%s\n' "$compact" >> "$staged" || return 1
+    fi
+    chmod 755 "$staged" && mv -f "$staged" "$RG_M_HOOK" || { rm -f "$staged"; return 1; }
+    return 0
+  }
+  run() {
+    [ "$ROOT" = /jffs/addons/ResolvGuard.d ] || { message 'not running from installed add-on';return 1; }
+    [ -d "$RUNTIME" ] && [ ! -L "$RUNTIME" ] || { message 'runtime directory unavailable';return 1; }
+    if [ -e "$RG_M_DATA" ] && { [ -L "$RG_M_DATA" ] || [ ! -d "$RG_M_DATA" ]; }; then
+      message 'unsafe WebUI runtime directory';return 1
+    fi
+    mkdir -p "$RG_M_DATA" || return 1
+    chmod 700 "$RG_M_DATA" || :
+    [ ! -L "$RG_M_DATA/manual.lock" ] || return 1
+    exec 7> "$RG_M_DATA/manual.lock" || return 1
+    if ! flock -n 7; then
+      message 'manual health check already running; request ignored'
+      return 1
+    fi
+    RG_M_STARTED=$(epoch)
+    RG_M_ID="${RG_M_STARTED}-$$"
+    { printf '{"schema":1,"requestId":';quote "$RG_M_ID"
+      printf ',"status":"running","startedEpoch":%s,"completedEpoch":0,"message":"Direct authenticated DoT policy probes running","checks":[],"resolvers":[]}\n' "$RG_M_STARTED"
+    } | atomic || return 1
+
+    RG_INSPECT_CONFIG_HELD=0
+    RG_INSPECT_DIR=''
+    trap '_CleanupInspectorSession_' EXIT HUP INT TERM
+    _RequireProbeDependencies_ >/dev/null 2>&1 || { error_result 'Authenticated DoT probe dependency unavailable'; return 1; }
+    attempt=0
+    until _AcquireConfigLock_; do
+      attempt=$((attempt+1))
+      [ "$attempt" -lt 6 ] || { error_result 'Configuration busy; manual check deferred';return 1; }
+      sleep 1
+    done
+    RG_INSPECT_CONFIG_HELD=1
+    [ ! -L "$RUNTIME/inspectors" ] || { error_result 'Unsafe inspector directory';return 1; }
+    mkdir -p "$RUNTIME/inspectors" || { error_result 'Unable to prepare inspector directory';return 1; }
+    RG_INSPECT_DIR="$RUNTIME/inspectors/$$"
+    [ ! -e "$RG_INSPECT_DIR" ] && [ ! -L "$RG_INSPECT_DIR" ] && mkdir "$RG_INSPECT_DIR" || {
+      error_result 'Unable to reserve inspector session';return 1;
+    }
+    PROVIDERS="$RG_INSPECT_DIR/providers.tsv"
+    _ValidateConfiguration_ >/dev/null 2>&1 || { error_result 'Current DNS monitoring policy/configuration failed validation';return 1; }
+    [ -f "$CHECKS" ] && [ ! -L "$CHECKS" ] && cp "$CHECKS" "$RG_INSPECT_DIR/checks.tsv" || {
+      error_result 'Unable to snapshot the approved DNS checks';return 1;
+    }
+    if ! _ReleaseConfigLock_; then
+      error_result 'Could not release configuration admission lock';return 1
+    fi
+    RG_INSPECT_CONFIG_HELD=0
+
+    RG_HEALTH_COLOR_ENABLED=0
+    RG_HEALTH_SHOW_RESOLVERS=0
+    outcomes="$RG_INSPECT_DIR/outcomes.tsv"
+    : > "$outcomes" || { error_result 'Unable to create check results';return 1; }
+    passed=0;failed=0
+    while IFS='|' read -r id ip tls port extra; do
+      [ -n "$id" ] || continue
+      while IFS='|' read -r name typ rcode count expected extra; do
+        case "$name" in ''|\#*) continue;; esac
+        # Each call is read-only and authenticates the exact configured TLS peer.
+        details=$(_ProbeDNSRecord_ "$id" "$name" "$typ" "$rcode" "$count" "$expected" 2>&1)
+        rc=$?
+        details=$(printf '%s' "$details" | tr '\n|' '  ' | cut -c 1-360)
+        if [ "$rc" -eq 0 ]; then result=PASS;passed=$((passed+1))
+        else result=FAIL;failed=$((failed+1)); fi
+        printf '%s|%s|%s|%s|%s\n' "$id" "$name" "$typ" "$result" "$details" >> "$outcomes" || {
+          error_result 'Unable to save the check details';return 1;
+        }
+      done < "$RG_INSPECT_DIR/checks.tsv"
+    done < "$PROVIDERS"
+    [ $((passed+failed)) -gt 0 ] || { error_result 'No DNS policy observations were completed';return 1; }
+    complete=$(epoch)
+    {
+      printf '{"schema":1,"requestId":';quote "$RG_M_ID"
+      printf ',"status":"complete","startedEpoch":%s,"completedEpoch":%s' "$RG_M_STARTED" "$complete"
+      printf ',"passed":%s,"failed":%s,"checks":[' "$passed" "$failed"
+      sep=''
+      while IFS='|' read -r id name typ result details; do
+        printf '%s{"id":' "$sep";quote "$id"
+        printf ',"hostname":';quote "$name"
+        printf ',"type":';quote "$typ"
+        printf ',"result":';quote "$result"
+        printf ',"detail":';quote "$details"
+        printf '}'
+        sep=,
+      done < "$outcomes"
+      printf '],"resolvers":['
+      sep=''
+      while IFS='|' read -r id ip tls port extra; do
+        counts=$(awk -F'|' -v key="$id" '$1==key {if($4=="PASS")p++;else if($4=="FAIL")f++} END{printf "%d|%d",p+0,f+0}' "$outcomes")
+        good=${counts%%|*};bad=${counts#*|}
+        printf '%s{"id":' "$sep";quote "$id"
+        printf ',"ip":';quote "$ip"
+        printf ',"tls":';quote "$tls"
+        printf ',"port":';quote "$port"
+        printf ',"passed":%s,"failed":%s}' "$good" "$bad"
+        sep=,
+      done < "$PROVIDERS"
+      printf ']}\n'
+    } | atomic || { error_result 'Unable to atomically publish manual results';return 1; }
+    return 0
+  }
+  case "${1:-}" in
+    run) run ;;
+    status) [ -f "$RG_M_DATA/manual.htm" ] && [ ! -L "$RG_M_DATA/manual.htm" ] && cat "$RG_M_DATA/manual.htm" || { message 'no manual health check result yet';return 1; } ;;
+    hook-install) update_hook install ;;
+    hook-remove) update_hook remove ;;
+    hook-current) hook_current ;;
+    *) message 'Usage: webui [manual-run|manual-status]';return 2 ;;
+  esac
+)
+# RESOLVGUARD WEBUI MANUAL CHECK END
+# RESOLVGUARD WEBUI CONFIG BRIDGE BEGIN
+# Native Merlin service-event is invoked by an authenticated start_apply.htm
+# POST. Only a small allowlisted ASCII data request is accepted;
+# never eval, source, or execute any user-supplied text. All writes delegate to
+# the same validation, configuration lock, and rollback functions as the CLI.
+_RGWebConfig_() (
+  umask 077
+  rg_dir="$RUNTIME/webui"
+  rg_hook=/jffs/scripts/service-event
+  rg_beg='# RESOLVGUARD WEBUI CONFIG BEGIN'
+  rg_end='# RESOLVGUARD WEBUI CONFIG END'
+  rg_lock=/tmp/addonwebui.lock
+  rg_result="$rg_dir/config-action.htm"
+  rg_config="$rg_dir/config.htm"
+  # Merlin ASUSWRT shared add-on transport, also used by MerlinAU.
+  # Only ResolvGuard_config_request is read; other add-ons' keys are untouched.
+  rg_shared="${RG_CUSTOM_SETTINGS_FILE:-/jffs/addons/custom_settings.txt}"
+  rg_notice() { printf '%s\n' "ResolvGuard WebUI config: $*" >&2; }
+  rg_quote() {
+    printf '%s' "$1" | LC_ALL=C awk '
+      BEGIN {printf "\""}
+      {if(NR>1)printf "\\n";
+       for(i=1;i<=length($0);i++) {
+         c=substr($0,i,1);
+         if(c=="\\") printf "\\\\";
+         else if(c=="\"") printf "\\\"";
+         else if(c==sprintf("%c",9)) printf "\\t";
+         else if(c==sprintf("%c",13)) printf "\\r";
+         else if(c=="<") printf "\\u003c";
+         else if(c==">") printf "\\u003e";
+         else if(c=="&") printf "\\u0026";
+         else printf "%s",c;
+       }}
+      END{printf "\""}'
+  }
+  rg_ready() {
+    [ -d "$RUNTIME" ] && [ ! -L "$RUNTIME" ] || return 1
+    [ ! -L "$rg_dir" ] && { [ ! -e "$rg_dir" ] || [ -d "$rg_dir" ]; } || return 1
+    mkdir -p "$rg_dir" || return 1
+    chmod 700 "$rg_dir" || return 1
+  }
+  rg_atomic() {
+    rg_target="$1"
+    [ ! -L "$rg_target" ] && { [ ! -e "$rg_target" ] || [ -f "$rg_target" ]; } || return 1
+    rg_tmp="$rg_target.new.$$"
+    [ ! -e "$rg_tmp" ] && [ ! -L "$rg_tmp" ] || return 1
+    if ! cat > "$rg_tmp" || ! chmod 600 "$rg_tmp" || ! mv -f "$rg_tmp" "$rg_target"; then
+      rm -f "$rg_tmp"; return 1
+    fi
+  }
+  rg_snapshot() {
+    rg_ready || return 1
+    [ -f "$SETTINGS" ] && [ ! -L "$SETTINGS" ] || return 1
+    [ -f "$EXTRA_PROVIDERS" ] && [ ! -L "$EXTRA_PROVIDERS" ] || return 1
+    # Serialize snapshots, including those triggered by SSH saves and cron.
+    [ ! -L "$rg_dir/config-snapshot.lock" ] &&
+      { [ ! -e "$rg_dir/config-snapshot.lock" ] || [ -f "$rg_dir/config-snapshot.lock" ]; } || return 1
+    exec 7> "$rg_dir/config-snapshot.lock" && flock -x 7 || return 1
+    # The result feed exists even before the first save. No flash write.
+    if [ ! -e "$rg_result" ] && [ ! -L "$rg_result" ]; then
+      rg_publish_result '' idle 'No configuration action completed yet' || :
+    fi
+    rg_previous=0
+    if [ -f "$rg_config" ] && [ ! -L "$rg_config" ]; then
+      rg_previous=$(sed -n 's/^.*"revision":\([0-9][0-9]*\),.*$/\1/p' "$rg_config" | head -n 1)
+    fi
+    case "$rg_previous" in ''|*[!0-9]*) rg_previous=0 ;; esac
+    [ "${#rg_previous}" -le 9 ] || rg_previous=0
+    rg_revision=$((rg_previous+1))
+    rg_epoch=$(date +%s 2>/dev/null || printf 0)
+    (
+      printf '{"schema":1,"kind":"configuration","revision":%s,"generatedEpoch":%s,"settings":{' \
+        "$rg_revision" "$rg_epoch"
+      rg_sep=''
+      for rg_key in SCHEDULE_INTERVAL_MINUTES FAST_CONFIRM_SECONDS FAIL_THRESHOLD RECOVERY_THRESHOLD TIMEOUT_SECONDS BOOT_MIN_UPTIME_SECONDS SYSLOG_HEALTH_INTERVAL_MINUTES; do
+        rg_value=$(sed -n "s/^${rg_key}=//p" "$SETTINGS" | head -n 1)
+        case "$rg_value" in ''|*[!0-9]*) rg_value=0 ;; esac
+        rg_value=$(printf '%s\n' "$rg_value" | awk '{printf "%.0f",$1+0}')
+        printf '%s' "$rg_sep"; rg_quote "$rg_key"; printf ':'; printf '%s' "$rg_value"
+        rg_sep=,
+      done
+      rg_recursive=false
+      if _RecursiveUnboundProduction_; then rg_recursive=true; fi
+      rg_auto=false;rg_hold=false
+      if [ "$rg_recursive" = false ] && [ -f "$SCHEDULE_MARKER" ] && [ ! -L "$SCHEDULE_MARKER" ] &&
+         [ -f "$AUTO_FAILOVER_MARKER" ] && [ ! -L "$AUTO_FAILOVER_MARKER" ]; then
+        if _CheckAutomaticFailoverAuthorization_ >/dev/null 2>&1; then
+          rg_auto=true
+        else
+          rg_hold=true
+        fi
+      fi
+      printf '},"monitoringEnabled":%s,"autoFailoverEnabled":%s,"requiresPolicyReview":%s,"policySafetyHold":%s,' \
+        "$( [ -f "$SCHEDULE_MARKER" ] && [ ! -L "$SCHEDULE_MARKER" ] && printf true || printf false )" \
+        "$rg_auto" "$rg_hold" "$rg_hold"
+      printf '"backups":['
+      rg_sep=''
+      while IFS='|' read -r rg_id rg_ip rg_tls rg_port rg_extra; do
+        case "$rg_id" in ''|'#'*) continue ;; esac
+        [ -z "$rg_extra" ] && _IsValidID_ "$rg_id" && _IsValidIP_ "$rg_ip" && \
+          _IsValidDomain_ "$rg_tls" && _IsValidTLSPort_ "$rg_port" || continue
+        case "$rg_id" in wan[0-9]*) continue ;; esac
+        printf '%s{"id":' "$rg_sep"; rg_quote "$rg_id"
+        printf ',"ip":'; rg_quote "$rg_ip"
+        printf ',"tls":'; rg_quote "$rg_tls"
+        printf ',"port":%s}' "$rg_port"
+        rg_sep=,
+      done < "$EXTRA_PROVIDERS"
+      printf '],"script":{"version":';rg_quote "$SCRIPT_VERSION"
+      printf ',"build":';rg_quote "$SCRIPT_VERSTAG"
+      printf ',"channel":';rg_quote "$UPDATE_CHANNEL";printf '}}\n'
+    ) | rg_atomic "$rg_config"
+  }
+  rg_publish_result() {
+    rg_id="$1"; rg_status="$2"; rg_message="$3"
+    rg_ready || return 1
+    (
+      printf '{"schema":1,"requestId":';rg_quote "$rg_id"
+      printf ',"status":';rg_quote "$rg_status"
+      printf ',"message":';rg_quote "$rg_message"
+      case "${rg_op:-}" in script-check|script-install)
+        printf ',"latestVersion":';rg_quote "${rg_latest_version:-}"
+        printf ',"latestBuild":';rg_quote "${rg_latest_build:-}"
+        printf ',"channel":';rg_quote "$UPDATE_CHANNEL" ;;
+      esac
+      printf ',"completedEpoch":%s}\n' "$(date +%s 2>/dev/null || printf 0)"
+    ) | rg_atomic "$rg_result"
+  }
+  rg_hook_body() {
+    printf '%s\n' 'case "$1:$2" in start:ResolvGuardCfg) /jffs/addons/ResolvGuard.d/resolvguard.sh webui config-run & ;; esac # RESOLVGUARD CONFIG'
+  }
+  rg_hook_current() {
+    [ -f "$rg_hook" ] && [ ! -L "$rg_hook" ] || return 1
+    [ "$(grep -Fc '# RESOLVGUARD CONFIG' "$rg_hook" || :)" = 1 ] &&
+      grep -Fqx "$(rg_hook_body)" "$rg_hook"
+  }
+  rg_hook_update() {
+    rg_verb="$1"
+    [ "$ROOT" = "$INSTALL_ROOT" ] || return 1
+    [ -d /jffs/scripts ] && [ ! -L /jffs/scripts ] || return 1
+    [ ! -L "$rg_hook" ] && { [ ! -e "$rg_hook" ] || [ -f "$rg_hook" ]; } || return 1
+    exec 9> "$rg_lock" && flock -x 9 || return 1
+    rg_line="$(rg_hook_body)"
+    rg_nline=0;rg_nbeg=0;rg_nend=0
+    if [ -f "$rg_hook" ]; then
+      rg_nline=$(grep -Fc '# RESOLVGUARD CONFIG' "$rg_hook" || :)
+      rg_nbeg=$(grep -Fxc "$rg_beg" "$rg_hook" || :)
+      rg_nend=$(grep -Fxc "$rg_end" "$rg_hook" || :)
+    fi
+    [ "$rg_nline" -le 1 ] && [ "$rg_nbeg" = "$rg_nend" ] &&
+      [ "$rg_nbeg" -le 1 ] && [ $((rg_nline+rg_nbeg)) -le 1 ] &&
+      [ "$(grep -Fc ResolvGuardCfg "$rg_hook" 2>/dev/null || :)" -eq $((rg_nline+rg_nbeg)) ] || return 1
+    if [ "$rg_nline" = 1 ]; then
+      grep -Fqx "$rg_line" "$rg_hook" || { rg_notice 'modified config hook'; return 1; }
+      [ "$rg_verb" = install ] && return 0
+    elif [ "$rg_nbeg" = 1 ]; then
+      rg_actual=$(sed -n '/^# RESOLVGUARD WEBUI CONFIG BEGIN$/,/^# RESOLVGUARD WEBUI CONFIG END$/p' "$rg_hook")
+      rg_expected="$(printf '%s\n' "$rg_beg" 'case "$1:$2" in' \
+        '  start:ResolvGuardCfg)' \
+        '    /bin/sh /jffs/addons/ResolvGuard.d/resolvguard.sh webui config-run >/tmp/resolvguard-webui-config.log 2>&1 &' \
+        '    ;;' 'esac' "$rg_end")"
+      [ "$rg_actual" = "$rg_expected" ] || { rg_notice 'modified config hook block'; return 1; }
+    elif [ "$rg_verb" = remove ]; then
+      return 0
+    fi
+    if [ "$rg_nline" = 0 ] && [ "$rg_nbeg" = 0 ] && [ -f "$rg_hook" ] &&
+       grep -F 'ResolvGuardCfg' "$rg_hook" >/dev/null; then
+      rg_notice 'unrecognized config action'; return 1
+    fi
+    rg_stage=/jffs/scripts/.service-event-resolvguard-config-$$
+    [ ! -e "$rg_stage" ] && [ ! -L "$rg_stage" ] || return 1
+    if [ -f "$rg_hook" ]; then
+      if [ "$rg_nbeg" = 1 ]; then
+        sed '/^# RESOLVGUARD WEBUI CONFIG BEGIN$/,/^# RESOLVGUARD WEBUI CONFIG END$/d' "$rg_hook" > "$rg_stage" || return 1
+      elif [ "$rg_nline" = 1 ]; then
+        awk -v owned="$rg_line" '$0 != owned {print}' "$rg_hook" > "$rg_stage" || return 1
+      else
+        cat "$rg_hook" > "$rg_stage" || return 1
+      fi
+    else
+      printf '#!/bin/sh\n' > "$rg_stage" || return 1
+    fi
+    if [ "$rg_verb" = install ]; then
+      printf '\n%s\n' "$rg_line" >> "$rg_stage" || return 1
+    fi
+    chmod 755 "$rg_stage" && mv -f "$rg_stage" "$rg_hook" || { rm -f "$rg_stage"; return 1; }
+  }
+  rg_apply() {
+    rg_notice 'received firmware configuration event'
+    if [ "$ROOT" != "$INSTALL_ROOT" ] || ! _IsInstallationComplete_; then
+      rg_notice 'installed script or installation marker unavailable'
+      return 1
+    fi
+    # Firmware delivers a fixed action name. The independent bounded payload
+    # is persisted by start_apply.htm under this one namespaced custom key.
+    rg_ready || return 1
+    [ ! -L "$rg_dir/config-request.lock" ] &&
+      { [ ! -e "$rg_dir/config-request.lock" ] || [ -f "$rg_dir/config-request.lock" ]; } || return 1
+    exec 6> "$rg_dir/config-request.lock" && flock -x 6 || return 1
+    [ -f "$rg_shared" ] && [ ! -L "$rg_shared" ] || {
+      rg_notice 'shared firmware settings file not available'; return 1;
+    }
+    rg_token=$(LC_ALL=C awk '
+      $1=="ResolvGuard_config_request" { n++; if (NF==2) v=$2; else bad=1 }
+      END { if(n==1 && !bad) print v; else exit 1 }
+    ' "$rg_shared") || { rg_notice 'missing or ambiguous namespaced request';return 1; }
+    # MerlinAU-style custom-settings transport carries the request through
+    # amng_custom JSON. The payload is bounded and allowlisted below; it has
+    # no reason to require a base64 applet or extra Entware dependency.
+    # Preserve raw separators; the shell never evaluates payload contents.
+    [ "${#rg_token}" -le 560 ] || { rg_notice 'oversized config request'; return 1; }
+    rg_payload="$rg_token"
+    # ASCII-only data. No control characters, shell syntax, whitespace, or
+    # line breaks may cross the firmware service event boundary.
+    case "$rg_payload" in ''|*[!A-Za-z0-9_.:/\|\-]*) rg_notice 'invalid data characters';return 1 ;; esac
+    IFS='|' read -r rg_id rg_op rg_a rg_b rg_c rg_d rg_overflow <<EOF_RG_WEB_CONFIG
+$rg_payload
+EOF_RG_WEB_CONFIG
+    case "$rg_id" in ''|*[!0-9]*) return 1 ;; esac
+    [ "${#rg_id}" -ge 11 ] && [ "${#rg_id}" -le 18 ] && [ -z "$rg_overflow" ] || return 1
+    # The shared key persists until another form save replaces it. Prevent
+    # duplicate event delivery from reapplying an already processed request.
+    rg_seen="$rg_dir/config-last-request"
+    [ ! -L "$rg_seen" ] && { [ ! -e "$rg_seen" ] || [ -f "$rg_seen" ]; } || return 1
+    if [ -f "$rg_seen" ] && [ "$(cat "$rg_seen")" = "$rg_id" ]; then
+      rg_notice 'duplicate configuration event ignored'
+      return 1
+    fi
+    rg_result_status=error;rg_message='Configuration rejected; see router log'
+    case "$rg_op" in
+      setting)
+        if [ -z "$rg_c" ] && [ -z "$rg_d" ]; then
+        case "$rg_a" in
+          SCHEDULE_INTERVAL_MINUTES|FAST_CONFIRM_SECONDS|FAIL_THRESHOLD|RECOVERY_THRESHOLD|TIMEOUT_SECONDS|BOOT_MIN_UPTIME_SECONDS|SYSLOG_HEALTH_INTERVAL_MINUTES)
+            if _SetSetting_ "$rg_a" "$rg_b"; then rg_result_status=success;rg_message='Monitoring setting saved'; fi ;;
+        esac
+        fi ;;
+      backup-add|backup-edit)
+        if [ -n "$rg_a" ] && [ "${#rg_a}" -le 32 ] && [ "${#rg_b}" -le 48 ] && [ "${#rg_c}" -le 253 ] &&
+           _IsValidID_ "$rg_a" && _IsValidIP_ "$rg_b" && _IsValidDomain_ "$rg_c" && _IsValidTLSPort_ "$rg_d"; then
+          case "$rg_a" in wan[0-9]*) :;; *)
+            if [ "$rg_op" = backup-add ]; then rg_kind=add; else rg_kind=edit; fi
+            if _ChangeTSVFile_ "$EXTRA_PROVIDERS" provider "$rg_kind" "$rg_a" "$rg_a|$rg_b|$rg_c|$rg_d"; then
+              rg_result_status=success;rg_message='Backup resolver saved; review DNS policy before automatic failover'
+            fi;; esac
+        fi ;;
+      backup-delete)
+        if [ -z "$rg_b" ] && [ -z "$rg_c" ] && [ -z "$rg_d" ] && _IsValidID_ "$rg_a"; then
+          case "$rg_a" in wan[0-9]*) :;; *)
+            if _ChangeTSVFile_ "$EXTRA_PROVIDERS" provider del "$rg_a"; then
+              rg_result_status=success;rg_message='Backup resolver removed; review DNS policy before automatic failover'
+            fi ;; esac
+        fi ;;
+      preset)
+        if [ -z "$rg_b" ] && [ -z "$rg_c" ] && [ -z "$rg_d" ]; then
+          case "$rg_a" in GO|CS|QS)
+            if _InstallBackupPreset_ "$rg_a"; then rg_result_status=success;rg_message='Backup resolver pair saved; policy review required'; fi ;;
+          esac
+        fi ;;
+      script-check|script-install)
+        rg_message='Unable to check the selected update channel'
+        if [ -z "$rg_c" ] && [ -z "$rg_d" ] &&
+           { [ "$rg_op" = script-check ] || _IsValidVersion_ "$rg_a"; } &&
+           _ReadReleaseManifest_; then
+          rg_latest_version="$RELEASE_VERSION"
+          rg_latest_build="$RELEASE_VERSTAG"
+          rg_newer=0
+          if _IsNewerVersion_ "$RELEASE_VERSION" "$SCRIPT_VERSION" ||
+             { [ "$UPDATE_CHANNEL" = development ] &&
+               [ "$RELEASE_VERSION" = "$SCRIPT_VERSION" ] &&
+               _IsNewerBuildTag_ "$RELEASE_VERSTAG" "$SCRIPT_VERSTAG"; }; then
+            rg_newer=1
+          fi
+          if [ "$rg_op" = script-check ]; then
+            if [ "$rg_newer" = 1 ]; then
+              rg_result_status=available;rg_message='A script update is available'
+            else
+              rg_result_status=current;rg_message='ResolvGuard is up to date'
+            fi
+          elif [ "$rg_newer" != 1 ]; then
+            rg_message='No newer script version is available. Check again.'
+          elif [ "$rg_a" != "$RELEASE_VERSION" ] || [ "$rg_b" != "$RELEASE_VERSTAG" ]; then
+            rg_message='Available version changed. Check again before installing.'
+          elif _ApplyVerifiedUpdate_; then
+            rg_result_status=updated;rg_message='Script update installed and verified'
+          else
+            rg_message='Script update failed or was blocked. Inspect SSH status before retrying.'
+          fi
+        fi ;;
+    esac
+    if [ "$rg_result_status" = success ]; then
+      # Run the snapshot in a child so its flock descriptor is closed before
+      # the immediate status publisher takes its own configuration snapshot.
+      (rg_snapshot) || rg_notice 'saved but snapshot publishing failed'
+      # A configuration save can invalidate policy authorization immediately.
+      # Refresh read-only live status now, not only after the next cron cycle.
+      _RGWebUI_ publish >/dev/null 2>&1 || rg_notice 'saved; live status refresh deferred to next scheduled check'
+    fi
+    rg_publish_result "$rg_id" "$rg_result_status" "$rg_message" || return 1
+    printf '%s\n' "$rg_id" | rg_atomic "$rg_seen" || return 1
+    case "$rg_result_status" in success|available|current|updated) return 0 ;; *) return 1 ;; esac
+  }
+  case "${1:-}" in
+    snapshot) rg_snapshot ;;
+    hook-install) rg_hook_update install ;;
+    hook-remove) rg_hook_update remove ;;
+    hook-current) rg_hook_current ;;
+    apply) rg_apply ;;
+    *) return 1 ;;
+  esac
+)
+# RESOLVGUARD WEBUI CONFIG BRIDGE END
+
+# RESOLVGUARD WEBUI INLINE BEGIN (monitoring snapshots and authenticated configuration)
+# All controller functions and variables execute in a subshell to avoid
+# altering the DNS monitor's globals, options, locks, and exit traps.
+_RGWebUI_() (
+  umask 077
+  RG_ROOT=${RG_WEBUI_ROOT:-$ROOT}
+  RG_RUNTIME=${RG_WEBUI_RUNTIME:-$RUNTIME}
+  RG_WEB=${RG_WEBUI_WWW:-/www/user}
+  RG_MENU=${RG_WEBUI_MENU:-/www/require/modules/menuTree.js}
+  RG_MENU_TMP=${RG_WEBUI_MENU_TMP:-/tmp/menuTree.js}
+  RG_LOCK=${RG_WEBUI_LOCK:-/tmp/addonwebui.lock}
+  RG_SERVERS=${RG_WEBUI_SERVERS:-/tmp/resolv.dnsmasq}
+  RG_DATA="$RG_RUNTIME/webui"
+  RG_ASSETS="$RG_ROOT"
+  RG_TITLE=ResolvGuard
+  RG_MARKER='ResolvGuard WebUI Integration v1'
+
+  say() { printf '%s\n' "$*"; }
+  err() { printf 'ResolvGuard WebUI: %s\n' "$*" >&2; }
+  # HTML/JSON receives no private WAN credentials; never publish config/settings.conf.
+  # Print JSON-quoted string with minimal, portable escaping.
+  jsonq() {
+    printf '%s' "$1" | LC_ALL=C awk '
+    BEGIN { printf "\"" }
+    {
+      if (NR>1) printf "\\n"
+      for (i=1;i<=length($0);i++) {
+        c=substr($0,i,1)
+        if (c=="\\") printf "\\\\"
+        else if (c=="\"") printf "\\\""
+        else if (c==sprintf("%c",9)) printf "\\t"
+        else if (c==sprintf("%c",13)) printf "\\r"
+        else if (c=="<") printf "\\u003c"
+        else if (c==">") printf "\\u003e"
+        else if (c=="&") printf "\\u0026"
+        else printf "%s", c
+      }
+    }
+    END { printf "\"" }
+    '
+  }
+  number() { case "$1" in ''|*[!0-9]*) printf '0';; *) printf '%s' "$1";; esac; }
+  safe_pool() { case "$1" in preferred|filtered1|filtered2|backup[0-9]*|wanpool[0-9]*) printf '%s' "$1" ;; *) printf unknown ;; esac; }
+  mode_name() {
+    if [ ! -f "$SCHEDULE_MARKER" ] || [ -L "$SCHEDULE_MARKER" ]; then printf inactive
+    elif [ ! -f "$AUTO_FAILOVER_MARKER" ] || [ -L "$AUTO_FAILOVER_MARKER" ]; then printf monitoring
+    elif _RecursiveUnboundProduction_; then printf monitoring
+    # Use the same live, fingerprint-aware authorization check as the SSH
+    # menu. An approval file existing does not mean its policy is still valid.
+    elif _CheckAutomaticFailoverAuthorization_ >/dev/null 2>&1; then printf automatic
+    else printf hold; fi
+  }
+  # Derive exactly the domain-scoped exception type already disclosed by installer.
+  # Unrecognized resolver formats are not labelled as verified bypass rules.
+  exceptions() {
+    [ -f "$RG_SERVERS" ] && [ ! -L "$RG_SERVERS" ] || return 0
+    LC_ALL=C awk '
+      /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+      {
+        line=$0; sub(/^[[:space:]]+/,"",line); sub(/[[:space:]]+$/, "",line)
+        sub(/[[:space:]]+#.*$/, "",line); sub(/[[:space:]]+$/, "",line)
+        if (substr(line,1,8)!="server=/") next
+        item=substr(line,9); idx=index(item,"/"); if(idx<2)next
+        d=substr(item,1,idx-1); ip=substr(item,idx+1)
+        sub(/[.]$/, "", d)
+        if (d !~ /^[A-Za-z0-9-]+([.][A-Za-z0-9-]+)+$/ || d ~ /[.][.]/ || ip=="" || index(ip,"/") || ip !~ /^[0-9a-fA-F:.]+$/) next
+        print d"|"ip
+      }
+    ' "$RG_SERVERS"
+  }
+
+
+  # Import only the completed cron cycle. No probing and no read of current pending
+  # cycle; caller invokes this after SCHEDULE UTC END was written.
+  extract_cycle() {
+    [ -f "$RG_RUNTIME/scheduled.log" ] && [ ! -L "$RG_RUNTIME/scheduled.log" ] || return 1
+    LC_ALL=C awk '
+     /^SCHEDULE UTC: / {buf=""; start=$3; active=0; next}
+     /^SCHEDULE UTC END: / { if ($0 ~ /result=/) {last=buf; last_start=start; last_end=$4; last_rc=$5; last_router=$6} next }
+     { if (start!="") buf=buf $0 "\n" }
+     END { if(last_start!="") {print "CYCLE|"last_start"|"last_end"|"last_rc"|"last_router; printf "%s",last} }
+    ' "$RG_RUNTIME/scheduled.log"
+  }
+
+  publish() {
+    [ -d "$RG_RUNTIME" ] && [ ! -L "$RG_RUNTIME" ] || { err 'runtime unavailable or unsafe'; return 1; }
+    if [ -e "$RG_DATA" ] && { [ -L "$RG_DATA" ] || [ ! -d "$RG_DATA" ]; }; then
+      err 'refusing unsafe webui runtime directory'; return 1
+    fi
+    mkdir -p "$RG_DATA" || return 1
+    chmod 700 "$RG_DATA" || :
+    # On-demand history files are public only to the authenticated Merlin WebUI.
+    # Reject unsafe replacements before exposing them through /ext/ResolvGuard.
+    for history_file in history.tsv history-failures.tsv; do
+      if [ -L "$RG_DATA/$history_file" ] ||
+         { [ -e "$RG_DATA/$history_file" ] && [ ! -f "$RG_DATA/$history_file" ]; }; then
+        err 'unsafe history detail file'; return 1
+      fi
+      [ -f "$RG_DATA/$history_file" ] || : > "$RG_DATA/$history_file" || return 1
+      chmod 600 "$RG_DATA/$history_file" || return 1
+    done
+    exec 8> "$RG_DATA/publish.lock" || return 1
+    flock -x 8 || return 1
+    cycle="$RG_DATA/cycle-$$"
+    observations="$RG_DATA/observations-$$"
+    trap 'rm -f "$cycle" "$observations" "$RG_DATA"/active-members-"$$" "$RG_DATA"/status-"$$".tmp "$RG_DATA"/history-"$$".tmp "$RG_DATA"/events-"$$".tmp "$RG_DATA"/last-end.new."$$"' EXIT HUP INT TERM
+    extract_cycle > "$cycle" || :
+    # First publish can precede the first cron cycle. Do not invent green state.
+    header=$(sed -n '1p' "$cycle")
+    case "$header" in CYCLE\|*) ;; *) header='CYCLE|||result=unknown' ;; esac
+    start=$(printf '%s\n' "$header" | cut -d'|' -f2)
+    done_at=$(printf '%s\n' "$header" | cut -d'|' -f3)
+    result=$(printf '%s\n' "$header" | cut -d'|' -f4 | sed 's/^result=//')
+    # Router wall clock captured with the completed cycle. It is for display
+    # only; retained monitoring/history timestamps stay unambiguously UTC.
+    router_end=$(printf '%s\n' "$header" | cut -d'|' -f5 | sed 's/^routerTime=//')
+    case "$router_end" in
+      ????-??-??T??:??:??[+-]????) : ;;
+      *) router_end='' ;;
+    esac
+    # Per-resolver state: consider failure on any monitored policy check within
+    # the latest complete cycle. Last-pass-only summaries could mask failures.
+    awk '
+      NR==1 {next}
+      {
+        line=$0; sub(/^[[:space:]]+/, "", line)
+        n=split(line,p,/[[:space:]]+/)
+        if(n<3)next
+        if (p[1]!="PASS" && p[1]!="FAIL")next
+        if(p[2]!~/^[a-zA-Z][a-zA-Z0-9_-]*$/)next
+        id=p[2]; if(!(id in seen)){seen[id]=1;ids[++k]=id}
+        if(p[1]=="FAIL") fail[id]++
+        else pass[id]++
+      }
+      END {for(i=1;i<=k;i++){id=ids[i];state=fail[id]?"fail":(pass[id]?"ok":"unknown");print id"|"state"|"pass[id]+0"|"fail[id]+0}}
+    ' "$cycle" > "$observations"
+    # Use the saved enrolled preferred identities; no invented provider names.
+    providers="$RG_ROOT/state/preferred-providers.tsv"
+    current_pool=preferred
+    if [ -f "$RG_ROOT/state/active-pool" ] && [ ! -L "$RG_ROOT/state/active-pool" ]; then
+      current_pool=$(sed -n '1p' "$RG_ROOT/state/active-pool")
+    fi
+    current_pool=$(safe_pool "$current_pool")
+    mode=$(mode_name)
+    interval=1
+    if [ -f "$RG_ROOT/config/settings.conf" ] && [ ! -L "$RG_ROOT/config/settings.conf" ]; then
+      setting=$(grep '^SCHEDULE_INTERVAL_MINUTES=' "$RG_ROOT/config/settings.conf" | tail -n 1 | cut -d= -f2 | tr -dc '0-9')
+      case "$setting" in 1|2|5|10|15|20|30|60) interval=$setting;; esac
+    fi
+    epoch=$(date -u +%s 2>/dev/null || printf 0)
+    # Make one append per completed cycle by remembering its exact END timestamp.
+    old_end=''
+    [ -f "$RG_DATA/last-end" ] && old_end=$(cat "$RG_DATA/last-end")
+    if [ -n "$done_at" ] && [ "$done_at" != "$old_end" ]; then
+      [ ! -L "$RG_DATA/history.tsv" ] || { err 'unsafe history'; return 1; }
+      # Keep actual endpoint identity alongside each completed observation.
+      # The captured cycle metadata was emitted under the monitor config lock,
+      # not reconstructed from today's potentially renumbered wanN roster.
+      awk -F'|' -v finished="$done_at" -v router="$router_end" '
+        FILENAME==ARGV[1] {
+          if ($1=="WEBUI RESOLVER IDENTITY" && $2 ~ /^wan[0-9]+$/ &&
+              $3 ~ /^[0-9a-fA-F:.]+$/ && $4 ~ /^[A-Za-z0-9_.-]+$/ &&
+              $5 ~ /^[0-9]+$/ && !known[$2]++) {
+            ids[++n]=$2; ip[$2]=$3; tls[$2]=$4; port[$2]=$5
+          }
+          next
+        }
+        $1 ~ /^wan[0-9]+$/ && $2 ~ /^(ok|fail|unknown)$/ {state[$1]=$2}
+        END {
+          for(i=1;i<=n;i++) {
+            id=ids[i]; result=(id in state)?state[id]:"unknown"
+            print finished"|"id"|"result"|"router"|"ip[id]"|"tls[id]"|"port[id]
+          }
+        }
+      ' "$cycle" "$observations" >> "$RG_DATA/history.tsv" || return 1
+      # Preserve the newest 40,320 rows; trim only every 60 completed cycles
+      # instead of rewriting the entire file every minute.
+      old_trim_count=0
+      [ -f "$RG_DATA/trim-count" ] && old_trim_count=$(cat "$RG_DATA/trim-count")
+      case "$old_trim_count" in ''|*[!0-9]*) old_trim_count=0 ;; esac
+      old_trim_count=$((old_trim_count+1))
+      if [ "$old_trim_count" -ge 60 ]; then
+        old_trim_count=0
+        if [ -f "$RG_DATA/history.tsv" ]; then
+          tail -n 40320 "$RG_DATA/history.tsv" > "$RG_DATA/history-$$.tmp" &&
+            mv "$RG_DATA/history-$$.tmp" "$RG_DATA/history.tsv"
+        fi
+      fi
+      printf '%s\n' "$old_trim_count" > "$RG_DATA/trim-count.new.$$" &&
+        mv "$RG_DATA/trim-count.new.$$" "$RG_DATA/trim-count"
+      if [ ! -L "$RG_DATA/events.tsv" ]; then
+        grep -E '^(DNS FAILOVER:|DNS FAILBACK:|DNS FILTERED|DNS RESOLVER|DNS RECOVERED:|FAST CONFIRM FAILED:|AUTOMATIC SWITCHING DISABLED:)' "$cycle" 2>/dev/null |
+          while IFS= read -r message; do
+            # Prevent literal line delimiters from corrupting event records.
+            message=$(printf '%s' "$message" | tr '|' '/')
+            printf '%s|%s|%s\n' "$done_at" "$message" "$router_end"
+          done >> "$RG_DATA/events.tsv"
+        tail -n 200 "$RG_DATA/events.tsv" > "$RG_DATA/events-$$.tmp" && mv "$RG_DATA/events-$$.tmp" "$RG_DATA/events.tsv"
+      fi
+      # Preserve bounded, timestamped policy failures from this *completed*
+      # scheduled cycle. Historical records before this feature may only have
+      # resolver-level PASS/FAIL; never infer missing policy details.
+      awk -F'|' -v cycle_end="$done_at" '
+        $1=="WEBUI RESOLVER IDENTITY" && NF==5 &&
+          $2 ~ /^wan[0-9]+$/ && $3 ~ /^[0-9a-fA-F:.]+$/ &&
+          $4 ~ /^[A-Za-z0-9_.-]+$/ && $5 ~ /^[0-9]+$/ {
+            ip[$2]=$3; tls[$2]=$4; port[$2]=$5; next
+          }
+        $1=="WEBUI POLICY FAILURE" && NF==8 &&
+        $2 ~ /^[0-9][0-9][0-9][0-9]-/ &&
+        $5 ~ /^[A-Za-z][A-Za-z0-9_-]*$/ &&
+        $7 ~ /^[A-Za-z0-9_-]+$/ && ($5 in ip) {
+          print cycle_end "|" $2 "|" $3 "|" $4 "|" $5 "|" $6 "|" $7 "|" $8 "|" ip[$5] "|" tls[$5] "|" port[$5]
+        }
+      ' "$cycle" >> "$RG_DATA/history-failures.tsv" || return 1
+      # Keep only the latest 8,192 failure details in volatile RAM. Unlike
+      # history.tsv this is needed only for diagnostic drill-down.
+      details_lines=$(wc -l < "$RG_DATA/history-failures.tsv")
+      if [ "$details_lines" -gt 8192 ]; then
+        tail -n 8192 "$RG_DATA/history-failures.tsv" > "$RG_DATA/history-failures-$$.tmp" &&
+          mv "$RG_DATA/history-failures-$$.tmp" "$RG_DATA/history-failures.tsv" || return 1
+      fi
+      printf '%s\n' "$done_at" > "$RG_DATA/last-end.new.$$" && mv "$RG_DATA/last-end.new.$$" "$RG_DATA/last-end"
+    fi
+    # The published active roster must match the *live* WAN DNS rulelist.
+    # Reading it is safe: neither operation switches pools or probes DNS.
+    # Fail closed when production membership cannot be verified.
+    active_members="$RG_DATA/active-members-$$"
+    : > "$active_members" || return 1
+    active_verified=false
+    case "$current_pool" in
+      preferred|filtered1|filtered2|backup[0-9]*|wanpool[0-9]*)
+        if [ "$(_GetActiveWANPool_ 2>/dev/null || :)" = "$current_pool" ] &&
+           _GetPoolMembers_ "$current_pool" > "$active_members" 2>/dev/null &&
+           [ -s "$active_members" ]; then
+          active_verified=true
+        else
+          : > "$active_members"
+        fi
+        ;;
+    esac
+    # Configuration checks only: these do not verify end-to-end LAN queries.
+    # Use the same read-only forwarding validator as the WAN safety gate, so
+    # DNS Paths reports direct Stubby and Unbound -> Stubby consistently.
+    dnsmasq_verified=false
+    strict_dot_verified=false
+    if _VerifyLANForwardingConfig_ >/dev/null 2>&1; then
+      dnsmasq_verified=true
+    fi
+    unbound_info=$(unbound_path)
+    IFS='|' read -r unbound_present unbound_running unbound_port unbound_route unbound_upstream <<EOF_UNBOUND
+$unbound_info
+EOF_UNBOUND
+    if _IsStrictProductionDoT_ >/dev/null 2>&1; then
+      strict_dot_verified=true
+    fi
+    # JSON is computed in volatile files and atomically published to the WebUI.
+    tmp="$RG_DATA/status-$$.tmp"
+    (
+      printf '{"schema":1,"source":"router","generatedEpoch":%s,' "$(number "$epoch")"
+      printf '"lastStart":'; jsonq "$start"; printf ',"lastEnd":';jsonq "$done_at"
+      printf ',"lastEndRouter":'; jsonq "$router_end"
+      printf ',"cycleResult":';jsonq "$result"
+      printf ',"pool":';jsonq "$current_pool"
+      printf ',"mode":';jsonq "$mode"
+      printf ',"scheduleMinutes":%s' "$(number "$interval")"
+      printf ',"dnsmasqDefaultVerified":%s,"strictDoTVerified":%s' "$dnsmasq_verified" "$strict_dot_verified"
+      printf ',"unboundDetected":%s,"unboundRunning":%s' "$unbound_present" "$unbound_running"
+      printf ',"unboundPort":';jsonq "$unbound_port"
+      printf ',"unboundRoute":';jsonq "$unbound_route"
+      printf ',"unboundUpstream":';jsonq "$unbound_upstream"
+      printf ',"exceptionsReadable":%s' "$( [ -f "$RG_SERVERS" ] && [ ! -L "$RG_SERVERS" ] && printf true || printf false )"
+      printf ',"pendingTransaction":%s,"recoveryHold":%s,' \
+        "$( [ -e "$RG_ROOT/state/pending-transaction" ] && printf true || printf false )" \
+        "$( [ -e "$RG_ROOT/state/recovery-attention" ] && printf true || printf false )"
+      printf '"resolvers":['
+      sep=''
+      runtime_providers="$RG_RUNTIME/providers.tsv"
+      if [ -f "$runtime_providers" ] && [ ! -L "$runtime_providers" ]; then
+        # Runtime roster: id|address|tls_hostname|DoT_port.
+        while IFS='|' read -r id ip tls dotport extra; do
+          case "$id" in wan[0-9]*|google[0-9]*|backup[0-9]*|[a-zA-Z]*[0-9]) ;; *) continue ;; esac
+          # The loop below never accepts arbitrary HTML; values are JSON-escaped.
+          state=unknown; pass=0; fail=0
+          row=$(awk -F'|' -v k="$id" '$1==k {print;exit}' "$observations")
+          if [ -n "$row" ]; then
+            state=$(printf '%s' "$row" | cut -d'|' -f2)
+            pass=$(printf '%s' "$row" | cut -d'|' -f3)
+            fail=$(printf '%s' "$row" | cut -d'|' -f4)
+          fi
+          printf '%s{"id":' "$sep";jsonq "$id"; printf ',"ip":';jsonq "$ip"
+          printf ',"tls":';jsonq "$tls";printf ',"port":';jsonq "$dotport"
+          printf ',"state":';jsonq "$state";printf ',"policyPass":%s,"policyFail":%s}' "$(number "$pass")" "$(number "$fail")"
+          sep=,
+        done < "$runtime_providers"
+      elif [ -f "$providers" ] && [ ! -L "$providers" ]; then
+        while IFS='|' read -r id ip tls legacy_port dotport extra; do
+          case "$id" in wan[0-9]*) ;; *) continue ;; esac
+          state=unknown; pass=0; fail=0
+          row=$(awk -F'|' -v k="$id" '$1==k {print;exit}' "$observations")
+          if [ -n "$row" ]; then
+            state=$(printf '%s' "$row" | cut -d'|' -f2)
+            pass=$(printf '%s' "$row" | cut -d'|' -f3)
+            fail=$(printf '%s' "$row" | cut -d'|' -f4)
+          fi
+          printf '%s{"id":' "$sep";jsonq "$id"; printf ',"ip":';jsonq "$ip"
+          printf ',"tls":';jsonq "$tls";printf ',"port":';jsonq "$dotport"
+          printf ',"state":';jsonq "$state";printf ',"policyPass":%s,"policyFail":%s}' "$(number "$pass")" "$(number "$fail")"
+          sep=,
+        done < "$providers"
+      fi
+      # Verified active non-preferred members, with observations from this
+      # completed cycle. An unobserved member is never labelled healthy.
+      printf '],"activePoolVerified":%s,"activeResolvers":[' "$active_verified"
+      sep=''
+      while IFS='|' read -r id ip tls dotport extra; do
+        [ -n "$id" ] && [ -n "$ip" ] && [ -n "$tls" ] || continue
+        row=$(awk -F'|' -v k="$id" '$1==k {print;exit}' "$observations")
+        state=unknown; pass=0; fail=0
+        if [ -n "$row" ]; then
+          state=$(printf '%s' "$row" | cut -d'|' -f2)
+          pass=$(printf '%s' "$row" | cut -d'|' -f3)
+          fail=$(printf '%s' "$row" | cut -d'|' -f4)
+        fi
+        printf '%s{"id":' "$sep";jsonq "$id";printf ',"ip":';jsonq "$ip"
+        printf ',"tls":';jsonq "$tls";printf ',"port":';jsonq "$dotport"
+        printf ',"state":';jsonq "$state"
+        printf ',"policyPass":%s,"policyFail":%s}' "$(number "$pass")" "$(number "$fail")"
+        sep=,
+      done < "$active_members"
+      printf '],"exceptions":['
+      sep=''
+      exceptions | while IFS='|' read -r domain upstream; do
+        printf '%s{"domain":' "$sep";jsonq "$domain";printf ',"upstream":';jsonq "$upstream";printf '}'
+        sep=,
+      done
+      printf '],"events":['
+      sep=''
+      if [ -f "$RG_DATA/events.tsv" ] && [ ! -L "$RG_DATA/events.tsv" ]; then
+        tail -n 24 "$RG_DATA/events.tsv" | while IFS='|' read -r at event router_at; do
+          printf '%s{"at":' "$sep";jsonq "$at";printf ',"message":';jsonq "$event"
+          printf ',"routerAt":';jsonq "$router_at";printf '}'
+          sep=,
+        done
+      fi
+      printf ']}'
+    ) > "$tmp" || return 1
+    mv "$tmp" "$RG_DATA/status.htm" || return 1
+    # History is aggregated in one awk process; avoid forking an awk per row.
+    # Worst-of-bucket states prevent masking real failures. The underlying RAM
+    # history still retains one observation per resolver per completed cycle.
+    tmp="$RG_DATA/history-$$.tmp"
+    (
+      printf '{"schema":1,"buckets":['
+      if [ -f "$RG_DATA/history.tsv" ] && [ ! -L "$RG_DATA/history.tsv" ]; then
+        LC_ALL=C awk -F'|' '
+          function emit(bucket,id,state,n,fail,unknown,ip,tls,port,legacy) {
+            if (commas++) printf ","
+            printf "{\"at\":\"%s\",\"id\":\"%s\",\"state\":\"%s\",\"samples\":%d,\"failures\":%d,\"unknowns\":%d,\"ip\":\"%s\",\"tls\":\"%s\",\"port\":\"%s\",\"legacy\":%s}",bucket,id,state,n,fail,unknown,ip,tls,port,legacy
+          }
+          (NF==4 || NF==3 || NF==7) && $1 ~ /^[0-9][0-9][0-9][0-9]-/ &&
+          $2 ~ /^wan[0-9]+$/ && $3 ~ /^(ok|fail|unknown)$/ {
+            # Old observations only contain wanN: their actual endpoint is
+            # unrecoverable after roster changes. Keep them, but never attach
+            # them to any current resolver identity.
+            legacy=NF!=7
+            if (!legacy && ($5 !~ /^[0-9a-fA-F:.]+$/ ||
+                            $6 !~ /^[A-Za-z0-9_.-]+$/ ||
+                            $7 !~ /^[0-9]+$/)) next
+            t=substr($1,1,13)
+            half=substr($1,15,2)+0 < 30 ? "00" : "30"
+            bucket=t ":" half ":00Z"
+            scope=legacy?("old:"$2):("endpoint:"tolower($5)"|"tolower($6)"|"$7)
+            key=bucket SUBSEP scope
+            if (!(key in seen)) {
+              seen[key]=1; keys[++count]=key; bs[key]=bucket; ids[key]=$2
+              ips[key]=legacy?"":$5; hosts[key]=legacy?"":$6
+              ports[key]=legacy?"":$7; old[key]=legacy?"true":"false"
+            }
+            n[key]++; if($3=="fail") f[key]++; else if($3=="unknown") u[key]++
+          }
+          END {
+            for (i=1;i<=count;i++) {
+              key=keys[i]; state=f[key]>0?"fail":(u[key]>0?"unknown":"ok")
+              emit(bs[key],ids[key],state,n[key],f[key],u[key],ips[key],hosts[key],ports[key],old[key])
+            }
+          }
+        ' "$RG_DATA/history.tsv"
+      fi
+      printf ']}'
+    ) > "$tmp" || return 1
+    mv "$tmp" "$RG_DATA/history.htm" || return 1
+    _RGWebConfig_ snapshot || err "unable to publish configuration snapshot"
+    rm -f "$cycle" "$observations"
+    trap - EXIT HUP INT TERM
+    return 0
+  }
+
+  # Only the page bearing our own marker + title can be reused or removed.
+  find_slot() {
+    i=1
+    while [ "$i" -le 20 ]; do
+      page="user${i}.asp"
+      title="$RG_WEB/user${i}.title"
+      if [ -f "$title" ] && [ "$(cat "$title")" = "$RG_TITLE" ]; then
+        if [ -f "$RG_WEB/$page" ] && grep -Fq "$RG_MARKER" "$RG_WEB/$page"; then
+          say "$page"; return 0
+        fi
+        err 'ResolvGuard-titled page has an unexpected body; refusing to replace'; return 1
+      fi
+      i=$((i+1))
+    done
+    i=1
+    while [ "$i" -le 20 ]; do
+      if [ ! -e "$RG_WEB/user${i}.asp" ] && [ ! -e "$RG_WEB/user${i}.title" ]; then
+        say "user${i}.asp"; return 0
+      fi
+      i=$((i+1))
+    done
+    err 'all Merlin user page slots occupied'; return 1
+  }
+  lock_menu() {
+    [ -d "$RG_WEB" ] && [ -d "$(dirname "$RG_MENU")" ] || return 1
+    exec 9> "$RG_LOCK" || return 1
+    flock -x 9 || return 1
+  }
+  unlock_menu() { flock -u 9 || :; }
+  # Caller owns /tmp/addonwebui.lock, shared with MerlinAU and other add-ons.
+  rewrite_menu() {
+    action="$1";page="$2"
+    if [ ! -f "$RG_MENU_TMP" ]; then
+      [ -f "$RG_MENU" ] || return 1
+      cp -p "$RG_MENU" "$RG_MENU_TMP" || return 1
+    fi
+    staged="$RG_MENU_TMP.resolvguard.$$"
+    # Drop only the exact ResolvGuard tab (including the old Administration
+    # location); preserve every other existing addon and firmware menu entry.
+    awk -v target="$page" -v action="$action" '
+      index($0,"tabName: \"ResolvGuard\"") && $0 ~ /url: \"user[0-9]+[.]asp\"/ {next}
+      {print}
+      action=="add" && index($0,"url: \"Advanced_WAN_Content.asp\"") {
+        print "{url: \""target"\", tabName: \"ResolvGuard\"},"; inserted=1
+      }
+      END {if(action=="add" && !inserted)exit 4}
+    ' "$RG_MENU_TMP" > "$staged" || { rm -f "$staged"; return 1; }
+    cp -p "$RG_MENU_TMP" "$RG_MENU_TMP.bak.resolvguard.$$" || { rm -f "$staged"; return 1; }
+    mv "$staged" "$RG_MENU_TMP" || return 1
+    umount "$RG_MENU" 2>/dev/null || :
+    if ! mount -o bind "$RG_MENU_TMP" "$RG_MENU"; then
+      # An attempted rollback is safer than leaving the firmware menu detached.
+      mv "$RG_MENU_TMP.bak.resolvguard.$$" "$RG_MENU_TMP" || :
+      mount -o bind "$RG_MENU_TMP" "$RG_MENU" 2>/dev/null || :
+      err 'menu bind mount failed; prior menu restored where possible'
+      return 1
+    fi
+    rm -f "$RG_MENU_TMP.bak.resolvguard.$$"
+  }
+
+  mount_page() {
+    [ -f "$RG_ASSETS/ResolvGuard.asp" ] && [ ! -L "$RG_ASSETS/ResolvGuard.asp" ] || { err 'ASP missing or symlink'; return 1; }
+    lock_menu || { err 'unable to acquire MerlinAU-compatible WebUI lock'; return 1; }
+    page=$(find_slot) || { unlock_menu; return 1; }
+    # Do not alter the existing live page when firmware lacks the WAN anchor.
+    menu_source="$RG_MENU_TMP"
+    [ -f "$menu_source" ] || menu_source="$RG_MENU"
+    if ! grep -F 'url: "Advanced_WAN_Content.asp"' "$menu_source" >/dev/null 2>&1; then
+      err 'WAN Internet Connection menu anchor not found; old page/menu left unchanged'
+      unlock_menu
+      return 1
+    fi
+    # The firmware WebUI is volatile; persistent source is in /jffs/addons.
+    cp "$RG_ASSETS/ResolvGuard.asp" "$RG_WEB/$page" || { unlock_menu; return 1; }
+    printf '%s\n' "$RG_TITLE" > "$RG_WEB/${page%.asp}.title" || { unlock_menu; return 1; }
+    dir="$RG_WEB/ResolvGuard"
+    if [ -L "$dir" ] || { [ -e "$dir" ] && [ ! -d "$dir" ]; }; then
+      err 'unsafe asset directory';unlock_menu; return 1
+    fi
+    mkdir -p "$dir" "$RG_DATA" || { unlock_menu; return 1; }
+    # Link owned, read-only dashboard feeds (JSON plus bounded history TSV);
+    # never expose config/settings or credentials.
+    for name in status.htm history.htm history-records.htm history-failures.htm manual.htm config.htm config-action.htm; do
+      if [ -e "$dir/$name" ] && [ ! -L "$dir/$name" ]; then
+        err 'refusing to replace non-owned web asset';unlock_menu; return 1
+      fi
+      source_file="$RG_DATA/$name"
+      case "$name" in
+        history-records.htm) source_file="$RG_DATA/history.tsv" ;;
+        history-failures.htm) source_file="$RG_DATA/history-failures.tsv" ;;
+      esac
+      ln -sf "$source_file" "$dir/$name" || { unlock_menu; return 1; }
+    done
+    # Retire only the legacy link pointing to our old two-file installation.
+    if [ -L "$dir/dashboard.htm" ] &&
+       [ "$(readlink "$dir/dashboard.htm")" = "$RG_ROOT/webui/dashboard.htm" ]; then
+      rm -f "$dir/dashboard.htm" || { unlock_menu;return 1; }
+    fi
+    rewrite_menu add "$page"
+    rc=$?
+    unlock_menu
+    if [ "$rc" -eq 0 ]; then say "Mounted ResolvGuard at /$page (JSON: /ext/ResolvGuard/status.htm)";fi
+    return "$rc"
+  }
+
+  unmount_page() {
+    lock_menu || { err 'unable to acquire WebUI lock'; return 1; }
+    # Do not accidentally allocate a free slot on uninstall.
+    found=''
+    for n in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+      if [ -f "$RG_WEB/user$n.title" ] && [ "$(cat "$RG_WEB/user$n.title")" = "$RG_TITLE" ]; then
+        if [ -f "$RG_WEB/user$n.asp" ] && grep -Fq "$RG_MARKER" "$RG_WEB/user$n.asp"; then
+          found="user$n.asp";break
+        else
+          err 'owned title but mismatched HTML; refusing cleanup';unlock_menu; return 1
+        fi
+      fi
+    done
+    if [ -n "$found" ]; then
+      rewrite_menu remove "$found" || { unlock_menu; return 1; }
+      rm -f "$RG_WEB/$found" "$RG_WEB/${found%.asp}.title" || { unlock_menu; return 1; }
+    fi
+    for name in status.htm history.htm history-records.htm history-failures.htm manual.htm config.htm config-action.htm; do
+      source_file="$RG_DATA/$name"
+      case "$name" in
+        history-records.htm) source_file="$RG_DATA/history.tsv" ;;
+        history-failures.htm) source_file="$RG_DATA/history-failures.tsv" ;;
+      esac
+      if [ -L "$RG_WEB/ResolvGuard/$name" ] && [ "$(readlink "$RG_WEB/ResolvGuard/$name")" = "$source_file" ]; then
+        rm -f "$RG_WEB/ResolvGuard/$name"
+      fi
+    done
+    if [ -L "$RG_WEB/ResolvGuard/dashboard.htm" ] &&
+       [ "$(readlink "$RG_WEB/ResolvGuard/dashboard.htm")" = "$RG_ROOT/webui/dashboard.htm" ]; then
+      rm -f "$RG_WEB/ResolvGuard/dashboard.htm" || { unlock_menu;return 1; }
+    fi
+    rmdir "$RG_WEB/ResolvGuard" 2>/dev/null || :
+    unlock_menu
+    say 'ResolvGuard WebUI unmounted (production DNS untouched)'
+  }
+
+  case "${1:-help}" in
+    publish) publish ;;
+    bootstrap) _BootstrapExistingWebUI_ ;;
+    mount) mount_page && _RGManual_ hook-install && _RGWebConfig_ hook-install ;;
+    unmount) _RGWebConfig_ hook-remove && _RGManual_ hook-remove && unmount_page ;;
+    startup)
+      i=0
+      while [ "$i" -lt 6 ]; do
+        if [ -d "$RG_WEB" ] && [ -f "$RG_MENU" ] && mount_page && _RGManual_ hook-install && _RGWebConfig_ hook-install; then
+          publish || :
+          exit 0
+        fi
+        i=$((i+1));sleep 10
+      done
+      err 'startup mount deferred; run webui mount manually'
+      exit 1 ;;
+    status)
+      if [ -f "$RG_DATA/status.htm" ]; then cat "$RG_DATA/status.htm";printf '\n'
+      else err 'no completed snapshot; run publish after a scheduled check';exit 1;fi ;;
+    manual-run) _RGManual_ run ;;
+    manual-status) _RGManual_ status ;;
+    *) say 'Usage: sh resolvguard.sh webui [bootstrap|mount|unmount|publish|startup|status|config-snapshot|manual-run|manual-status]' ;;
+  esac
+
+)
+# RESOLVGUARD WEBUI INLINE END
 _ScheduleStartup_() {
+  # Background migration/registration even on legacy script-only upgrades.
+  # Retry while boot is bringing up networking and /www, never block DNS recovery.
+  (
+    attempt=0
+    while [ "$attempt" -lt 6 ]; do
+      if _BootstrapExistingWebUI_; then exit 0; fi
+      attempt=$((attempt+1))
+      sleep 10
+    done
+    exit 1
+  ) > /tmp/resolvguard-webui-startup.log 2>&1 &
   [ -r "$SCHEDULE_MARKER" ] || { _Say_ 'Startup: schedule not enabled; nothing to do'; return 0; }
   _RegisterScheduleCron_ || return 1
   # No writes to production DNS or automatic health checks during boot.
@@ -4337,6 +6010,32 @@ _RotateScheduleLog_() {
   rm -f "$staged"
 }
 
+# Record monitoring-only as an operating-mode transition, not a per-minute
+# health event. This volatile marker never changes WAN configuration or
+# persists to flash; the dashboard separately shows the current mode.
+_ReportScheduledSwitchingMode_() {
+  local state previous staged marker
+  marker="$RUNTIME/switching-mode-notice"
+  [ ! -L "$marker" ] || return 1
+  if [ -f "$AUTO_FAILOVER_MARKER" ] && [ ! -L "$AUTO_FAILOVER_MARKER" ]; then
+    state=automatic
+  elif [ -f "$SCHEDULE_MARKER" ] && [ ! -L "$SCHEDULE_MARKER" ] &&
+       [ ! -e "$AUTO_FAILOVER_MARKER" ] && [ ! -L "$AUTO_FAILOVER_MARKER" ]; then
+    state=monitoring
+  else
+    state=hold
+  fi
+  previous=''
+  [ ! -r "$marker" ] || previous="$(cat "$marker" 2>/dev/null)"
+  [ "$previous" != "$state" ] || return 0
+  staged="$marker.new.$$"
+  [ ! -e "$staged" ] && [ ! -L "$staged" ] || return 1
+  (umask 077; printf '%s\n' "$state" > "$staged") &&
+    mv "$staged" "$marker" || { rm -f "$staged"; return 1; }
+  [ "$state" != monitoring ] ||
+    _Say_ 'AUTOMATIC SWITCHING DISABLED: Monitoring Only; no WAN change.'
+}
+
 _RunScheduledCheck_() {
   local outcome
   [ -r "$SCHEDULE_MARKER" ] || { _Say_ 'SKIP: monitoring schedule not enabled'; return 0; }
@@ -4344,16 +6043,40 @@ _RunScheduledCheck_() {
     _Say_ 'SKIP: interactive DNS maintenance has priority; scheduled check deferred.'
     return 0
   fi
+  # An administrator may switch to recursive Unbound after granting automatic
+  # WAN switching. Revoke the old grant, keeping the schedule and DNS checks.
+  if [ -e "$AUTO_FAILOVER_MARKER" ] && _RecursiveUnboundProduction_; then
+    if _AcquireWANLock_; then
+      if [ -f "$AUTO_FAILOVER_MARKER" ] && [ ! -L "$AUTO_FAILOVER_MARKER" ] &&
+         _RecursiveUnboundProduction_; then
+        if rm -f "$AUTO_FAILOVER_MARKER"; then
+          _LogEvent_ notice 'MONITORING ONLY: recursive Unbound active; automatic WAN switching authorization revoked' >/dev/null
+        else
+          _Fail_ 'Unable to revoke automatic WAN authorization in recursive mode'
+        fi
+      fi
+      _ReleaseWANLock_ >/dev/null 2>&1 || :
+    fi
+  fi
   _RotateScheduleLog_ || :
   _Say_ "SCHEDULE UTC: $(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || _Say_ 'clock-unavailable')"
   _CheckBootReadiness_ || return 0
   [ ! -e "$PENDING_TRANSACTION" ] && [ ! -e "$RECOVERY_HOLD" ] || {
     _Say_ 'SKIP: unresolved WAN transaction or recovery hold; no WAN switching'; return 0;
   }
+  RG_WEBUI_RECORD_POLICY_FAILURES=1
   if _RunDNSHealthCheck_ scheduled; then outcome=0
   else outcome=$?
   fi
-  _Say_ "SCHEDULE UTC END: $(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || _Say_ 'clock-unavailable') result=$outcome"
+  RG_WEBUI_RECORD_POLICY_FAILURES=0
+  _ReportScheduledSwitchingMode_ || :
+  # Preserve UTC for history and give the WebUI the router's actual local
+  # clock and UTC offset at completion (independent of the viewing browser).
+  _Say_ "SCHEDULE UTC END: $(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || _Say_ 'clock-unavailable') result=$outcome routerTime=$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || _Say_ 'clock-unavailable')"
+  # Publish only after a completed scheduled evaluation; never alter DNS outcomes.
+  if [ -f "$ROOT/ResolvGuard.asp" ] && [ ! -L "$ROOT/ResolvGuard.asp" ]; then
+    _RGWebUI_ publish >/dev/null 2>&1 || :
+  fi
   return "$outcome"
 }
 
@@ -4476,7 +6199,7 @@ _ShowMenuState_() {
   else
     printf '  %-24s%sDISABLED%s\n' 'Scheduled DNS Checks:' "$RG_YELLOW" "$RG_RESET"
   fi
-  if [ -r "$SCHEDULE_MARKER" ] && [ -r "$AUTO_FAILOVER_MARKER" ]; then
+  if [ -r "$SCHEDULE_MARKER" ] && [ -r "$AUTO_FAILOVER_MARKER" ] && ! _RecursiveUnboundProduction_; then
     if _CheckAutomaticFailoverAuthorization_ >/dev/null 2>&1; then
       printf '  %-24s%sAUTHORIZED%s\n' 'Unattended Switching:' "$RG_GREEN" "$RG_RESET"
     else
@@ -4487,9 +6210,17 @@ _ShowMenuState_() {
   fi
 }
 
+# An interactive SSH menu can remain open while the separate WebUI process
+# updates settings.conf. Refresh its in-memory values on each menu redraw;
+# merely waiting for input must not own a config/WAN lock or mask a web save.
+_RefreshMenuConfiguration_() {
+  [ -f "$SETTINGS" ] && [ ! -L "$SETTINGS" ] && [ -r "$SETTINGS" ] || return 1
+  . "$SETTINGS"
+}
 _ShowHeader_() {
   local section
   section="${1:-Main Menu}"
+  _RefreshMenuConfiguration_ || :
   _SetMenuPalette_
   if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ]; then
     printf '\033[2J\033[H'
@@ -4707,6 +6438,9 @@ _CommitConfigurationLocked_() {
   fi
   rm -f "$backup1" "$backup2" "$stage2"
   _Say_ 'Configuration: SAVED'
+  # Keep the WebUI's own configuration feed current for SSH changes as well.
+  # This is RAM-only, best-effort, and never changes whether the commit succeeded.
+  _RGWebConfig_ snapshot >/dev/null 2>&1 || :
   if [ -e "$AUTO_FAILOVER_MARKER" ]; then
     _Say_ 'DNS policy: REAPPROVAL REQUIRED'
   fi
@@ -5268,6 +7002,18 @@ _ApplyVerifiedUpdate_() (
       rm -rf "$stage"; _Fail_ 'Release asset is not marked as stable'; exit 1;
     }
   fi
+  # Always download and verify the current ASP whenever the target script
+  # declares WebUI support. Older releases without it may still be selected.
+  update_webui=0
+  if grep -Fx '# RESOLVGUARD WEBUI ASSET ResolvGuard.asp' "$newscript" >/dev/null 2>&1; then
+    update_webui=1
+    newasp="$stage/ResolvGuard.asp"
+    asp_url="$(_WebUIAssetURL_ "$RELEASE_CHANNEL" "$RELEASE_VERSION")" || exit 1
+    _FetchHTTPS_ "$asp_url" "$newasp" || { rm -rf "$stage";exit 1; }
+    _VerifyWebUIAsset_ "$newasp" "$RELEASE_VERSION" "$RELEASE_VERSTAG" "$RELEASE_CHANNEL" || {
+      rm -rf "$stage";_Fail_ 'WebUI asset identity/content invalid; update left untouched';exit 1;
+    }
+  fi
   _AcquireConfigLock_ || {
     rm -rf "$stage"
     _Fail_ 'Configuration commit in progress; script replacement deferred'
@@ -5279,91 +7025,131 @@ _ApplyVerifiedUpdate_() (
   staged="$ROOT/.resolvguard.sh.update.$$"
   tempbackup="$STATE_DIR/.updater-previous.sh.$$"
   backup="$STATE_DIR/updater-previous.sh"
+  asp_target="$ROOT/ResolvGuard.asp"
+  asp_staged="$ROOT/.ResolvGuard.asp.update.$$"
+  asp_tempbackup="$STATE_DIR/.updater-previous.asp.$$"
+  asp_had_old=0
+  asp_published=0
+  script_published=0
 
-  # The replacement is staged beside the installed script so the final move
-  # stays on the same filesystem. The old script is retained only until the
-  # new installation has been verified (or a failed installation restored).
-  for path in "$staged" "$tempbackup"; do
+  # Both replacements are staged on the same JFFS filesystem. Preserve the
+  # installed versions only until both new files verify; no lasting backup.
+  for path in "$staged" "$tempbackup" "$asp_staged" "$asp_tempbackup"; do
     if [ -e "$path" ] || [ -L "$path" ]; then
       rm -rf "$stage"
-      _Fail_ 'Update destination staging path occupied'
+      _Fail_ 'Update staging or temporary rollback path occupied'
       exit 1
     fi
   done
-
-  # Previous builds saved a persistent updater-previous.sh. Accept an ordinary
-  # legacy file so that a successful update can retire it, but refuse unsafe
-  # state entries rather than deleting unknown files or following symlinks.
-  if [ -L "$backup" ]; then
-    rm -rf "$stage"
-    _Fail_ 'Existing updater backup is a symbolic link'
-    exit 1
+  if [ -L "$backup" ] || { [ -e "$backup" ] && [ ! -f "$backup" ]; }; then
+    rm -rf "$stage";_Fail_ 'Unsafe legacy updater script backup';exit 1
   fi
-
-  if [ -e "$backup" ] && [ ! -f "$backup" ]; then
-    rm -rf "$stage"
-    _Fail_ 'Existing updater backup is not a regular file'
-    exit 1
+  if [ -e "$asp_target" ] || [ -L "$asp_target" ]; then
+    [ -f "$asp_target" ] && [ ! -L "$asp_target" ] || {
+      rm -rf "$stage";_Fail_ 'Unsafe installed WebUI ASP';exit 1;
+    }
+    asp_had_old=1
   fi
-
   if ! cp "$newscript" "$staged" || ! chmod 755 "$staged" ||
      ! cp "$installed" "$tempbackup" || ! chmod 600 "$tempbackup"; then
     rm -f "$staged" "$tempbackup"
     rm -rf "$stage"
-    _Fail_ 'Cannot stage new script or temporarily preserve old script'
+    _Fail_ 'Cannot stage new script and temporary rollback copy'
     exit 1
   fi
+  if [ "$update_webui" = 1 ]; then
+    if ! cp "$newasp" "$asp_staged" || ! chmod 644 "$asp_staged"; then
+      rm -f "$staged" "$tempbackup" "$asp_staged"
+      rm -rf "$stage";_Fail_ 'Cannot stage WebUI ASP';exit 1
+    fi
+    if [ "$asp_had_old" = 1 ] &&
+       { ! cp "$asp_target" "$asp_tempbackup" || ! chmod 600 "$asp_tempbackup"; }; then
+      rm -f "$staged" "$tempbackup" "$asp_staged" "$asp_tempbackup"
+      rm -rf "$stage";_Fail_ 'Cannot preserve previous WebUI ASP';exit 1
+    fi
+  fi
 
+  rollback_update() {
+    rollback_ok=1
+    if [ "$script_published" = 1 ]; then
+      if ! cp "$tempbackup" "$staged" || ! chmod 755 "$staged" ||
+         ! mv -f "$staged" "$installed" || ! cmp -s "$installed" "$tempbackup"; then
+        rollback_ok=0
+      fi
+    fi
+    if [ "$asp_published" = 1 ]; then
+      if [ "$asp_had_old" = 1 ]; then
+        if ! cp "$asp_tempbackup" "$asp_staged" || ! chmod 644 "$asp_staged" ||
+           ! mv -f "$asp_staged" "$asp_target" || ! cmp -s "$asp_target" "$asp_tempbackup"; then
+          rollback_ok=0
+        fi
+      elif ! rm -f "$asp_target"; then
+        rollback_ok=0
+      fi
+    fi
+    if [ "$rollback_ok" = 1 ]; then
+      rm -f "$staged" "$asp_staged" "$tempbackup" "$asp_tempbackup"
+      rm -rf "$stage"
+      _Fail_ 'Update failed; previous script and ASP restored (where applicable)'
+    else
+      _Fail_ "CRITICAL: update rollback incomplete; preserved copies at $tempbackup and $asp_tempbackup"
+      _Fail_ 'Inspect the installed script/ASP before retrying; DNS state was not modified'
+    fi
+  }
+
+  if [ "$update_webui" = 1 ]; then
+    if ! mv -f "$asp_staged" "$asp_target"; then
+      rollback_update
+      exit 1
+    fi
+    asp_published=1
+    if ! cmp -s "$asp_target" "$newasp" ||
+       ! _VerifyWebUIAsset_ "$asp_target" "$RELEASE_VERSION" "$RELEASE_VERSTAG" "$RELEASE_CHANNEL"; then
+      rollback_update
+      exit 1
+    fi
+  fi
   if ! mv -f "$staged" "$installed"; then
-    rm -f "$staged"
+    rollback_update
+    exit 1
+  fi
+  script_published=1
+  if ! cmp -s "$installed" "$newscript" || ! sh -n "$installed"; then
+    rollback_update
+    exit 1
+  fi
+
+  if ! rm -f "$tempbackup" "$asp_tempbackup"; then
     rm -rf "$stage"
-
-    # Preserve the temporary copy when replacement fails unexpectedly: the
-    # installed script may no longer be identical to the previous version.
-    if cmp -s "$installed" "$tempbackup"; then
-      rm -f "$tempbackup" || :
-      _Fail_ 'Atomic script replacement failed; original installation retained'
-    else
-      _Fail_ "CRITICAL: script replacement failed; previous script retained at $tempbackup"
-    fi
+    _Fail_ 'Update verified but temporary rollback cleanup failed; inspect state directory'
     exit 1
   fi
-
-  # A mismatch after replacement must restore the previous script before any
-  # rollback file is deleted. Keep that file if restoration cannot be proven.
-  if ! cmp -s "$installed" "$newscript"; then
-    if cp "$tempbackup" "$staged" && chmod 755 "$staged" &&
-       mv -f "$staged" "$installed" && cmp -s "$installed" "$tempbackup"; then
-      rm -f "$tempbackup" || _Fail_ "Temporary rollback cleanup failed: $tempbackup"
-      rm -rf "$stage"
-      _Fail_ 'Update verification failed; previous script restored and verified'
-    else
-      rm -f "$staged"
-      rm -rf "$stage"
-      _Fail_ "CRITICAL: update verification and rollback failed; prior script retained at $tempbackup"
-    fi
-    exit 1
-  fi
-
-  # No permanent previous-version backup is retained after success. Clean up
-  # the temporary rollback file and the legacy persistent file (if any).
-  # A failed removal is reported as incomplete maintenance, never as a clean
-  # success, even though the newly installed script already passed verification.
-  if ! rm -f "$tempbackup"; then
-    rm -rf "$stage"
-    _Fail_ "Update installed and verified, but temporary rollback cleanup failed: $tempbackup"
-    exit 1
-  fi
-
   if [ -f "$backup" ] && ! rm -f "$backup"; then
-    rm -rf "$stage"
-    _Fail_ "Update installed and verified, but legacy backup cleanup failed: $backup"
-    exit 1
+    rm -rf "$stage";_Fail_ 'Update verified but legacy backup cleanup failed';exit 1
+  fi
+  if ! rm -rf "$stage"; then
+    _Fail_ 'Update verified but download staging cleanup failed';exit 1
   fi
 
-  if ! rm -rf "$stage"; then
-    _Fail_ "Update installed and verified, but download staging cleanup failed: $stage"
-    exit 1
+  # Remount to pick up the newly installed root ASP on the native WAN page.
+  # Firmware UI may not be ready; a failure is reported rather than risking
+  # a DNS-affecting rollback for a purely visual mount operation.
+  if [ "$update_webui" = 1 ]; then
+    if /bin/sh "$installed" webui bootstrap >/tmp/resolvguard-webui-update-mount.log 2>&1; then
+      # Remove old prototype assets only after a successful remount.
+      legacy="$ROOT/webui"
+      if [ -d "$legacy" ] && [ ! -L "$legacy" ]; then
+        for old in ResolvGuard.asp dashboard.htm; do
+          if [ -f "$legacy/$old" ] && [ ! -L "$legacy/$old" ]; then
+            rm -f "$legacy/$old" || _Say_ "NOTICE: legacy file remains: $legacy/$old"
+          fi
+        done
+        rmdir "$legacy" 2>/dev/null || :
+      fi
+    else
+      _Say_ 'NOTICE: WebUI ASP installed; automatic bootstrap deferred. Run: sh /jffs/addons/ResolvGuard.d/resolvguard.sh webui bootstrap'
+      _Say_ 'NOTICE: legacy WebUI files retained until the new page mounts successfully.'
+    fi
   fi
 
   if [ "$RELEASE_CHANNEL" = development ]; then
@@ -5535,11 +7321,20 @@ _UninstallNeverEnrolled_() {
     [ ! -e "$PREF_PROVIDERS" ] && [ ! -L "$PREF_PROVIDERS" ] || return 1
   hook="$HOOK_DIR/services-start"
   if [ -f "$hook" ] && [ ! -L "$hook" ]; then
+    # The one ResolvGuard-owned services-start line is permitted even for
+    # an unenrolled installation: it only restores the independent WebUI.
+    # Refuse stray/modified references rather than deleting a foreign hook.
     if grep -F "$ROOT/resolvguard.sh" "$hook" >/dev/null 2>&1 ||
+       grep -F '# RESOLVGUARD STARTUP' "$hook" >/dev/null ||
        grep -Fqx '# RESOLVGUARD BEGIN' "$hook" ||
        grep -Fqx '# RESOLVGUARD END' "$hook"; then
-      _Fail_ 'Unenrolled installation still has a startup hook; uninstall blocked'
-      return 1
+      _CheckOwnedStartupHook_ || return 1
+      if { ! grep -Fqx "$(_StartupHookLine_)" "$hook" &&
+           ! grep -Fqx '# RESOLVGUARD BEGIN' "$hook"; } ||
+         [ "$(grep -Fc "$ROOT/resolvguard.sh" "$hook")" -ne 1 ]; then
+        _Fail_ 'Unrecognized ResolvGuard services-start reference; uninstall blocked'
+        return 1
+      fi
     fi
   fi
   jobs="$(cru l 2>/dev/null)" || {
@@ -5606,6 +7401,19 @@ _UninstallLocked_() {
       }
   else
     _UninstallNeverEnrolled_ || return 1
+  fi
+  # Remove only ResolvGuard-owned WebUI resources before deleting the add-on.
+  if { [ -f "$ROOT/ResolvGuard.asp" ] && [ ! -L "$ROOT/ResolvGuard.asp" ]; } ||
+     { [ -f "$ROOT/webui/ResolvGuard.asp" ] && [ ! -L "$ROOT/webui/ResolvGuard.asp" ]; } ||
+     { [ -f /jffs/scripts/service-event ] &&
+       { grep -Fq '# RESOLVGUARD MANUAL' /jffs/scripts/service-event ||
+         grep -Fq '# RESOLVGUARD CONFIG' /jffs/scripts/service-event ||
+         grep -Fq '# RESOLVGUARD WEBUI MANUAL BEGIN' /jffs/scripts/service-event ||
+         grep -Fq '# RESOLVGUARD WEBUI CONFIG BEGIN' /jffs/scripts/service-event; }; }; then
+    _RGWebUI_ unmount || {
+      _Fail_ 'WebUI cleanup failed; installation retained for inspection'
+      return 1
+    }
   fi
   rm -rf "$ROOT" || {
     _Fail_ 'Failed to remove add-on files; inspect the remaining installation'
@@ -6163,9 +7971,22 @@ _RunQuickSetupWizard_() {
       _Say_ '  No changes saved; existing checks will be used.'
     }
   fi
-  # Disclose domain-scoped DNS bypasses before requesting approval for
-  # automatic WAN switching. Interactive SSH users must acknowledge the
-  # warning; noninteractive callers receive plain text without a pause.
+  # Discover the current Unbound mode AFTER saved setup choices, not just
+  # once during installation. Recursive Unbound cannot use automatic WAN
+  # failover; go straight to Monitoring Only without requesting policy consent,
+  # invoking the failover command, or asking a redundant fallback question.
+  # Scheduled monitoring remains independently read-only and may be disabled
+  # later through Monitoring Settings.
+  if _RecursiveUnboundProduction_; then
+    _Say_ '  Recursive Unbound detected: automatic WAN failover is unavailable.'
+    _Say_ '  Selecting Monitoring Only for external DoT checks.'
+    _EnableScheduledMonitoring_ confirmed quiet || return 1
+    printf '  %sMONITORING ONLY%s  Scheduled checks ON; WAN switching OFF.\n' "$RG_CYAN" "$RG_RESET"
+    return 0
+  fi
+
+  # Disclose domain-scoped DNS bypasses only when considering automatic WAN
+  # switching. Recursive Unbound does not use the direct DNSMasq -> Stubby path.
   _ShowDNSMasqScopedSetupWarning_
 
   if [ -r "$AUTO_FAILOVER_MARKER" ] && _CheckAutomaticFailoverAuthorization_ >/dev/null 2>&1; then
@@ -6277,6 +8098,10 @@ _ShowAdvancedOptionsMenu_() {
 }
 
 _ToggleAutomaticFailover_() {
+  if _RecursiveUnboundProduction_; then
+    _Fail_ 'WAN failover disabled in recursive Unbound mode. Use Monitoring Only until Unbound forwards to Stubby.'
+    return 1
+  fi
   if [ -r "$AUTO_FAILOVER_MARKER" ]; then
     _DisableAutomaticFailover_
   elif [ ! -r "$PREF_RULELIST" ] || [ ! -r "$PREF_PROVIDERS" ]; then
@@ -6310,14 +8135,20 @@ _MainMenu_() {
     if ! _IsQuickSetupComplete_; then
       _PrintMenuItem_ qs 'Quick Setup (Complete Initial Setup)'
     fi
-    if _CheckAutomaticFailoverAuthorization_ >/dev/null 2>&1; then
+    if _RecursiveUnboundProduction_; then
+      state='DISABLED (RECURSIVE UNBOUND)'
+    elif _CheckAutomaticFailoverAuthorization_ >/dev/null 2>&1; then
       state='ON'
     elif [ -r "$AUTO_FAILOVER_MARKER" ]; then
       state='SAFETY HOLD'
     else
       state='OFF'
     fi
-    _PrintMenuItem_ af "Automatic DNS Failover: $state (Toggle)"
+    if _RecursiveUnboundProduction_; then
+      _PrintMenuItem_ af "Automatic DNS Failover: $state"
+    else
+      _PrintMenuItem_ af "Automatic DNS Failover: $state (Toggle)"
+    fi
     _PrintMenuItem_ vs 'View Status'
     _PrintMenuItem_ ch 'Check DNS Health Now'
     _PrintMenuItem_ in 'Inspect Live DNS'
@@ -6357,6 +8188,26 @@ case "${1:-menu}" in
      fi ;;
 esac
 
+# When an older stable updater replaces only resolvguard.sh, it cannot invoke
+# code introduced by the new script. On the NEXT installed execution (manual
+# or cron), self-heal the missing ASP and Merlin mount using the installed
+# script's channel. The installed SCRIPT_BRANCH -> UPDATE_CHANNEL mapping
+# selects raw dev/ResolvGuard.asp or raw main/ResolvGuard.asp, never the source
+# branch of an earlier channel-switch command.
+# Keep uninstall, recovery, WebUI unmount, and amtm offline capability probing
+# free of implicit WebUI downloads or mount operations.
+case "${1:-menu}" in
+  scheduled-check) _MaybeRepairWebUIOnInvocation_ background ;;
+  configure|quick-setup|dependencies|deps|schedule|policy|validate|enroll|pools|discover|check|probe|status)
+    _MaybeRepairWebUIOnInvocation_ ;;
+  amtmupdate)
+    [ "${2:-update}" = check ] || _MaybeRepairWebUIOnInvocation_ ;;
+  develop)
+    [ "$UPDATE_CHANNEL" != development ] || _MaybeRepairWebUIOnInvocation_ ;;
+  stable)
+    [ "$UPDATE_CHANNEL" != stable ] || _MaybeRepairWebUIOnInvocation_ ;;
+esac
+
 case "${1:-menu}" in
   install)
     _InstallResolvGuard_ || exit 1
@@ -6366,6 +8217,8 @@ case "${1:-menu}" in
     if ! _IsInstallationComplete_; then
       _InstallResolvGuard_ || exit 1
       _StartFirstRunSetup_
+    else
+      _BootstrapExistingWebUI_ || :
     fi
     _MainMenu_ ;;
   configure) _ShowConfigurationMenu_ ;;
@@ -6378,6 +8231,12 @@ case "${1:-menu}" in
   policy) _ManagePolicy_ "${2:-status}" ;;
   startup) _ScheduleStartup_ ;;
   scheduled-check) _RunScheduledCheck_ ;;
+  webui)
+    case "${2:-status}" in
+      config-run) _RGWebConfig_ apply ;;
+      config-snapshot) _RGWebConfig_ snapshot ;;
+      *) _RGWebUI_ "${2:-status}" ;;
+    esac ;;
   validate) (
     PROVIDERS="$RUNTIME/providers-validation-$$.tsv"
     trap 'rm -f "$RUNTIME/providers-validation-$$.tsv"' EXIT HUP INT TERM
@@ -6393,13 +8252,14 @@ case "${1:-menu}" in
   help|-h|--help)
     cat <<HELP
 ResolvGuard v$SCRIPT_VERSION (WAN DNS-over-TLS monitoring and failover)
-Usage: sh $ROOT/resolvguard.sh [install|menu|quick-setup|dependencies|configure|uninstall|discover|validate|enroll|pools|check|status|restore|probe <hostname-or-URL> [BOTH|TYPE] [provider-id|all] [summary|full]|schedule [status|enable|disable|logs]|startup|policy [status|approve|revoke]|amtmupdate [check|status|update]|develop|stable]
+Usage: sh $ROOT/resolvguard.sh [install|menu|quick-setup|dependencies|configure|uninstall|discover|validate|enroll|pools|check|status|restore|probe <hostname-or-URL> [BOTH|TYPE] [provider-id|all] [summary|full]|schedule [status|enable|disable|logs]|startup|webui [bootstrap|mount|unmount|publish|status]|policy [status|approve|revoke]|amtmupdate [check|status|update]|develop|stable]
 
 No arguments: if installation is needed, install and offer Quick Setup once; otherwise open the SSH menu. An incomplete setup remains selectable from the menu. e or exit leaves the current menu.
 install verifies prerequisites (including optional bind-dig installation), initializes missing config, and publishes the main script only after preparation succeeds.
 A failed first-time install removes an initially placed script; an existing DNS-enrolled installation is never removed on failed prerequisite repair.
 Quick Setup runs after first installation; if cancelled, it remains on the menu until completed. After completion, use the dedicated menu options, or deliberately rerun the wizard using the quick-setup CLI command.
-Default INACTIVE: no scheduled monitoring and no automatic WAN DNS changes.
+Default INACTIVE before Quick Setup: no scheduled monitoring and no automatic WAN DNS changes.
+When recursive Unbound serves LAN DNS, Quick Setup skips automatic-failover approval and starts read-only scheduled external DoT Monitoring Only; this can later be disabled from Monitoring Settings.
 Manual restoration is available through Maintenance & Recovery.
 The preferred WAN snapshot and transaction journal live in ResolvGuard.d/state.
 Probes use short-lived local authenticated DoT resolvers.
@@ -6407,7 +8267,7 @@ Monitored hostnames are NEVER forwarded through separate DNS routes.
 probe is a read-only DNS response inspector. Main Menu IN option can save selected successful observations as policy checks with explicit confirmation.
 Install and first run initialize missing config/settings.conf, config/checks.tsv and config/extra-providers.tsv without overwriting existing files.
 Quick Setup checks for Entware bind-dig and offers to install it with permission if missing. A separate onboarding completion record is written only after successful setup (including Monitoring Only or deliberately inactive operation). Run dependencies to check/install dig separately.
-Extracting the package does not enable cron or startup hooks; choose monitoring or automatic failover in the menu.
+Install creates a shared services-start hook for the independent WebUI. It does not enable cron, DNS monitoring, or automatic failover.
 Main Menu toggles Automatic DNS Failover; policy review and scheduling are integrated.
 Unattended failover requires a persistent, operator-approved DNS policy.
 Unexpected answer data/count is monitored as resolver-health failure. Automatic WAN switching still requires corroboration, a safe independently verified destination, and approved policy. An uncorroborated or universally stale DNS policy cannot authorize a switch.

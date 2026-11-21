@@ -29,7 +29,7 @@ jobs:
 
     steps:
       - name: Check out main branch (release source)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           ref: main
@@ -175,7 +175,7 @@ jobs:
           fi
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.release.outputs.tag }}
           name: ResolvGuard ${{ steps.release.outputs.tag }}
