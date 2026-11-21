@@ -60,67 +60,12 @@ function rgRequestConfiguration(data) {
   rgSharedCustomSettings.ResolvGuard_config_request=data;
   return true;
 }
-// Reuse Asuswrt-Merlin's own showLoading()/hideLoading() dialog.
-// Firmware percentages are time estimates, not measurements of DNS or update work.
-// Hold the native dialog until a matching router response has been validated.
-var rgNativeOperation={active:false,closing:false,closeTimer:null,timeoutMs:0};
-function rgBeginNativeOperation(timeoutMs){
-  if(rgNativeOperation.active)return false;
-  if(typeof showLoading!=='function')return false;
-  var form=document.getElementById('rg_config_form');
-  var wait=form&&form.elements.namedItem('action_wait');
-  if(!wait)return false;
-  // Keep the ASUS timer longer than the maximum response wait. In particular,
-  // an updater install must never lose the overlay while a download is active.
-  wait.value=String(Math.ceil(Math.max(1000,Number(timeoutMs)||25000)/1000)+30);
-  rgNativeOperation={active:true,closing:false,closeTimer:null,timeoutMs:Number(timeoutMs)||25000};
-  try { showLoading(); }
-  catch(e){rgNativeOperation.active=false;return false;}
-  return true;
-}
-function rgNativeCompletePercent(){
-  // Keep the original firmware wheel/dialog. Only the visible percentage is
-  // advanced on confirmed success; do not manipulate firmware timers.
-  var roots=[document.getElementById('Loading'),document.getElementById('loadingBlock')];
-  var changed=0;
-  roots.forEach(function(root){
-    if(!root)return;
-    var walker=document.createTreeWalker(root,NodeFilter.SHOW_TEXT,null);
-    var textNodes=[];while(walker.nextNode())textNodes.push(walker.currentNode);
-    textNodes.forEach(function(node){
-      var value=node.nodeValue||'';
-      if(/\b\d{1,3}%/.test(value)){
-        node.nodeValue=value.replace(/\b\d{1,3}%/g,'100%');changed++;
-      }
-    });
-  });
-  return changed;
-}
-function rgDismissNativeOperation(){
-  if(rgNativeOperation.closeTimer)clearTimeout(rgNativeOperation.closeTimer);
-  rgNativeOperation.closeTimer=null;
-  // Prefer the firmware's own cleanup; force-hide only if unavailable.
-  var nativeHidden=false;
-  try{if(typeof hideLoading==='function'){hideLoading();nativeHidden=true;}}catch(e){}
-  if(!nativeHidden){
-    var overlay=document.getElementById('Loading');
-    if(overlay)overlay.style.display='none';
-  }
-  rgNativeOperation.active=false;rgNativeOperation.closing=false;
-}
-function rgEndNativeOperation(success,confirmed){
-  if(!rgNativeOperation.active||rgNativeOperation.closing)return;
-  rgNativeOperation.closing=true;
-  if(success&&confirmed){
-    // Completion is based on the result request ID and any snapshot validation,
-    // never on ASUS's elapsed-time calculation.
-    rgNativeCompletePercent();
-    rgNativeOperation.closeTimer=setTimeout(rgDismissNativeOperation,1100);
-  }else{
-    // Failure/no matched response: release the wheel without displaying 100%.
-    // The specific diagnostic is already shown in the embedded Settings tab.
-    rgDismissNativeOperation();
-  }
+// MerlinAU dismisses the ASUS apply overlay after handling its result.
+// A failed or timed-out ResolvGuard request must also release this overlay.
+function rgFinishConfiguration() {
+  try { if (typeof hideLoading === 'function') hideLoading(); } catch(e) {}
+  var overlay=document.getElementById('Loading');
+  if (overlay) overlay.style.display='none';
 }
 function initial() {
   if (typeof show_menu === 'function') show_menu();
@@ -199,7 +144,7 @@ function rgDashboardLoaded() {
   <input type="hidden" name="action_script" value="" />
   <input type="hidden" name="amng_custom" value="" />
   <input type="hidden" name="action_mode" value="apply" />
-  <input type="hidden" name="action_wait" value="0" />
+  <input type="hidden" name="action_wait" value="10" />
   <input type="hidden" name="current_page" value="" />
   <input type="hidden" name="next_page" value="" />
   <input type="hidden" name="modified" value="0" />
@@ -549,16 +494,16 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     <div class="section-head" style="margin-top:0"><h3>ResolvGuard settings</h3></div>
     <div class="note rg-config-note">These settings govern ResolvGuard's monitoring behavior.</div>
     <div class="card" style="margin-top:16px">
+      <div class="card-head"><div><div class="card-title">Monitoring &amp; health-check parameters</div><div class="card-sub" id="settingsSummary">Loading saved configuration…</div></div></div>
+      <div id="settingsRows"></div>
+    </div>
+    <div class="card" style="margin-top:16px">
       <div class="card-head"><div><div class="card-title">Script Maintenance</div><div class="card-sub">Check the selected ResolvGuard channel before installing</div></div></div>
       <div class="card-pad">
         <div class="rg-script-info"><div><span class="hint">Installed version</span><strong id="scriptInstalled">Loading…</strong></div><div><span class="hint">Update channel</span><strong id="scriptChannel">—</strong></div></div>
         <div class="rg-actions"><button type="button" class="btn" id="scriptCheck" disabled>Check for Updates</button><button type="button" class="btn primary" id="scriptInstall" hidden disabled>Update Now</button><button type="button" class="btn" id="scriptReload" hidden>Reload WebUI</button></div>
         <p class="desc" id="scriptUpdateFeedback" role="status" aria-live="polite">No update check performed.</p>
       </div>
-    </div>
-    <div class="card" style="margin-top:16px">
-      <div class="card-head"><div><div class="card-title">Monitoring &amp; health-check parameters</div><div class="card-sub" id="settingsSummary">Loading saved configuration…</div></div></div>
-      <div id="settingsRows"></div>
     </div>
   </section>
   <div class="rg-configuration-status" id="configFeedback" role="status" aria-live="polite" hidden></div>
@@ -1462,14 +1407,10 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     const requestId=payload.split('|')[0];
     const previousRevision=Number(state.config.revision||0);
     controlsBusy(true);configNotice('Submitting configuration request to Merlin…');
-    let received=null,finishOk=false,finishMsg='';
     try {
-      if(window.parent===window || typeof window.parent.rgBeginNativeOperation!=='function' ||
-         !window.parent.rgBeginNativeOperation(25000))
-        throw Error('Merlin native loading dialog is unavailable; configuration not submitted.');
-      if(typeof window.parent.rgRequestConfiguration!=='function' || !window.parent.rgRequestConfiguration(payload))
+      if(window.parent===window || typeof window.parent.rgRequestConfiguration!=='function' || !window.parent.rgRequestConfiguration(payload))
         throw Error('Open this page through WAN → ResolvGuard to use authenticated settings.');
-      const began=Date.now();
+      const began=Date.now();let received=null;
       while(Date.now()-began<25000){
         await new Promise(resolve=>setTimeout(resolve,1000));
         try{const d=await load('/ext/ResolvGuard/config-action.htm');if(d.requestId===requestId){received=d;break;}}catch(e){}
@@ -1477,17 +1418,15 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
       if(!received)throw Error('No matching response from the router. Check /tmp/resolvguard-webui-config.log; do not assume the setting was saved.');
       if(received.status!=='success')throw Error(received.message||'The router rejected the configuration request.');
       configNotice(received.message||'Configuration saved');
-      const snapshotOk=await loadConfig(previousRevision);
-      if(!snapshotOk)
+      if(!await loadConfig(previousRevision))
         configNotice('Router confirmed the save, but the new configuration snapshot is unavailable. Further edits are disabled until refreshed.',true);
       await refresh();
       resetBackup();
-      finishOk=snapshotOk;
-      finishMsg=snapshotOk?'Configuration saved and refreshed.':'Saved, but the refreshed configuration is unavailable.';
-    }catch(e){finishMsg=e.message||'Configuration request failed.';configNotice(finishMsg,true);}finally{
+    }catch(e){configNotice(e.message,true);}finally{
       controlsBusy(false);
-      try{if(window.parent!==window&&typeof window.parent.rgEndNativeOperation==='function')
-        window.parent.rgEndNativeOperation(finishOk,!!received);}catch(e){}
+      // The firmware may keep its 'Complete' overlay after the action has
+      // already finished. Never leave a blocking spinner over the dashboard.
+      try { if(window.parent!==window && typeof window.parent.rgFinishConfiguration==='function') window.parent.rgFinishConfiguration(); }catch(e){}
     }
   }
   function updateNotice(message,kind=''){
@@ -1510,15 +1449,11 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
       state.updateAvailable=false;$('scriptInstall').hidden=true;
     }
     updateNotice(mode==='script-check'?'Checking '+script.channel+' for updates…':'Installing verified script update…');
-    let result=null,finishOk=false,finishMsg='';
     try{
-      const timeout=mode==='script-install'?240000:120000;
-      if(window.parent===window||typeof window.parent.rgBeginNativeOperation!=='function'||
-         !window.parent.rgBeginNativeOperation(timeout))
-        throw Error('Merlin native loading dialog is unavailable; update not submitted.');
-      if(typeof window.parent.rgRequestConfiguration!=='function'||!window.parent.rgRequestConfiguration(payload))
+      if(window.parent===window||typeof window.parent.rgRequestConfiguration!=='function'||!window.parent.rgRequestConfiguration(payload))
         throw Error('Open WAN → ResolvGuard to use authenticated updates.');
-      const started=Date.now();
+      const started=Date.now();let result=null;
+      const timeout=mode==='script-install'?240000:120000;
       while(Date.now()-started<timeout){
         await new Promise(resolve=>setTimeout(resolve,1000));
         try{const d=await load('/ext/ResolvGuard/config-action.htm');if(d.requestId===requestId){result=d;break;}}catch(e){}
@@ -1538,16 +1473,12 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
         state.updateAvailable=false;$('scriptInstall').hidden=true;$('scriptReload').hidden=false;
         updateNotice('Update installed and verified. Reload the WebUI to use the new version.','success');
       }else throw Error(result.message||'The router rejected the update request.');
-      finishOk=true;
-      finishMsg=mode==='script-install'?'Update installed and verified. Reload WebUI to use it.':
-        (result.status==='available'?'Update available.':'Update check complete.');
     }catch(e){
       if(mode==='script-install'){state.updateAvailable=false;$('scriptInstall').hidden=true;}
-      finishMsg=e.message||'Update check failed.';updateNotice(finishMsg,'error');
+      updateNotice(e.message||'Update check failed.','error');
     }finally{
       state.updateBusy=false;controlsBusy(false);
-      try{if(window.parent!==window&&typeof window.parent.rgEndNativeOperation==='function')
-        window.parent.rgEndNativeOperation(finishOk,!!result);}catch(e){}
+      try{if(window.parent!==window&&typeof window.parent.rgFinishConfiguration==='function')window.parent.rgFinishConfiguration();}catch(e){}
     }
   }
   $('scriptCheck').addEventListener('click',()=>scriptUpdate('script-check'));
