@@ -532,6 +532,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
   function topState(d){
     if(!d)return {title:'Connecting to ResolvGuard…',detail:'Waiting for the first status snapshot.',status:'unknown'};
     if(d.pendingTransaction||d.recoveryHold)return {title:'Critical — DNS recovery requires attention.',detail:'A pending transaction or recovery hold exists. Check SSH technical status before making changes.',status:'critical'};
+    if(d.mode==='hold')return {title:'Policy safety hold — automatic failover suspended.',detail:'The approved DNS policy no longer matches the configured providers or settings, or authorization could not be verified. Scheduled DNS checks continue, but unattended WAN switching is blocked. Reapprove the current policy through SSH before restoring failover.',status:'critical'};
     if(isStale(d))return {title:'Monitoring data is stale.',detail:'No recent completed health evaluation is available. This is not a passing result.',status:'unknown'};
     if(!hasRealChecks(d))return {title:'Waiting for health results.',detail:'The latest completed cycle had no DNS policy observations.',status:'unknown'};
     const p=pref(d), n=p.filter(r=>r.state==='ok').length;
@@ -672,7 +673,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
   })();
   function syncWaveSignal(d, feedConnected=true){
     const live=feedConnected && !!d?.lastEnd && !isStale(d) && hasRealChecks(d);
-    const alert=feedConnected && !!d && (d.pendingTransaction||d.recoveryHold);
+    const alert=feedConnected && !!d && (d.pendingTransaction||d.recoveryHold||d.mode==='hold');
     const node=$('heartbeat');
     node.classList.toggle('no-signal',!live&&!alert);
     const summary=alert?'critical':live?topState(d).status:'unknown';
@@ -763,13 +764,13 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     $('resolverScopeNote').innerHTML=recursive?'Direct authenticated DoT probes; not Unbound DNS health.':'These are <strong>direct authenticated DoT probes</strong>. Production LAN DNS still uses DNSMasq → Stubby by default.';
     syncWaveSignal(d,state.feedConnected);
     $('heroHeading').textContent=s.title; $('heroText').textContent=s.detail;
-    $('heroKicker').textContent=recursive
+    $('heroKicker').textContent=d?.mode==='hold'?'AUTOMATIC FAILOVER SUSPENDED':recursive
       ? s.status==='healthy'?'External DoT checks healthy':s.status==='degraded'?'External DoT checks degraded':s.status==='critical'?'External DoT checks failing':'External DoT monitoring'
       : s.status==='healthy'?'Monitoring healthy':s.status==='degraded'?'DNS degraded — operating':s.status==='critical'?'DNS CRITICAL':'Verification pending';
     paintOverviewSeverity(s.status);
     $('poolPill').textContent=(recursive?'WAN pool: ':'Active pool: ')+(d?.pool||'unknown');
     $('modePill').textContent=recursive?'WAN failover disabled in recursive mode':(({'monitoring':'Monitoring Only','automatic':'Auto Failover configured','inactive':'Monitoring inactive','hold':'Policy safety hold'})[d?.mode]||'Unknown mode');
-    $('heartLabel').textContent=s.status==='healthy'?'Check complete · Healthy':s.status==='degraded'?'Check complete · Degraded':s.status==='critical'?'Critical · Attention needed':'Awaiting reliable check';
+    $('heartLabel').textContent=d?.mode==='hold'?'Protection paused · Policy hold':s.status==='healthy'?'Check complete · Healthy':s.status==='degraded'?'Check complete · Degraded':s.status==='critical'?'Critical · Attention needed':'Awaiting reliable check';
     if(recursive&&s.status!=='unknown')$('heartLabel').textContent='DoT checks · '+(s.status==='healthy'?'Healthy':s.status==='degraded'?'Degraded':'Failing');
     $('heartSub').textContent=d?.lastEnd?'Last completed '+(routerTimeLabel(d.lastEndRouter)||String(d.lastEnd).replace('T',' ').replace(/Z$/,' UTC')):'No completed cycle recorded';
     $('statResolvers').textContent=d&&r.length?`${n} / ${r.length}`:'—';
@@ -1205,7 +1206,11 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
   function renderSettingsSummary(){
     const cfg=state.config;if(!cfg)return;
     const recursive=recursiveUnbound(state.snapshot);
-    const summary=cfg.monitoringEnabled?'Monitoring enabled'+(recursive?' · WAN failover disabled in recursive mode':(cfg.autoFailoverEnabled?' · Automatic failover authorized':' · Monitoring only')):'Monitoring disabled';
+    // Current router status supersedes a cached configuration snapshot.
+    const liveMode=state.feedConnected?state.snapshot?.mode:null;
+    const hold=liveMode==='hold'||(!liveMode&&cfg.policySafetyHold===true);
+    const automatic=liveMode==='automatic'||(!liveMode&&cfg.autoFailoverEnabled===true);
+    const summary=cfg.monitoringEnabled?'Monitoring enabled'+(recursive?' · WAN failover disabled in recursive mode':hold?' · POLICY SAFETY HOLD — automatic failover suspended':automatic?' · Automatic failover authorized':' · Monitoring only'):'Monitoring disabled';
     $('settingsSummary').textContent=summary+(cfg.generatedEpoch?' · Router snapshot: '+new Date(Number(cfg.generatedEpoch)*1000).toLocaleString():'');
   }
   function renderSettings(){
@@ -1291,6 +1296,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
       configNotice(received.message||'Configuration saved');
       if(!await loadConfig(previousRevision))
         configNotice('Router confirmed the save, but the new configuration snapshot is unavailable. Further edits are disabled until refreshed.',true);
+      await refresh();
       resetBackup();
     }catch(e){configNotice(e.message,true);}finally{
       controlsBusy(false);

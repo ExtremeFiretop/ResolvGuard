@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.2
-readonly SCRIPT_VERSTAG="26112101"
+readonly SCRIPT_VERSTAG="26112102"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -5177,12 +5177,18 @@ _RGWebConfig_() (
       done
       rg_recursive=false
       if _RecursiveUnboundProduction_; then rg_recursive=true; fi
-      rg_auto=false
-      if [ "$rg_recursive" = false ] && [ -f "$AUTO_FAILOVER_MARKER" ] && [ ! -L "$AUTO_FAILOVER_MARKER" ]; then rg_auto=true; fi
-      printf '},"monitoringEnabled":%s,"autoFailoverEnabled":%s,"requiresPolicyReview":%s,' \
+      rg_auto=false;rg_hold=false
+      if [ "$rg_recursive" = false ] && [ -f "$SCHEDULE_MARKER" ] && [ ! -L "$SCHEDULE_MARKER" ] &&
+         [ -f "$AUTO_FAILOVER_MARKER" ] && [ ! -L "$AUTO_FAILOVER_MARKER" ]; then
+        if _CheckAutomaticFailoverAuthorization_ >/dev/null 2>&1; then
+          rg_auto=true
+        else
+          rg_hold=true
+        fi
+      fi
+      printf '},"monitoringEnabled":%s,"autoFailoverEnabled":%s,"requiresPolicyReview":%s,"policySafetyHold":%s,' \
         "$( [ -f "$SCHEDULE_MARKER" ] && [ ! -L "$SCHEDULE_MARKER" ] && printf true || printf false )" \
-        "$rg_auto" \
-        "$( [ -f "$AUTO_FAILOVER_MARKER" ] && [ ! -L "$AUTO_FAILOVER_MARKER" ] && printf true || printf false )"
+        "$rg_auto" "$rg_hold" "$rg_hold"
       printf '"backups":['
       rg_sep=''
       while IFS='|' read -r rg_id rg_ip rg_tls rg_port rg_extra; do
@@ -5379,7 +5385,12 @@ EOF_RG_WEB_CONFIG
         fi ;;
     esac
     if [ "$rg_result_status" = success ]; then
-      rg_snapshot || rg_notice 'saved but snapshot publishing failed'
+      # Run the snapshot in a child so its flock descriptor is closed before
+      # the immediate status publisher takes its own configuration snapshot.
+      (rg_snapshot) || rg_notice 'saved but snapshot publishing failed'
+      # A configuration save can invalidate policy authorization immediately.
+      # Refresh read-only live status now, not only after the next cron cycle.
+      _RGWebUI_ publish >/dev/null 2>&1 || rg_notice 'saved; live status refresh deferred to next scheduled check'
     fi
     rg_publish_result "$rg_id" "$rg_result_status" "$rg_message" || return 1
     printf '%s\n' "$rg_id" | rg_atomic "$rg_seen" || return 1
@@ -5440,11 +5451,13 @@ _RGWebUI_() (
   number() { case "$1" in ''|*[!0-9]*) printf '0';; *) printf '%s' "$1";; esac; }
   safe_pool() { case "$1" in preferred|filtered1|filtered2|backup[0-9]*|wanpool[0-9]*) printf '%s' "$1" ;; *) printf unknown ;; esac; }
   mode_name() {
-    if [ ! -f "$RG_ROOT/state/monitoring-enabled" ]; then printf inactive
-    elif [ ! -f "$RG_ROOT/state/automatic-failover-enabled" ]; then printf monitoring
+    if [ ! -f "$SCHEDULE_MARKER" ] || [ -L "$SCHEDULE_MARKER" ]; then printf inactive
+    elif [ ! -f "$AUTO_FAILOVER_MARKER" ] || [ -L "$AUTO_FAILOVER_MARKER" ]; then printf monitoring
     elif _RecursiveUnboundProduction_; then printf monitoring
-    elif [ ! -f "$RG_ROOT/state/policy-approval" ]; then printf hold
-    else printf automatic; fi
+    # Use the same live, fingerprint-aware authorization check as the SSH
+    # menu. An approval file existing does not mean its policy is still valid.
+    elif _CheckAutomaticFailoverAuthorization_ >/dev/null 2>&1; then printf automatic
+    else printf hold; fi
   }
   # Derive exactly the domain-scoped exception type already disclosed by installer.
   # Unrecognized resolver formats are not labelled as verified bypass rules.
