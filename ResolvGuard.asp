@@ -473,17 +473,6 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
 .rg-help-trigger{flex:0 0 20px;width:20px;height:20px;display:inline-flex;align-items:center;justify-content:center;padding:0;border:1px solid #56847d;border-radius:50%;background:#1a3b3c;color:#bcefe2;font-size:12px;font-family:inherit;font-weight:800;line-height:1;cursor:help}
 .rg-help-trigger:hover,.rg-help-trigger:focus-visible{background:#315e54;border-color:#8aebc0;color:#fff;outline:2px solid transparent;box-shadow:0 0 0 2px #8aebc078}
 .rg-help-trigger[aria-expanded="true"]{background:#315e54;border-color:#8aebc0}
-/* DNS Policy Approval is reviewed inline so it works in Merlin's tall iframe. */
-.rg-policy-review{margin-top:14px;padding:15px;border:1px solid #355b60;border-radius:12px;background:#112830}
-.rg-policy-review[hidden]{display:none!important}
-.rg-policy-review h4{font-size:12px;margin:14px 0 6px;color:#b8e6d6}
-.rg-policy-review ul{margin:5px 0 0 19px;padding:0;line-height:1.75;font-size:12px;color:#d1e2df}
-.rg-policy-review li{overflow-wrap:anywhere}
-.rg-policy-review .rg-policy-fingerprint{overflow-wrap:anywhere;font-family:monospace;color:#92b7bc;font-size:11px}
-.rg-policy-consent{display:flex;align-items:flex-start;gap:10px;font-size:12px;line-height:1.5;margin:14px 0}
-.rg-policy-consent input{margin-top:3px;flex-shrink:0}
-.rg-policy-line{margin:8px 0;font-size:12px;color:#bbd4d0}
-.rg-policy-alert{border-left:3px solid #e8b976;background:#40302158;padding:10px 12px;border-radius:6px;color:#f3d3a2}
 .rg-settings-tooltip{position:fixed;z-index:1000;width:min(340px,calc(100vw - 24px));box-sizing:border-box;background:#193138;border:1px solid #689e93;border-radius:11px;box-shadow:0 14px 32px #000a;padding:14px 16px;color:#e8f5f1;font-size:12px;line-height:1.55;pointer-events:none}
 .rg-settings-tooltip[hidden]{display:none!important}
 .rg-settings-tooltip strong{display:block;color:#d4fff0;font-size:13px;margin-bottom:7px}
@@ -607,28 +596,6 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
         <p class="desc" id="scriptUpdateFeedback" role="status" aria-live="polite">No update check performed.</p>
       </div>
     </div>
-    <div class="card" style="margin-top:16px" id="rgPolicyCard">
-      <div class="card-head"><div><div class="card-title">DNS Policy Approval</div><div class="card-sub">Review and authorize the exact WAN DoT switching policy</div></div></div>
-      <div class="card-pad">
-        <p class="rg-policy-line">Approval: <strong id="rgPolicyState">Loading…</strong></p>
-        <p class="desc" id="rgPolicyMessage">Changes to preferred WAN DNS, health checks, backups, or thresholds require a new approval before automatic switching.</p>
-        <div class="rg-actions"><button type="button" class="btn" id="rgPolicyReview" disabled>Review Policy</button></div>
-        <div class="rg-policy-review" id="rgPolicyPanel" hidden>
-          <strong>Review the current DNS policy</strong>
-          <p class="desc">This authorizes ResolvGuard to change Merlin WAN DNS automatically when monitoring and failover are enabled. It does not change your DNS configuration during approval.</p>
-          <h4>Preferred WAN DoT resolvers</h4><ul id="rgPolicyPreferred"></ul>
-          <h4>Alternate DNS providers</h4><ul id="rgPolicyAlternates"></ul>
-          <details><summary>Exact preferred WAN DoT list and integration paths</summary><pre id="rgPolicyRaw" style="white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px"></pre></details>
-          <h4>DNS answer validation rules</h4><ul id="rgPolicyChecks"></ul>
-          <h4>Monitoring and recovery controls</h4><ul id="rgPolicyThresholds"></ul>
-          <p class="rg-policy-line" id="rgPolicySafetyNotice"></p>
-          <p class="rg-policy-fingerprint" id="rgPolicyFingerprint"></p>
-          <label class="rg-policy-consent"><input type="checkbox" id="rgPolicyConsent"> <span>I have reviewed these DNS providers and health checks and authorize automatic WAN DNS switching under this policy.</span></label>
-          <div class="rg-actions"><button type="button" class="btn primary" id="rgPolicyApprove" disabled>Approve Reviewed Policy</button><button type="button" class="btn" id="rgPolicyCancel">Cancel</button></div>
-          <p id="rgPolicyFeedback" class="desc" role="status" aria-live="polite"></p>
-        </div>
-      </div>
-    </div>
     <div class="card" style="margin-top:16px">
       <div class="card-head"><div><div class="card-title">Monitoring &amp; health-check parameters</div><div class="card-sub" id="settingsSummary">Loading saved configuration…</div></div></div>
       <div id="settingsRows"></div>
@@ -679,7 +646,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     // health result. An old policy hold must not masquerade as current status.
     if(d.mode==='inactive')return {title:'Monitoring is inactive.',detail:'Scheduled DNS checks and automatic WAN switching are disabled. Results below are from the last completed check, not current DNS health.',status:'unknown'};
     if(isStale(d))return {title:'Monitoring data is stale.',detail:'No recent completed health evaluation is available. This is not a passing result.',status:'unknown'};
-    if(d.mode==='hold')return {title:'Policy safety hold — automatic failover suspended.',detail:'The approved DNS policy no longer matches the configured providers or settings, or authorization could not be verified. Scheduled DNS checks continue, but unattended WAN switching is blocked. Review and approve the current DNS policy in Settings before restoring failover.',status:'critical'};
+    if(d.mode==='hold')return {title:'Policy safety hold — automatic failover suspended.',detail:'The approved DNS policy no longer matches the configured providers or settings, or authorization could not be verified. Scheduled DNS checks continue, but unattended WAN switching is blocked. Reapprove the current policy through SSH before restoring failover.',status:'critical'};
     if(!hasRealChecks(d))return {title:'Waiting for health results.',detail:'The latest completed cycle had no DNS policy observations.',status:'unknown'};
     const p=pref(d), n=p.filter(r=>r.state==='ok').length;
     const allPreferredHealthy=p.length>0&&n===p.length;
@@ -1452,8 +1419,6 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     document.querySelectorAll('#backups button,#settingsRows .rg-save-setting').forEach(e=>e.disabled=disabled);
     $('scriptCheck').disabled=disabled;
     $('scriptInstall').disabled=disabled||state.updateBusy||!state.updateAvailable;
-    $('rgPolicyReview').disabled=disabled||!state.config?.policy?.reviewable;
-    $('rgPolicyApprove').disabled=disabled||!state.policyReviewFingerprint||!$('rgPolicyConsent').checked;
   }
   function controlsBusy(b){state.configBusy=Boolean(b);syncConfigControls();}
   function renderSettingsSummary(){
@@ -1466,71 +1431,12 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     const summary=cfg.monitoringEnabled?'Monitoring enabled'+(recursive?' · WAN failover disabled in recursive mode':hold?' · POLICY SAFETY HOLD — automatic failover suspended':automatic?' · Automatic failover authorized':' · Monitoring only'):'Monitoring disabled';
     $('settingsSummary').textContent=summary+(cfg.generatedEpoch?' · Router snapshot: '+new Date(Number(cfg.generatedEpoch)*1000).toLocaleString():'');
   }
-  function closePolicyReview(){
-    state.policyReviewFingerprint='';
-    $('rgPolicyConsent').checked=false;
-    $('rgPolicyPanel').hidden=true;
-    $('rgPolicyFeedback').textContent='';
-    syncConfigControls();
-  }
-  function renderPolicySummary(){
-    const p=state.config?.policy||{}, status=String(p.approval||'BLOCKED');
-    $('rgPolicyState').textContent=status;
-    $('rgPolicyState').className=status==='VALID'?'green':(status==='CHANGED'||status==='INVALID'||status==='BLOCKED'?'amber':'');
-    const detail=p.recursiveUnbound?'Recursive Unbound detected: WAN DoT switching approval is unavailable. Monitoring Only remains supported.':
-      !p.reviewable?'Approval requires enrolled preferred WAN DoT, an active preferred pool and no unresolved recovery transaction.':
-      status==='VALID'?'The saved authorization matches the current DNS policy.':'Review the current policy to authorize unattended WAN DNS switching.';
-    $('rgPolicyMessage').textContent=detail;
-  }
-  function openPolicyReview(){
-    const cfg=state.config,p=cfg?.policy;
-    if(state.configBusy||!state.configFresh||!p?.reviewable||!(/^[0-9a-f]{64}$/.test(p.fingerprint||'')))return;
-    const items=(id,arr)=>{$(id).innerHTML=arr.length?arr.map(x=>'<li>'+esc(x)+'</li>').join(''):'<li>None configured</li>';};
-    const preferred=Array.isArray(p.preferred)?p.preferred:[];
-    const backups=Array.isArray(cfg.backups)?cfg.backups:[];
-    const checks=Array.isArray(p.checks)?p.checks:[];
-    items('rgPolicyPreferred',preferred.map(x=>x.id+' · '+x.ip+':'+x.port+' · '+x.tls));
-    items('rgPolicyAlternates',backups.map(x=>x.id+' · '+x.ip+':'+x.port+' · '+x.tls));
-    // WAN-derived alternate groups are also considered by the router's
-    // approval validator, so do not misrepresent this list as exhaustive.
-    $('rgPolicyAlternates').insertAdjacentHTML('beforeend','<li>WAN-derived provider groups: router validates eligibility during approval</li>');
-    items('rgPolicyChecks',checks.map(x=>x.name+' · '+x.type+' · '+x.rcode+' · minimum '+x.minAnswers+' answers'+(x.expected?' · expected '+x.expected:'')));
-    items('rgPolicyThresholds',['Failure threshold: '+cfg.settings.FAIL_THRESHOLD,'Recovery threshold: '+cfg.settings.RECOVERY_THRESHOLD,
-      'Schedule interval: '+cfg.settings.SCHEDULE_INTERVAL_MINUTES+' minutes','Fast confirmation: '+cfg.settings.FAST_CONFIRM_SECONDS+' seconds',
-      'Probe timeout: '+cfg.settings.TIMEOUT_SECONDS+' seconds','Startup warmup: '+cfg.settings.BOOT_MIN_UPTIME_SECONDS+' seconds']);
-    $('rgPolicySafetyNotice').textContent=p.automaticMarker?
-      'CAUTION: An automatic-failover marker already exists. Approving this policy can immediately restore unattended switching after the router verifies its safety conditions.':
-      'Approval alone will NOT enable automatic failover. Enable it separately when ready; monitoring is a separate control.';
-    $('rgPolicySafetyNotice').className=p.automaticMarker?'rg-policy-line rg-policy-alert':'rg-policy-line';
-    $('rgPolicyRaw').textContent='WAN DoT list: '+(p.preferredRulelist||'Unavailable')+'\nStubby config: '+(p.stubbyConfig||'Unknown')+'\nTrusted CA file: '+(p.caFile||'Unknown');
-    $('rgPolicyFingerprint').textContent='Policy fingerprint (SHA-256): '+p.fingerprint;
-    state.policyReviewFingerprint=p.fingerprint;
-    $('rgPolicyPanel').hidden=false;
-    $('rgPolicyConsent').checked=false;
-    $('rgPolicyFeedback').textContent='';
-    syncConfigControls();
-  }
-  async function submitPolicyApproval(){
-    const reviewed=state.policyReviewFingerprint;
-    if(!reviewed||!$('rgPolicyConsent').checked||state.configBusy||!state.configFresh||
-       state.config?.policy?.fingerprint!==reviewed)return;
-    // The checksum is not an authorization on its own: the firmware service
-    // action checks approval prerequisites, policy identity and safety locks.
-    const reenable=state.config.policy.automaticMarker;
-    if(!confirm(reenable?
-      'Approve the reviewed DNS policy? An existing failover authorization marker may cause automatic WAN switching to resume immediately.':
-      'Approve this DNS policy? This authorizes future automatic WAN switching, but does not enable failover by itself.'))return;
-    closePolicyReview();
-    await applyConfig(['policy-approve',reviewed]);
-  }
   function renderSettings(){
     const cfg=state.config;if(!cfg)return;
-    renderPolicySummary();
     const script=cfg.script||{};
     $('scriptInstalled').textContent=script.version?'v'+script.version+(script.channel==='development'?'_'+script.build:''):'Unavailable';
     $('scriptChannel').textContent=script.channel||'Unknown';
     renderSettingsSummary();
-    closePolicyReview(); // A refreshed policy snapshot invalidates an open review.
     closeSettingHelp(); // A refreshed snapshot replaces the setting buttons.
     $('settingsRows').innerHTML=Object.entries(settingsDefs).map(([key,[title,options]])=>{
       const val=Number(cfg.settings?.[key]||0),list=options.length>2||['SCHEDULE_INTERVAL_MINUTES','SYSLOG_HEALTH_INTERVAL_MINUTES'].includes(key);
@@ -1693,10 +1599,6 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
       try{if(window.parent!==window&&typeof window.parent.rgFinishConfiguration==='function')window.parent.rgFinishConfiguration();}catch(e){}
     }
   }
-  $('rgPolicyReview').addEventListener('click',openPolicyReview);
-  $('rgPolicyCancel').addEventListener('click',closePolicyReview);
-  $('rgPolicyConsent').addEventListener('change',syncConfigControls);
-  $('rgPolicyApprove').addEventListener('click',submitPolicyApproval);
   $('scriptCheck').addEventListener('click',()=>scriptUpdate('script-check'));
   $('scriptInstall').addEventListener('click',()=>scriptUpdate('script-install'));
   $('scriptReload').addEventListener('click',()=>window.parent.location.reload());
