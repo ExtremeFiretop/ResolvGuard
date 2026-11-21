@@ -371,6 +371,20 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
 /* ResolvGuard settings and backup resolver controls */
 .rg-script-info{display:flex;flex-wrap:wrap;gap:24px}.rg-script-info div{display:flex;flex-direction:column;gap:3px}.rg-script-info strong{font-size:14px}#scriptUpdateFeedback.error{color:var(--red)}#scriptUpdateFeedback.success{color:var(--green)}#scriptInstall[hidden],#scriptReload[hidden]{display:none!important}
 .rg-config-note{margin:2px 0 0;line-height:1.65}.rg-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:13px 17px}.rg-fields label,.rg-setting-row label{font-size:12px;font-weight:700;color:#b5ced2;display:flex;flex-direction:column;gap:6px}.rg-input{width:100%;font:inherit;color:#ecf7f3;background:#0d1d25;border:1px solid #385660;border-radius:9px;padding:10px;min-width:0}.rg-input:focus-visible{outline:2px solid var(--green);outline-offset:1px}.rg-input:disabled{opacity:.6}.rg-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:16px}.rg-divider{border-top:1px solid var(--line);margin:20px 0}.rg-backup-row,.rg-setting-row{padding:14px 18px;border-bottom:1px solid #243c44;display:flex;align-items:center;justify-content:space-between;gap:15px}.rg-backup-row:last-child,.rg-setting-row:last-child{border-bottom:0}.rg-backup-info strong{font-size:13px;display:block}.rg-backup-info small{color:var(--sub);display:block;overflow-wrap:anywhere;margin-top:5px}.rg-setting-row .rg-control{display:flex;align-items:center;gap:9px}.rg-setting-row .rg-input{width:110px}.rg-configuration-status{position:sticky;bottom:10px;z-index:50;padding:13px 16px;margin-top:14px;border:1px solid #3c7260;border-radius:10px;background:#17352f;color:#c4ffe5;box-shadow:0 10px 22px #0006}.rg-configuration-status.error{border-color:#8d5a53;background:#3c2426;color:#ffd1c6}.rg-configuration-status[hidden]{display:none!important}@media(max-width:820px){.rg-fields{grid-template-columns:1fr}.rg-backup-row,.rg-setting-row{align-items:flex-start;flex-direction:column}.rg-setting-row .rg-control{width:100%}}
+
+/* Settings help: the bubble is mounted outside cards so no ancestor clips it. */
+.rg-setting-label-group{display:flex;align-items:center;gap:8px;min-width:0}
+.rg-setting-label-group label{cursor:help;min-width:0}
+.rg-help-trigger{flex:0 0 20px;width:20px;height:20px;display:inline-flex;align-items:center;justify-content:center;padding:0;border:1px solid #56847d;border-radius:50%;background:#1a3b3c;color:#bcefe2;font-size:12px;font-family:inherit;font-weight:800;line-height:1;cursor:help}
+.rg-help-trigger:hover,.rg-help-trigger:focus-visible{background:#315e54;border-color:#8aebc0;color:#fff;outline:2px solid transparent;box-shadow:0 0 0 2px #8aebc078}
+.rg-help-trigger[aria-expanded="true"]{background:#315e54;border-color:#8aebc0}
+.rg-settings-tooltip{position:fixed;z-index:1000;width:min(340px,calc(100vw - 24px));box-sizing:border-box;background:#193138;border:1px solid #689e93;border-radius:11px;box-shadow:0 14px 32px #000a;padding:14px 16px;color:#e8f5f1;font-size:12px;line-height:1.55;pointer-events:none}
+.rg-settings-tooltip[hidden]{display:none!important}
+.rg-settings-tooltip strong{display:block;color:#d4fff0;font-size:13px;margin-bottom:7px}
+.rg-settings-tooltip p{margin:0 0 8px}
+.rg-settings-tooltip .rg-tip-effect{color:#b7d3d2}
+.rg-settings-tooltip .rg-tip-caution{color:#f0c69c;border-top:1px solid #426267;padding-top:8px;margin-top:9px}
+@media(max-width:820px){.rg-setting-label-group{width:100%;justify-content:flex-start}}
 /* The Unbound scope notice appears only in recursive mode. Give the History
    toolbar breathing room without changing spacing when the notice is hidden. */
 #unboundHistoryNotice:not(.hidden) { margin-bottom:16px; }
@@ -496,6 +510,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
   <footer class="footer"><span>ResolvGuard dashboard · By ExtremeFiretop</span><span>Heartbeat follows completed scheduled cycles · History stored in /tmp</span></footer>
 </main>
 </div>
+<div id="rgSettingTooltip" class="rg-settings-tooltip" role="tooltip" hidden><strong id="rgTipTitle"></strong><p id="rgTipSummary"></p><p class="rg-tip-effect" id="rgTipEffect"></p><div class="rg-tip-caution" id="rgTipCaution"></div></div>
 <div id="inspectBackdrop" class="inspector-backdrop" tabindex="-1"></div>
 <aside class="inspector" id="inspector" aria-label="Resolver details" aria-hidden="true" role="dialog" aria-modal="true"><button id="inspectorClose" class="inspector-close" aria-label="Close">×</button><div class="eyebrow">Resolver inspector</div><div id="inspectContent"></div></aside>
 <script>
@@ -1044,7 +1059,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     }
   }
   function closeInspector(){$('inspectBackdrop').classList.remove('open');$('inspector').classList.remove('open');$('inspector').setAttribute('aria-hidden','true');}
-  function tab(name){state.tab=name;waveform.setVisible(name==='overview');syncWaveSignal(state.snapshot,state.feedConnected);document.querySelectorAll('[data-tab]').forEach(el=>{const active=el.dataset.tab===name;el.classList.toggle('active',active);});document.querySelectorAll('.tab').forEach(el=>el.classList.toggle('active',el.id===name));const m={overview:['Dashboard overview','Your DNS reliability, clearly visible.'],history:['Health history','Observed DNS reliability'],paths:['DNS paths & exceptions','Inspect production routing, and scoped bypasses.'],backups:['Backup & alternate resolvers','Manage ResolvGuard backup DoT endpoints.'],settings:['ResolvGuard settings','Configure monitoring thresholds and timing using TLS authentication.']}[name];$('pageTitle').textContent=m[0];$('pageDesc').textContent=m[1];if(name==='history')renderHistory();if(name==='paths')renderPaths();if(name==='settings'||name==='backups')loadConfig();}
+  function tab(name){closeSettingHelp();state.tab=name;waveform.setVisible(name==='overview');syncWaveSignal(state.snapshot,state.feedConnected);document.querySelectorAll('[data-tab]').forEach(el=>{const active=el.dataset.tab===name;el.classList.toggle('active',active);});document.querySelectorAll('.tab').forEach(el=>el.classList.toggle('active',el.id===name));const m={overview:['Dashboard overview','Your DNS reliability, clearly visible.'],history:['Health history','Observed DNS reliability'],paths:['DNS paths & exceptions','Inspect production routing, and scoped bypasses.'],backups:['Backup & alternate resolvers','Manage ResolvGuard backup DoT endpoints.'],settings:['ResolvGuard settings','Configure monitoring thresholds and timing using TLS authentication.']}[name];$('pageTitle').textContent=m[0];$('pageDesc').textContent=m[1];if(name==='history')renderHistory();if(name==='paths')renderPaths();if(name==='settings'||name==='backups')loadConfig();}
   async function load(url){const response=await fetch(url+'?t='+Date.now(),{cache:'no-store',credentials:'same-origin'});if(!response.ok)throw Error('HTTP '+response.status);const d=JSON.parse(await response.text());if(d.schema!==1)throw Error('Unsupported feed schema');return d;}
   async function refresh(){if(state.polling)return;state.polling=true;try{
       const d=await load('/ext/ResolvGuard/status.htm');
@@ -1200,12 +1215,108 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     BOOT_MIN_UPTIME_SECONDS:['Startup warmup (seconds)',[0,3600]],
     SYSLOG_HEALTH_INTERVAL_MINUTES:['Healthy syslog interval (minutes)',[0,15,30,60]]
   };
+  // Settings help is informational only. It never calls configuration actions,
+  // probes DNS, or changes the policy approval. Keep descriptions aligned with
+  // the shell's actual monitoring/switching semantics.
+  const settingHelp={
+    SCHEDULE_INTERVAL_MINUTES:[
+      'How often recurring DNS health checks run while monitoring is enabled.',
+      'A shorter interval detects problems sooner but performs more DNS probes. The cron schedule is updated when the setting is applied.',
+      'Changing this value does not enable monitoring or authorize automatic switching.'
+    ],
+    FAST_CONFIRM_SECONDS:[
+      'How long to wait before rechecking an observed failure during a scheduled cycle.',
+      'With a value above zero, ResolvGuard makes an extra observation after the delay. Zero disables the delayed recheck; resolver exclusion still requires two independent observations.',
+      'Fast confirmation above zero requires a failure threshold of at least 2.'
+    ],
+    FAIL_THRESHOLD:[
+      'The number of failed evaluations needed before considering automatic failover.',
+      'A larger number is more conservative. A fast confirmation can supply another failed evaluation in the same scheduled cycle.',
+      'Switching still requires verified resolver failures, a healthy alternative, and valid authorization.'
+    ],
+    RECOVERY_THRESHOLD:[
+      'How many successful preferred-pool evaluations are needed before automatic recovery.',
+      'When an alternate pool is active, ResolvGuard also tests the preferred pool. A larger value delays switching back to preferred.',
+      'A successful check alone does not override a policy safety hold or authorize switching.'
+    ],
+    TIMEOUT_SECONDS:[
+      'Maximum wait for each DNS query issued by ResolvGuard health checks.',
+      'A longer timeout tolerates slow responses but can make checks take longer. A shorter timeout may classify slow resolvers as failed.',
+      'This does not change the timeout of normal LAN client DNS requests.'
+    ],
+    BOOT_MIN_UPTIME_SECONDS:[
+      'Minimum router uptime before scheduled DNS checks are allowed after boot.',
+      'During warmup, scheduled checks skip; ResolvGuard also requires a ready clock/NTP and connected WAN.',
+      'Zero skips only the minimum-uptime delay, not the NTP/WAN readiness checks.'
+    ],
+    SYSLOG_HEALTH_INTERVAL_MINUTES:[
+      'How often to log a healthy preferred-pool heartbeat to the router syslog.',
+      'Choose 15, 30, or 60 minutes to periodically log healthy results; 0 disables these extra healthy syslog messages.',
+      'This is separate from WebUI heartbeat animations and does not change the monitoring schedule.'
+    ]
+  };
+  let activeHelpTrigger=null,helpPinned=false;
+  const helpBubble=$('rgSettingTooltip');
+  function closeSettingHelp(){
+    if(activeHelpTrigger)activeHelpTrigger.setAttribute('aria-expanded','false');
+    activeHelpTrigger=null;helpPinned=false;helpBubble.hidden=true;
+  }
+  function positionSettingHelp(){
+    if(!activeHelpTrigger||helpBubble.hidden)return;
+    const b=activeHelpTrigger.getBoundingClientRect(),margin=12;
+    // Keep the entire tooltip inside the embedded WebUI viewport.
+    const width=helpBubble.getBoundingClientRect().width;
+    const height=helpBubble.getBoundingClientRect().height;
+    const left=Math.max(margin,Math.min(window.innerWidth-margin-width,b.left+b.width/2-width/2));
+    const below=b.bottom+9,above=b.top-height-9;
+    const top=below+height>window.innerHeight-margin&&above>=margin?above:
+      Math.max(margin,Math.min(window.innerHeight-margin-height,below));
+    helpBubble.style.left=left+'px';helpBubble.style.top=top+'px';
+  }
+  function showSettingHelp(group,pin){
+    const trigger=group&&group.querySelector('.rg-help-trigger');
+    if(!trigger)return;
+    const help=settingHelp[trigger.dataset.help];if(!help)return;
+    if(activeHelpTrigger&&activeHelpTrigger!==trigger)activeHelpTrigger.setAttribute('aria-expanded','false');
+    activeHelpTrigger=trigger;helpPinned=!!pin;
+    $('rgTipTitle').textContent=settingsDefs[trigger.dataset.help][0];
+    $('rgTipSummary').textContent=help[0];
+    $('rgTipEffect').textContent=help[1];
+    $('rgTipCaution').textContent=help[2];
+    helpBubble.hidden=false;trigger.setAttribute('aria-expanded','true');
+    positionSettingHelp();
+  }
+  document.addEventListener('mouseover',e=>{
+    const group=e.target.closest('.rg-setting-label-group');
+    if(group&&!group.contains(e.relatedTarget)&&!helpPinned)showSettingHelp(group,false);
+  });
+  document.addEventListener('mouseout',e=>{
+    const group=e.target.closest('.rg-setting-label-group');
+    if(group&&!group.contains(e.relatedTarget)&&!helpPinned)closeSettingHelp();
+  });
+  document.addEventListener('focusin',e=>{
+    if(e.target.matches('.rg-help-trigger')&&!helpPinned)showSettingHelp(e.target.closest('.rg-setting-label-group'),false);
+  });
+  document.addEventListener('focusout',e=>{
+    if(e.target.matches('.rg-help-trigger')&&!helpPinned)closeSettingHelp();
+  });
+  document.addEventListener('click',e=>{
+    const trigger=e.target.closest('.rg-help-trigger');
+    if(trigger){
+      e.preventDefault();e.stopPropagation();
+      if(trigger===activeHelpTrigger&&helpPinned)closeSettingHelp();
+      else showSettingHelp(trigger.closest('.rg-setting-label-group'),true);
+    }else if(helpPinned)closeSettingHelp();
+  });
+  document.addEventListener('keydown',e=>{if(e.key==='Escape')closeSettingHelp();});
+  window.addEventListener('resize',positionSettingHelp);
+  document.addEventListener('scroll',positionSettingHelp,true);
   function configNotice(msg,isError=false){const e=$('configFeedback');e.hidden=false;e.textContent=msg;e.classList.toggle('error',isError);}
   // Loading a read-only snapshot must not mark the UI as performing a write.
   // Otherwise the first load leaves every configuration button disabled.
   function syncConfigControls(){
     const disabled=state.configBusy||state.configLoading||!state.config||!state.configFresh;
-    document.querySelectorAll('#backups button,#settingsRows button').forEach(e=>e.disabled=disabled);
+    document.querySelectorAll('#backups button,#settingsRows .rg-save-setting').forEach(e=>e.disabled=disabled);
     $('scriptCheck').disabled=disabled;
     $('scriptInstall').disabled=disabled||state.updateBusy||!state.updateAvailable;
   }
@@ -1226,11 +1337,12 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     $('scriptInstalled').textContent=script.version?'v'+script.version+(script.channel==='development'?'_'+script.build:''):'Unavailable';
     $('scriptChannel').textContent=script.channel||'Unknown';
     renderSettingsSummary();
+    closeSettingHelp(); // A refreshed snapshot replaces the setting buttons.
     $('settingsRows').innerHTML=Object.entries(settingsDefs).map(([key,[title,options]])=>{
       const val=Number(cfg.settings?.[key]||0),list=options.length>2||['SCHEDULE_INTERVAL_MINUTES','SYSLOG_HEALTH_INTERVAL_MINUTES'].includes(key);
       const input=list?`<select class="rg-input" id="s_${key}">${options.map(n=>`<option value="${n}"${n===val?' selected':''}>${n}</option>`).join('')}</select>`:
         `<input class="rg-input" type="number" id="s_${key}" min="${options[0]}" max="${options[1]}" step="1" value="${val}">`;
-      return `<div class="rg-setting-row"><label for="s_${key}">${esc(title)}</label><div class="rg-control">${input}<button type="button" class="btn rg-save-setting" data-setting="${key}"${state.configBusy?' disabled':''}>Apply</button></div></div>`;
+      return `<div class="rg-setting-row"><div class="rg-setting-label-group"><label for="s_${key}">${esc(title)}</label><button type="button" class="rg-help-trigger" data-help="${key}" aria-label="Explain ${esc(title)}" aria-controls="rgSettingTooltip" aria-expanded="false" aria-describedby="rgSettingTooltip">?</button></div><div class="rg-control">${input}<button type="button" class="btn rg-save-setting" data-setting="${key}"${state.configBusy?' disabled':''}>Apply</button></div></div>`;
     }).join('');
   }
   function resetBackup(){state.editingBackupId='';$('backupId').disabled=false;for(const id of ['backupId','backupIp','backupTls'])$(id).value='';$('backupPort').value='853';$('backupMode').textContent='Add new resolver';$('backupSave').textContent='Save resolver';}
