@@ -417,7 +417,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     <div class="note hidden" id="unboundOverviewNotice" role="status" style="margin-top:12px"><strong>Recursive Unbound currently handles LAN DNS.</strong> ResolvGuard's DoT checks are separate, and WAN failover is disabled in recursive mode. To use ResolvGuard's DoT failover, select Unbound Manager's <strong>Integrate with Stubby</strong> option.</div>
     <div class="section-head"><h3 id="overviewMetricsHeading">Network health at a glance</h3><div class="hint">Scheduled monitoring · Manual checks are independent</div></div>
     <div class="stats">
-      <div class="stat"><div class="stat-label">Preferred resolvers</div><div class="stat-val green" id="statResolvers">—</div><div class="stat-sub" id="statResolversSub">Reachable and policy-compliant</div></div>
+      <div class="stat"><div class="stat-label" id="statResolversLabel">Preferred resolvers</div><div class="stat-val green" id="statResolvers">—</div><div class="stat-sub" id="statResolversSub">Reachable and policy-compliant</div></div>
       <div class="stat"><div class="stat-label" id="statPoliciesLabel">DNS probe results</div><div class="stat-val" id="statPolicies">—</div><div class="stat-sub" id="statPoliciesDescription">Passed / total attempts · latest cycle</div></div>
       <div class="stat"><div class="stat-label" id="statPoolLabel">Active production pool</div><div class="stat-val" id="statPool" style="font-size:23px">unknown</div><div class="stat-sub" id="statPoolSub">WAN DNS configuration</div></div>
       <div class="stat"><div class="stat-label">Next scheduled cycle</div><div class="stat-val" id="statCountdown">—</div><div class="stat-sub" id="statSeq">No completed check yet</div></div>
@@ -429,7 +429,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
       <div class="card-pad" style="padding-top:10px"><div class="note">Active membership comes from the verified production WAN DNS rulelist. PASS/FAIL refers to direct authenticated DNS observations in the latest completed cycle, not individual LAN query routing.</div></div>
     </div>
     <div class="two-col">
-      <div class="card"><div class="card-head"><div><div class="card-title">Preferred DNS resolvers</div><div class="card-sub">Tap a resolver for authentication and policy details</div></div><div class="small-pill" id="preferredCount">— healthy</div></div><div id="resolverList"></div><div class="card-pad" style="padding-top:10px"><div class="note" id="resolverScopeNote">These are <strong>direct authenticated DoT probes</strong>. Production LAN DNS still uses DNSMasq → Stubby by default.</div></div></div>
+      <div class="card"><div class="card-head"><div><div class="card-title" id="preferredResolversTitle">Preferred DNS resolvers</div><div class="card-sub">Tap a resolver for authentication and policy details</div></div><div class="small-pill" id="preferredCount">— healthy</div></div><div id="resolverList"></div><div class="card-pad" style="padding-top:10px"><div class="note" id="resolverScopeNote">These are <strong>direct authenticated DoT probes</strong>. Production LAN DNS still uses DNSMasq → Stubby by default.</div></div></div>
       <div class="card"><div class="card-head"><div><div class="card-title">Recent activity</div><div class="card-sub" id="recentActivityDescription">Actual completed failover and recovery events</div></div><button class="text-link" data-tab="history">All events →</button></div><div class="feed" id="eventFeed"></div></div>
     </div>
     <div class="section-head"><h3>Quick reliability history</h3><span class="hint">Last 24 hours · 30-minute segments · live check counts</span></div>
@@ -778,6 +778,8 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     const inactive=d?.mode==='inactive',historical=inactive||!d||isStale(d);
     const recoveryAlert=!!(d?.pendingTransaction||d?.recoveryHold);
     const recursive=recursiveUnbound(d);
+    $('statResolversLabel').textContent=recursive?'Preferred WAN DoT resolvers':'Preferred resolvers';
+    $('preferredResolversTitle').textContent=recursive?'Preferred WAN DoT resolvers':'Preferred DNS resolvers';
     $('unboundOverviewNotice').classList.toggle('hidden',!recursive);
     $('overviewMetricsHeading').textContent=historical?'Last recorded DNS results':recursive?'External DoT checks at a glance':'Network health at a glance';
     $('resolverViewHeading').textContent=historical?'Last recorded resolver results':'Live resolver view';

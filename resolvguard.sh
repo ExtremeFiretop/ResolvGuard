@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.2
-readonly SCRIPT_VERSTAG="26112105"
+readonly SCRIPT_VERSTAG="26112106"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -7837,11 +7837,17 @@ _ShowQuickStatus_() {
 }
 
 _ConfigureQuickBackup_() {
-  local selected name ip1 ip2 host proposed staged
+  local selected name ip1 ip2 host proposed staged recursive_unbound
+  recursive_unbound=0
+  if _RecursiveUnboundProduction_; then recursive_unbound=1; fi
   _PrepareProviders_ && _PrepareResolverPools_ || return 1
   if awk -F'|' '$1 ~ /^(backup|wanpool)[0-9]+$/ {found=1} END{exit !found}' "$POOLS"; then
     _ShowSetupStep_ 2 'ALTERNATE DNS POOLS'
     printf '  %sConfigured alternate pools: %s%s\n' "$RG_GREEN" "$(_DescribeAlternatePools_)" "$RG_RESET"
+    if [ "$recursive_unbound" -eq 1 ]; then
+      _Say_ '  Recursive Unbound: saved WAN DoT backups will not activate automatically.'
+      _Say_ '  Monitoring Only does not change Unbound or its routing.'
+    fi
     return 0
   fi
   if awk -F'|' '$1 !~ /^#/ && $1!="" {found=1} END{exit !found}' "$EXTRA_PROVIDERS"; then
@@ -7850,6 +7856,10 @@ _ConfigureQuickBackup_() {
   fi
   while :; do
     _ShowSetupStep_ 2 'BACKUP DNS'
+    if [ "$recursive_unbound" -eq 1 ]; then
+      _Say_ '  Recursive Unbound: backups are saved for WAN DoT, not Unbound.'
+      _Say_ '  Monitoring Only will not activate these backups automatically.'
+    fi
     _PrintBackupPresetChoices_
     if awk -F'|' '$1 ~ /^wan[0-9]+$/ && $3=="dns.google" {found=1} END{exit !found}' "$PREF_PROVIDERS"; then
       proposed=cs
@@ -7944,7 +7954,14 @@ _RunQuickSetupWizard_() {
     printf '  %sCurrent router DNS (Strict DoT):%s\n' "$RG_BOLD" "$RG_RESET"
     awk -F'|' -v col="$RG_CYAN" -v reset="$RG_RESET" \
       '$1 ~ /^wan[0-9]+$/ {printf "    %s%-39s%s %s\n",col,$2,reset,$3}' "$PROVIDERS"
-    _ConfirmYesNo_ 'Use ALL these as preferred DNS (and restore point)?' || return 1
+    _Say_ '  Enrollment saves these existing WAN DoT resolvers as a restore point.'
+    _Say_ '  It does NOT change ASUS WAN DNS, Unbound, or DNS routing.'
+    if _RecursiveUnboundProduction_; then
+      _Say_ '  Recursive Unbound uses a separate DNS path, not this WAN DoT pool.'
+      _ConfirmYesNo_ 'Save as preferred WAN DoT monitoring pool?' || return 1
+    else
+      _ConfirmYesNo_ 'Save as preferred WAN DoT pool?' || return 1
+    fi
     _EnrollPreferredDNS_ >/dev/null || return 1
     printf '  %sPreferred DNS saved.%s\n' "$RG_GREEN" "$RG_RESET"
   else
