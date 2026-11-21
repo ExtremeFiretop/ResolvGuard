@@ -25,7 +25,7 @@ readonly SCRIPT_VERSTAG="26112104"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
-SCRIPT_BRANCH="master"
+SCRIPT_BRANCH="dev"
 
 # Run install from a staged download, or from the final script path. A normal
 # first launch uses the same installation path before opening the SSH menu.
