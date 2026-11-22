@@ -3,7 +3,7 @@
 # ResolvGuard.sh
 #
 # Project Created: 2026-Oct-29 by @ExtremeFiretop
-# Last Modified: 2026-Nov-21
+# Last Modified: 2026-Nov-22
 #
 # ResolvGuard™
 # Official project: https://github.com/ExtremeFiretop/ResolvGuard
@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.3
-readonly SCRIPT_VERSTAG="26112114"
+readonly SCRIPT_VERSTAG="26112202"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -70,6 +70,64 @@ STUBBY=/usr/sbin/stubby
 # Firmware-local DNSMasq forwarding files. Internal constants, not user policy.
 DNSMASQ_SERVERS=/tmp/resolv.dnsmasq
 DNSMASQ_MAIN=/etc/dnsmasq.conf
+
+# ResolvGuard manages the *gateway's* WAN Strict DoT and Stubby service, not
+# the DNS forwarding performed by an AiMesh satellite. Firmware re_mode=1 is
+# the authoritative AiMesh-node signal; sw_mode=1 requires router operation.
+# Do not treat a stopped Stubby daemon as a node, or cfg_master=0 by itself as
+# proof of one (standalone routers may have no active AiMesh controller).
+# Keep this guard above configuration initialization: unsupported installs
+# must not create files, Entware packages, hooks, cron jobs or WAN state.
+_RequireGatewayRole_() {
+  local mode mesh
+  if ! mode="$(nvram get sw_mode 2>/dev/null)" ||
+     ! mesh="$(nvram get re_mode 2>/dev/null)"; then
+    printf '%s\n' 'ERROR: Cannot read ASUS router role; refusing ResolvGuard operation.' >&2
+    return 1
+  fi
+  case "$mesh" in
+    1)
+      printf '%s\n' 'ERROR: ResolvGuard does not support AiMesh nodes (re_mode=1). Install it on the primary WAN router.' >&2
+      return 1 ;;
+    ''|0) : ;;
+    *)
+      printf 'ERROR: Unknown ASUS AiMesh role (re_mode=%s); refusing ResolvGuard operation.\n' "$mesh" >&2
+      return 1 ;;
+  esac
+  case "$mode" in
+    1) return 0 ;;
+    3)
+      printf '%s\n' 'ERROR: ResolvGuard requires router mode; access points and AiMesh nodes are unsupported (sw_mode=3).' >&2 ;;
+    ''|*[!0-9]*)
+      printf '%s\n' 'ERROR: ASUS router operation mode is unknown; refusing ResolvGuard operation.' >&2 ;;
+    *)
+      printf 'ERROR: Unsupported ASUS operation mode (sw_mode=%s); ResolvGuard requires the primary WAN router.\n' "$mode" >&2 ;;
+  esac
+  return 1
+}
+
+# Fast, side-effect-free admission before any configuration or dependency work.
+# Existing node installations may still read status/help, and AMTM retains its
+# offline probe; uninstall is intentionally refused rather than discarding
+# enrolled WAN/recovery state while this device no longer owns gateway DNS.
+case "$_RG_COMMAND" in
+  help|-h|--help) : ;;
+  status)
+    _RequireGatewayRole_ || {
+      printf '%s\n' 'ResolvGuard status: INACTIVE (unsupported router role; no DNS operations performed).'
+      exit 0
+    } ;;
+  amtmupdate)
+    [ "${2:-update}" = check ] || _RequireGatewayRole_ || exit 2 ;;
+  startup|scheduled-check)
+    _RequireGatewayRole_ || { printf '%s\n' 'SKIP: unsupported router role; no ResolvGuard monitoring or WAN changes.'; exit 0; } ;;
+  schedule)
+    [ "${2:-status}" = disable ] || _RequireGatewayRole_ || exit 2 ;;
+  policy)
+    [ "${2:-status}" = revoke ] || _RequireGatewayRole_ || exit 2 ;;
+  webui) _RequireGatewayRole_ || exit 2 ;;
+  *) _RequireGatewayRole_ || exit 2 ;;
+esac
 
 # Choose the firmware's active production Stubby YAML when initializing a new
 # installation. 3006 may use stubby-0.yml, while 3004 commonly uses stubby.yml.
@@ -2662,6 +2720,7 @@ _VerifyUnboundStubbyListeners_() {
 }
 
 _CheckLiveSwitchSafety_() {
+  _RequireGatewayRole_ || return 1
   if _RecursiveUnboundProduction_; then
     _Fail_ 'WAN failover disabled in recursive Unbound mode; use Unbound Manager Integrate with Stubby'
     return 1
@@ -3405,6 +3464,7 @@ _CleanupSwitchConfigLock_() {
 
 _SwitchDNSPool_() (
   local old new reason prev desired actual verified
+  _RequireGatewayRole_ || return 1
   # Config commits may run during read-only probes, but not during WAN writes.
   # A maintenance caller can already own CONFIG_LOCK while holding WAN_LOCK.
   RG_SWITCH_CONFIG_LOCK_OWNED=0
@@ -3470,6 +3530,9 @@ _SwitchDNSPool_() (
         rm -f "$ACTIVE_POOL.new.$$" "$ACTIVE_RULELIST.new.$$"; return 1;
       }
   fi
+  # Recheck immediately before journaling a new WAN write. Never create a
+  # pending transaction if this device has become an AiMesh node meanwhile.
+  _RequireGatewayRole_ || return 1
   # Journal the old and new rulelists before WAN changes.
   if ! _WriteSwitchIntent_ "$old" "$new" "$prev" "$desired"; then
     rm -f "$ACTIVE_POOL.new.$$" "$ACTIVE_RULELIST.new.$$"
@@ -4280,6 +4343,7 @@ _TransactionRulelistMatchesPool_() {
 # Restore only a previously enrolled preferred configuration; never overwrite an
 # unknown GUI/NVRAM change. Interrupted transaction evidence remains on failures.
 _RestorePreferredDNSLocked_() {
+  _RequireGatewayRole_ || return 1
   local current preferred source target from_pool to_pool tracked part
   [ -s "$PREF_RULELIST" ] && [ ! -L "$PREF_RULELIST" ] || {
     _Fail_ 'Preferred DNS snapshot unavailable'; return 1; }
@@ -4444,6 +4508,7 @@ _GetScheduleJobCommand_() {
 
 _RegisterScheduleCron_() {
   local logfile cron_list
+  _RequireGatewayRole_ || return 1
   # Cron opens redirected stdout before the script's own umask executes.
   logfile="$RUNTIME/scheduled.log"
   [ ! -L "$logfile" ] && { [ ! -e "$logfile" ] || [ -f "$logfile" ]; } || {
@@ -4570,6 +4635,7 @@ _AllowMonitoringOnlyWithoutLANForwarding_() {
 
 _EnableScheduledMonitoring_() {
   local staged unattended success_output
+  _RequireGatewayRole_ || return 1
   unattended="${1:-ask}"
   success_output="${2:-verbose}"
   [ "$ROOT" = "$INSTALL_ROOT" ] || { _Fail_ 'Enable scheduler only from installed add-on directory'; return 1; }
@@ -4629,6 +4695,7 @@ _EnableScheduledMonitoring_() {
 
 _EnableAutomaticFailover_() {
   local approval_status staged view
+  _RequireGatewayRole_ || return 1
   view="${1:-detail}"
   if _RecursiveUnboundProduction_; then
     _Fail_ 'WAN failover is disabled in recursive Unbound mode. Use Monitoring Only or enable Unbound Manager Integrate with Stubby.'
@@ -4777,6 +4844,7 @@ _WriteBootReport_() {
 
 _ReconcileBootState_() {
   local current preferred tracked expected source target from_pool to_pool part readiness_mode success_output
+  _RequireGatewayRole_ || return 1
   success_output="${1:-verbose}"
   [ -r "$PREF_RULELIST" ] || { _Say_ 'BOOT: not enrolled; no changes'; return 1; }
   if [ -e "$WAN_LOCK" ]; then
@@ -6081,6 +6149,7 @@ EOF_UNBOUND
 )
 # RESOLVGUARD WEBUI INLINE END
 _ScheduleStartup_() {
+  _RequireGatewayRole_ || { _Say_ 'SKIP: unsupported router role; startup registration disabled.'; return 0; }
   # Background migration/registration even on legacy script-only upgrades.
   # Retry while boot is bringing up networking and /www, never block DNS recovery.
   (
@@ -6140,6 +6209,7 @@ _ReportScheduledSwitchingMode_() {
 
 _RunScheduledCheck_() {
   local outcome
+  _RequireGatewayRole_ || { _Say_ 'SKIP: unsupported router role; no DNS checks or switching.'; return 0; }
   [ -r "$SCHEDULE_MARKER" ] || { _Say_ 'SKIP: monitoring schedule not enabled'; return 0; }
   if _MaintenancePriorityPending_; then
     _Say_ 'SKIP: interactive DNS maintenance has priority; scheduled check deferred.'
@@ -7024,6 +7094,7 @@ _ReadReleaseManifest_() {
 }
 
 _UpdateSafetyPreflight_() {
+  _RequireGatewayRole_ || return 1
   _IsInstallationComplete_ || {
     _Fail_ 'ResolvGuard installation has not completed'; return 1;
   }
