@@ -3,7 +3,7 @@
 # ResolvGuard.sh
 #
 # Project Created: 2026-Oct-29 by @ExtremeFiretop
-# Last Modified: 2026-Nov-15
+# Last Modified: 2026-Nov-22
 #
 # ResolvGuard™
 # Official project: https://github.com/ExtremeFiretop/ResolvGuard
@@ -20,12 +20,12 @@ CONFIG_SCHEMA=5
 set -u
 
 ## Set version for each Production Release ##
-readonly SCRIPT_VERSION=0.2.2
-readonly SCRIPT_VERSTAG="26112104"
+readonly SCRIPT_VERSION=0.2.3
+readonly SCRIPT_VERSTAG="26112207"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
-SCRIPT_BRANCH="master"
+SCRIPT_BRANCH="dev"
 
 # Run install from a staged download, or from the final script path. A normal
 # first launch uses the same installation path before opening the SSH menu.
@@ -70,6 +70,64 @@ STUBBY=/usr/sbin/stubby
 # Firmware-local DNSMasq forwarding files. Internal constants, not user policy.
 DNSMASQ_SERVERS=/tmp/resolv.dnsmasq
 DNSMASQ_MAIN=/etc/dnsmasq.conf
+
+# ResolvGuard manages the *gateway's* WAN Strict DoT and Stubby service, not
+# the DNS forwarding performed by an AiMesh satellite. Firmware re_mode=1 is
+# the authoritative AiMesh-node signal; sw_mode=1 requires router operation.
+# Do not treat a stopped Stubby daemon as a node, or cfg_master=0 by itself as
+# proof of one (standalone routers may have no active AiMesh controller).
+# Keep this guard above configuration initialization: unsupported installs
+# must not create files, Entware packages, hooks, cron jobs or WAN state.
+_RequireGatewayRole_() {
+  local mode mesh
+  if ! mode="$(nvram get sw_mode 2>/dev/null)" ||
+     ! mesh="$(nvram get re_mode 2>/dev/null)"; then
+    printf '%s\n' 'ERROR: Cannot read ASUS router role; refusing ResolvGuard operation.' >&2
+    return 1
+  fi
+  case "$mesh" in
+    1)
+      printf '%s\n' 'ERROR: ResolvGuard does not support AiMesh nodes (re_mode=1). Install it on the primary WAN router.' >&2
+      return 1 ;;
+    ''|0) : ;;
+    *)
+      printf 'ERROR: Unknown ASUS AiMesh role (re_mode=%s); refusing ResolvGuard operation.\n' "$mesh" >&2
+      return 1 ;;
+  esac
+  case "$mode" in
+    1) return 0 ;;
+    3)
+      printf '%s\n' 'ERROR: ResolvGuard requires router mode; access points and AiMesh nodes are unsupported (sw_mode=3).' >&2 ;;
+    ''|*[!0-9]*)
+      printf '%s\n' 'ERROR: ASUS router operation mode is unknown; refusing ResolvGuard operation.' >&2 ;;
+    *)
+      printf 'ERROR: Unsupported ASUS operation mode (sw_mode=%s); ResolvGuard requires the primary WAN router.\n' "$mode" >&2 ;;
+  esac
+  return 1
+}
+
+# Fast, side-effect-free admission before any configuration or dependency work.
+# Existing node installations may still read status/help, and AMTM retains its
+# offline probe; uninstall is intentionally refused rather than discarding
+# enrolled WAN/recovery state while this device no longer owns gateway DNS.
+case "$_RG_COMMAND" in
+  help|-h|--help) : ;;
+  status)
+    _RequireGatewayRole_ || {
+      printf '%s\n' 'ResolvGuard status: INACTIVE (unsupported router role; no DNS operations performed).'
+      exit 0
+    } ;;
+  amtmupdate)
+    [ "${2:-update}" = check ] || _RequireGatewayRole_ || exit 2 ;;
+  startup|scheduled-check)
+    _RequireGatewayRole_ || { printf '%s\n' 'SKIP: unsupported router role; no ResolvGuard monitoring or WAN changes.'; exit 0; } ;;
+  schedule)
+    [ "${2:-status}" = disable ] || _RequireGatewayRole_ || exit 2 ;;
+  policy)
+    [ "${2:-status}" = revoke ] || _RequireGatewayRole_ || exit 2 ;;
+  webui) _RequireGatewayRole_ || exit 2 ;;
+  *) _RequireGatewayRole_ || exit 2 ;;
+esac
 
 # Choose the firmware's active production Stubby YAML when initializing a new
 # installation. 3006 may use stubby-0.yml, while 3004 commonly uses stubby.yml.
@@ -345,16 +403,23 @@ _LogHealthyHeartbeat_() {
   _LogEvent_ info "DNS HEALTHY: preferred WAN Strict DoT checks passed (heartbeat ${SYSLOG_HEALTH_INTERVAL_MINUTES}m)"
 }
 _Fail_() { _Say_ "ERROR: $*" >&2; return 1; }
+# Explicit [y/N]: empty means No; unknown answers are never interpreted
+# as consent or refusal. Re-prompt instead of terminating the operation.
 _ConfirmYesNo_() {
   local response
   _SetMenuPalette_
-  printf '\n  %s%s%s %s[y/N]%s: ' "$RG_BOLD" "$1" "$RG_RESET" "$RG_CYAN" "$RG_RESET"
-  IFS= read -r response || return 1
-  printf '\n'
-  case "$response" in
-    y|Y|yes|YES|Yes) return 0 ;;
-    *) [ "${2:-}" = quiet ] || _Say_ '  Cancelled.'; return 1 ;;
-  esac
+  while :; do
+    printf '\n  %s%s%s %s[y/N]%s: ' "$RG_BOLD" "$1" "$RG_RESET" "$RG_CYAN" "$RG_RESET"
+    IFS= read -r response || return 1
+    printf '\n'
+    case "$response" in
+      [Yy]|[Yy][Ee][Ss]) return 0 ;;
+      ''|[Nn]|[Nn][Oo]|[Ee]|[Ee][Xx][Ii][Tt])
+        [ "${2:-}" = quiet ] || _Say_ '  Cancelled.'
+        return 1 ;;
+      *) _Say_ '  Please answer y/yes or n/no (e/exit cancels).' ;;
+    esac
+  done
 }
 _IsValidID_() { case "$1" in ''|*[!A-Za-z0-9_-]*) return 1;; *) return 0;; esac; }
 _IsValidDomain_() {
@@ -473,6 +538,15 @@ _IsValidPort_() {
 }
 _IsValidRecordType_() {
   printf '%s\n' "$1" | LC_ALL=C grep -Eq '^[A-Z][A-Z0-9]{0,15}$'
+}
+# Health-check policy must name a registered, meaningful DNS RR type.
+# Probe/inspection retains its separate generic record-type syntax check.
+# Explicit list prevents typo types (e.g. AAAAA) from becoming active policy.
+_IsSupportedHealthRecordType_() {
+  case "$1" in
+    A|AAAA|AFSDB|APL|CAA|CDNSKEY|CDS|CERT|CNAME|CSYNC|DHCID|DNAME|DNSKEY|DS|HINFO|HIP|HTTPS|IPSECKEY|KX|LOC|MX|NAPTR|NS|NSEC|NSEC3|NSEC3PARAM|OPENPGPKEY|PTR|RP|RRSIG|SMIMEA|SOA|SPF|SRV|SSHFP|SVCB|TLSA|TXT|URI|ZONEMD) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 _IsValidRCODE_() {
   printf '%s\n' "$1" | LC_ALL=C grep -Eq '^[A-Z][A-Z0-9_]{0,31}$'
@@ -639,7 +713,7 @@ _ValidateConfiguration_() {
   }
   while IFS='|' read -r qname qtype rcode answers expected extra; do
     case "$qname" in ''|\#*) continue;; esac
-    [ -z "${extra:-}" ] && _IsValidDomain_ "$qname" && _IsValidRecordType_ "$qtype" &&
+    [ -z "${extra:-}" ] && _IsValidDomain_ "$qname" && _IsSupportedHealthRecordType_ "$qtype" &&
       _IsValidRCODE_ "$rcode" && _IsValidDNSAnswerCount_ "$answers" && _IsSafeToken_ "$expected" || {
       _Fail_ "Invalid DNS health check: $qname $qtype"; return 1;
     }
@@ -2653,6 +2727,7 @@ _VerifyUnboundStubbyListeners_() {
 }
 
 _CheckLiveSwitchSafety_() {
+  _RequireGatewayRole_ || return 1
   if _RecursiveUnboundProduction_; then
     _Fail_ 'WAN failover disabled in recursive Unbound mode; use Unbound Manager Integrate with Stubby'
     return 1
@@ -3225,9 +3300,15 @@ _ShowPolicyStatus_() {
 # a one-time claim that every upstream is healthy at this instant. Scheduled
 # health checks must independently prove safe endpoints before any WAN write.
 _ApprovePolicy_() (
-  local fingerprint staged approval_prompt view count
+  local fingerprint staged approval_prompt view count reviewed_fingerprint
   approval_prompt="${1:-Approve DNS policy?}"
   view="${2:-detail}"
+  reviewed_fingerprint="${3:-}"
+  if [ "$view" = web ]; then
+    case "$reviewed_fingerprint" in ''|*[!0-9a-f]*)
+      _Fail_ 'WebUI approval requires a reviewed SHA256 policy fingerprint'; return 1;; esac
+    [ "${#reviewed_fingerprint}" -eq 64 ] || return 1
+  fi
   RG_POLICY_CONFIG_HELD=0
   RG_POLICY_WAN_HELD=0
   RG_MAINTENANCE_PRIORITY_HELD=0
@@ -3260,6 +3341,15 @@ _ApprovePolicy_() (
     _Fail_ 'No alternate WAN-derived or independent backup pool configured; switching policy cannot be approved'; return 1; }
   fingerprint="$(_GetPolicyFingerprint_)" || {
     _Fail_ 'Unable to fingerprint the DNS policy'; return 1; }
+  if [ "$view" = web ]; then
+    # The browser explicitly reviewed THIS policy. Fail closed if even a single
+    # resolver, threshold, health check, or integration setting has changed.
+    [ "$fingerprint" = "$reviewed_fingerprint" ] || {
+      _Fail_ 'Policy changed since the WebUI review; refresh and review again'; return 1; }
+    if _RecursiveUnboundProduction_; then
+      _Fail_ 'Automatic failover policy cannot be approved for recursive Unbound'; return 1
+    fi
+  fi
   if [ "$view" = quick ]; then
     printf '  Preferred DNS: %sStrict authenticated DoT verified%s\n' "$RG_GREEN" "$RG_RESET"
     printf '  Alternate groups: %s configured\n' "$count"
@@ -3274,30 +3364,34 @@ _ApprovePolicy_() (
     done < "$CHECKS"
   fi
   _Say_ ''
-  # Never hold a WAN lock, config lock, or priority reservation while an
-  # administrator reads the policy or considers the approval prompt.
-  # Monitoring therefore runs normally during an arbitrarily long review.
-  _ReleasePolicyConfigLock_ || {
-    _Fail_ 'Unable to release configuration lock before confirmation'
-    return 1
-  }
-  _ReleasePolicyWANLock_ || {
-    _Fail_ 'Unable to release DNS lock before confirmation'
-    return 1
-  }
-  _ReleaseMaintenancePriority_ || {
-    _Fail_ 'Unable to release interactive priority before confirmation'
-    return 1
-  }
-  if [ "$view" = quick ]; then
-    _ConfirmYesNo_ "$approval_prompt" quiet || return 1
-  else
-    _ConfirmYesNo_ "$approval_prompt" || return 1
+  if [ "$view" != web ]; then
+    # Never hold a WAN lock, config lock, or priority reservation while an
+    # administrator reads the policy or considers the approval prompt.
+    # Monitoring therefore runs normally during an arbitrarily long review.
+    _ReleasePolicyConfigLock_ || {
+      _Fail_ 'Unable to release configuration lock before confirmation'
+      return 1
+    }
+    _ReleasePolicyWANLock_ || {
+      _Fail_ 'Unable to release DNS lock before confirmation'
+      return 1
+    }
+    _ReleaseMaintenancePriority_ || {
+      _Fail_ 'Unable to release interactive priority before confirmation'
+      return 1
+    }
+    if [ "$view" = quick ]; then
+      _ConfirmYesNo_ "$approval_prompt" quiet || return 1
+    else
+      _ConfirmYesNo_ "$approval_prompt" || return 1
+    fi
   fi
   # Re-establish priority after consent, then verify the reviewed policy
   # under both locks before persisting any approval.
-  _AcquireWANLockForPolicy_ || return 1
-  _AcquireConfigLockForPolicy_ || return 1
+  if [ "$view" != web ]; then
+    _AcquireWANLockForPolicy_ || return 1
+    _AcquireConfigLockForPolicy_ || return 1
+  fi
   [ ! -e "$PENDING_TRANSACTION" ] && [ ! -L "$PENDING_TRANSACTION" ] &&
     [ ! -e "$RECOVERY_HOLD" ] && [ ! -L "$RECOVERY_HOLD" ] || {
     _Fail_ 'WAN recovery state changed during review; approval refused'; return 1; }
@@ -3377,6 +3471,7 @@ _CleanupSwitchConfigLock_() {
 
 _SwitchDNSPool_() (
   local old new reason prev desired actual verified
+  _RequireGatewayRole_ || return 1
   # Config commits may run during read-only probes, but not during WAN writes.
   # A maintenance caller can already own CONFIG_LOCK while holding WAN_LOCK.
   RG_SWITCH_CONFIG_LOCK_OWNED=0
@@ -3442,6 +3537,9 @@ _SwitchDNSPool_() (
         rm -f "$ACTIVE_POOL.new.$$" "$ACTIVE_RULELIST.new.$$"; return 1;
       }
   fi
+  # Recheck immediately before journaling a new WAN write. Never create a
+  # pending transaction if this device has become an AiMesh node meanwhile.
+  _RequireGatewayRole_ || return 1
   # Journal the old and new rulelists before WAN changes.
   if ! _WriteSwitchIntent_ "$old" "$new" "$prev" "$desired"; then
     rm -f "$ACTIVE_POOL.new.$$" "$ACTIVE_RULELIST.new.$$"
@@ -4252,6 +4350,7 @@ _TransactionRulelistMatchesPool_() {
 # Restore only a previously enrolled preferred configuration; never overwrite an
 # unknown GUI/NVRAM change. Interrupted transaction evidence remains on failures.
 _RestorePreferredDNSLocked_() {
+  _RequireGatewayRole_ || return 1
   local current preferred source target from_pool to_pool tracked part
   [ -s "$PREF_RULELIST" ] && [ ! -L "$PREF_RULELIST" ] || {
     _Fail_ 'Preferred DNS snapshot unavailable'; return 1; }
@@ -4416,6 +4515,7 @@ _GetScheduleJobCommand_() {
 
 _RegisterScheduleCron_() {
   local logfile cron_list
+  _RequireGatewayRole_ || return 1
   # Cron opens redirected stdout before the script's own umask executes.
   logfile="$RUNTIME/scheduled.log"
   [ ! -L "$logfile" ] && { [ ! -e "$logfile" ] || [ -f "$logfile" ]; } || {
@@ -4432,36 +4532,23 @@ _RegisterScheduleCron_() {
     _Fail_ 'Registered cron job could not be verified'; return 1; }
 }
 
-# Keep the startup entry as a single, exactly owned line. Legacy blocks
-# from an existing installed ResolvGuard may be replaced only if unmodified.
+# Keep the startup entry as a single, exactly owned line. Reject unknown or
+# modified ResolvGuard entries rather than altering other add-ons' hooks.
 _StartupHookLine_() {
   printf '%s/resolvguard.sh startup & # RESOLVGUARD STARTUP\n' "$ROOT"
 }
 
 _CheckOwnedStartupHook_() {
-  local hook line n_line n_begin n_end n_refs actual expected
+  local hook line n_line n_tag n_refs
   hook="$HOOK_DIR/services-start"
   [ ! -e "$hook" ] && [ ! -L "$hook" ] && return 0
   [ -f "$hook" ] && [ ! -L "$hook" ] || { _Fail_ 'Unsafe services-start hook'; return 1; }
   line="$(_StartupHookLine_)"
-  n_line="$(grep -Fc '# RESOLVGUARD STARTUP' "$hook" || :)"
-  n_begin="$(grep -Fxc '# RESOLVGUARD BEGIN' "$hook" || :)"
-  n_end="$(grep -Fxc '# RESOLVGUARD END' "$hook" || :)"
-  [ "$n_line" -le 1 ] && [ "$n_begin" = "$n_end" ] && [ "$n_begin" -le 1 ] &&
-    [ $((n_line+n_begin)) -le 1 ] || { _Fail_ 'Ambiguous ResolvGuard startup hook'; return 1; }
-  if [ "$n_line" = 1 ]; then
-    grep -Fqx "$line" "$hook" || { _Fail_ 'Modified ResolvGuard startup hook'; return 1; }
-  elif [ "$n_begin" = 1 ]; then
-    expected="$(printf '%s\n' '# RESOLVGUARD BEGIN' \
-      "/bin/sh $ROOT/resolvguard.sh startup >> /tmp/resolvguard-startup.log 2>&1 &" \
-      '# RESOLVGUARD END')"
-    actual="$(sed -n '/^# RESOLVGUARD BEGIN$/,/^# RESOLVGUARD END$/p' "$hook")"
-    [ "$actual" = "$expected" ] || { _Fail_ 'Modified ResolvGuard startup block'; return 1; }
-  fi
-  # The one owned entry is the only permitted startup invocation.
+  n_line="$(grep -Fxc "$line" "$hook" || :)"
+  n_tag="$(grep -Fc '# RESOLVGUARD STARTUP' "$hook" || :)"
   n_refs="$(grep -Fc "$ROOT/resolvguard.sh startup" "$hook" || :)"
-  [ "$n_refs" -eq $((n_line+n_begin)) ] || {
-    _Fail_ 'Unrecognized ResolvGuard startup command'; return 1;
+  [ "$n_line" -le 1 ] && [ "$n_tag" -eq "$n_line" ] && [ "$n_refs" -eq "$n_line" ] || {
+    _Fail_ 'Unrecognized or duplicate ResolvGuard startup hook'; return 1;
   }
 }
 
@@ -4479,11 +4566,7 @@ _InstallScheduleHook_() {
   staged="$HOOK_DIR/.services-start-resolvguard-$$"
   [ ! -e "$staged" ] && [ ! -L "$staged" ] || return 1
   if [ -f "$hook" ]; then
-    if grep -Fqx '# RESOLVGUARD BEGIN' "$hook"; then
-      sed '/^# RESOLVGUARD BEGIN$/,/^# RESOLVGUARD END$/d' "$hook" > "$staged" || return 1
-    else
-      cat "$hook" > "$staged" || return 1
-    fi
+    cat "$hook" > "$staged" || return 1
   else
     (umask 077; printf '#!/bin/sh\n' > "$staged") || return 1
   fi
@@ -4497,16 +4580,10 @@ _RemoveScheduleHook_() {
   _CheckOwnedStartupHook_ || return 1
   [ -f "$hook" ] || return 0
   line="$(_StartupHookLine_)"
-  if ! grep -Fqx "$line" "$hook" && ! grep -Fqx '# RESOLVGUARD BEGIN' "$hook"; then
-    return 0
-  fi
+  grep -Fqx "$line" "$hook" || return 0
   staged="$HOOK_DIR/.services-start-uninstall-$$"
   [ ! -e "$staged" ] && [ ! -L "$staged" ] || return 1
-  if grep -Fqx '# RESOLVGUARD BEGIN' "$hook"; then
-    sed '/^# RESOLVGUARD BEGIN$/,/^# RESOLVGUARD END$/d' "$hook" > "$staged" || return 1
-  else
-    awk -v owned="$line" '$0 != owned {print}' "$hook" > "$staged" || return 1
-  fi
+  awk -v owned="$line" '$0 != owned {print}' "$hook" > "$staged" || return 1
   chmod 755 "$staged" && mv -f "$staged" "$hook" || { rm -f "$staged"; return 1; }
 }
 
@@ -4565,6 +4642,7 @@ _AllowMonitoringOnlyWithoutLANForwarding_() {
 
 _EnableScheduledMonitoring_() {
   local staged unattended success_output
+  _RequireGatewayRole_ || return 1
   unattended="${1:-ask}"
   success_output="${2:-verbose}"
   [ "$ROOT" = "$INSTALL_ROOT" ] || { _Fail_ 'Enable scheduler only from installed add-on directory'; return 1; }
@@ -4624,6 +4702,7 @@ _EnableScheduledMonitoring_() {
 
 _EnableAutomaticFailover_() {
   local approval_status staged view
+  _RequireGatewayRole_ || return 1
   view="${1:-detail}"
   if _RecursiveUnboundProduction_; then
     _Fail_ 'WAN failover is disabled in recursive Unbound mode. Use Monitoring Only or enable Unbound Manager Integrate with Stubby.'
@@ -4651,13 +4730,19 @@ _EnableAutomaticFailover_() {
   _ShowDNSMasqScopedSetupWarning_
 
   if ! approval_status="$(_GetPolicyApprovalState_)"; then
+    if [ "$view" = web ]; then
+      _Fail_ "Review and approve the current policy before enabling automatic failover: $approval_status"
+      return 1
+    fi
     if [ "$view" != quick ]; then
       _Say_ "DNS policy approval required: $approval_status"
     fi
     _ApprovePolicy_ 'Approve policy and enable automatic failover?' "$view" || return 1
   else
     _CheckPolicyAuthorization_ || return 1
-    _ConfirmYesNo_ 'Enable automatic WAN DNS failover?' || return 1
+    if [ "$view" != web ]; then
+      _ConfirmYesNo_ 'Enable automatic WAN DNS failover?' || return 1
+    fi
   fi
   _CheckPolicyAuthorization_ || return 1
   # Consent is not authorization to write. Strict forwarding/service ownership
@@ -4692,7 +4777,9 @@ _DisableAutomaticFailover_() {
   if [ ! -e "$AUTO_FAILOVER_MARKER" ]; then
     _Say_ 'Automatic failover: already OFF'; return 0
   fi
-  _ConfirmYesNo_ 'Disable automatic DNS switching (keep monitoring)?' || return 1
+  if [ "${1:-}" != web ]; then
+    _ConfirmYesNo_ 'Disable automatic DNS switching (keep monitoring)?' || return 1
+  fi
   [ ! -L "$AUTO_FAILOVER_MARKER" ] || { _Fail_ 'Unsafe authorization marker'; return 1; }
   rm -f "$AUTO_FAILOVER_MARKER" || return 1
   # Re-entering Monitoring Only is a new state transition for event history.
@@ -4764,6 +4851,7 @@ _WriteBootReport_() {
 
 _ReconcileBootState_() {
   local current preferred tracked expected source target from_pool to_pool part readiness_mode success_output
+  _RequireGatewayRole_ || return 1
   success_output="${1:-verbose}"
   [ -r "$PREF_RULELIST" ] || { _Say_ 'BOOT: not enrolled; no changes'; return 1; }
   if [ -e "$WAN_LOCK" ]; then
@@ -4882,8 +4970,6 @@ _RGManual_() (
   RG_M_DATA="${RUNTIME}/webui"
   RG_M_HOOK=/jffs/scripts/service-event
   RG_M_LOCK=/tmp/addonwebui.lock
-  RG_M_BEG='# RESOLVGUARD WEBUI MANUAL BEGIN'
-  RG_M_END='# RESOLVGUARD WEBUI MANUAL END'
 
   message() { printf '%s\n' "ResolvGuard WebUI manual: $*" >&2; }
   quote() {
@@ -4931,8 +5017,9 @@ _RGManual_() (
   }
   hook_current() {
     [ -f "$RG_M_HOOK" ] && [ ! -L "$RG_M_HOOK" ] || return 1
-    [ "$(grep -Fc '# RESOLVGUARD MANUAL' "$RG_M_HOOK" || :)" = 1 ] &&
-      grep -Fqx "$(hook_body)" "$RG_M_HOOK"
+    [ "$(grep -Fxc "$(hook_body)" "$RG_M_HOOK" || :)" = 1 ] &&
+      [ "$(grep -Fc '# RESOLVGUARD MANUAL' "$RG_M_HOOK" || :)" = 1 ] &&
+      [ "$(grep -Fc ResolvGuardManualCheck "$RG_M_HOOK" || :)" = 1 ]
   }
   update_hook() {
     action="$1"
@@ -4943,45 +5030,26 @@ _RGManual_() (
     [ -d /jffs/scripts ] && [ ! -L /jffs/scripts ] || { message 'scripts directory missing or unsafe'; return 1; }
     exec 9> "$RG_M_LOCK" && flock -x 9 || return 1
     compact="$(hook_body)"
-    count_compact=0;count_begin=0;count_end=0
+    count_compact=0; count_tag=0; count_action=0
     if [ -f "$RG_M_HOOK" ]; then
-      count_compact=$(grep -Fc '# RESOLVGUARD MANUAL' "$RG_M_HOOK" || :)
-      count_begin=$(grep -Fxc "$RG_M_BEG" "$RG_M_HOOK" || :)
-      count_end=$(grep -Fxc "$RG_M_END" "$RG_M_HOOK" || :)
+      count_compact=$(grep -Fxc "$compact" "$RG_M_HOOK" || :)
+      count_tag=$(grep -Fc '# RESOLVGUARD MANUAL' "$RG_M_HOOK" || :)
+      count_action=$(grep -Fc ResolvGuardManualCheck "$RG_M_HOOK" || :)
     fi
-    [ "$count_compact" -le 1 ] && [ "$count_begin" = "$count_end" ] &&
-      [ "$count_begin" -le 1 ] && [ $((count_compact+count_begin)) -le 1 ] &&
-      [ "$(grep -Fc ResolvGuardManualCheck "$RG_M_HOOK" 2>/dev/null || :)" -eq $((count_compact+count_begin)) ] || {
-        message 'ambiguous service-event manual hook'; return 1;
+    [ "$count_compact" -le 1 ] && [ "$count_tag" -eq "$count_compact" ] &&
+      [ "$count_action" -eq "$count_compact" ] || {
+        message 'unrecognized or duplicate service-event manual hook'; return 1;
       }
-    if [ "$count_compact" = 1 ]; then
-      grep -Fqx "$compact" "$RG_M_HOOK" || { message 'modified manual hook'; return 1; }
-      [ "$action" = install ] && return 0
-    elif [ "$count_begin" = 1 ]; then
-      actual=$(sed -n '/^# RESOLVGUARD WEBUI MANUAL BEGIN$/,/^# RESOLVGUARD WEBUI MANUAL END$/p' "$RG_M_HOOK")
-      expected="$(printf '%s\n' "$RG_M_BEG" \
-        'if [ "$1" = "start" ] && [ "$2" = "ResolvGuardManualCheck" ]; then' \
-        '  /bin/sh /jffs/addons/ResolvGuard.d/resolvguard.sh webui manual-run >/tmp/resolvguard-webui-manual.log 2>&1 &' \
-        'fi' "$RG_M_END")"
-      [ "$actual" = "$expected" ] || { message 'modified manual hook block'; return 1; }
-    elif [ "$action" = remove ]; then
+    if [ "$count_compact" -eq 1 ] && [ "$action" = install ]; then
       return 0
     fi
-    # An unowned action must not be overwritten or duplicated.
-    if [ "$count_compact" = 0 ] && [ "$count_begin" = 0 ] && [ -f "$RG_M_HOOK" ] &&
-       grep -F 'ResolvGuardManualCheck' "$RG_M_HOOK" >/dev/null; then
-      message 'unrecognized manual action'; return 1
+    if [ "$count_compact" -eq 0 ] && [ "$action" = remove ]; then
+      return 0
     fi
     staged=/jffs/scripts/.service-event-resolvguard-manual-$$
     [ ! -e "$staged" ] && [ ! -L "$staged" ] || return 1
     if [ -f "$RG_M_HOOK" ]; then
-      if [ "$count_begin" = 1 ]; then
-        sed '/^# RESOLVGUARD WEBUI MANUAL BEGIN$/,/^# RESOLVGUARD WEBUI MANUAL END$/d' "$RG_M_HOOK" > "$staged" || return 1
-      elif [ "$count_compact" = 1 ]; then
-        awk -v owned="$compact" '$0 != owned {print}' "$RG_M_HOOK" > "$staged" || return 1
-      else
-        cat "$RG_M_HOOK" > "$staged" || return 1
-      fi
+      awk -v owned="$compact" '$0 != owned {print}' "$RG_M_HOOK" > "$staged" || return 1
     else
       printf '#!/bin/sh\n' > "$staged" || return 1
     fi
@@ -5109,8 +5177,6 @@ _RGWebConfig_() (
   umask 077
   rg_dir="$RUNTIME/webui"
   rg_hook=/jffs/scripts/service-event
-  rg_beg='# RESOLVGUARD WEBUI CONFIG BEGIN'
-  rg_end='# RESOLVGUARD WEBUI CONFIG END'
   rg_lock=/tmp/addonwebui.lock
   rg_result="$rg_dir/config-action.htm"
   rg_config="$rg_dir/config.htm"
@@ -5192,7 +5258,59 @@ _RGWebConfig_() (
           rg_hold=true
         fi
       fi
-      printf '},"monitoringEnabled":%s,"autoFailoverEnabled":%s,"requiresPolicyReview":%s,"policySafetyHold":%s,' \
+      # Review data is a read-only representation of the same v5 policy
+      # fingerprint accepted by the CLI. The approval operation rechecks it
+      # under WAN/config locks; these fields never grant permission themselves.
+      rg_approval="$(_GetPolicyApprovalState_ 2>/dev/null || :)"
+      rg_approval_code="${rg_approval%% *}"
+      case "$rg_approval_code" in VALID|MISSING|CHANGED|INVALID|BLOCKED) :;; *) rg_approval_code=BLOCKED;; esac
+      rg_fingerprint="$(_GetPolicyFingerprint_ 2>/dev/null || :)"
+      case "$rg_fingerprint" in ''|*[!0-9a-f]*) rg_fingerprint='';; esac
+      [ "${#rg_fingerprint}" -eq 64 ] || rg_fingerprint=''
+      rg_pool="$(_GetActiveWANPool_ 2>/dev/null || :)"
+      rg_reviewable=false
+      if [ "$rg_recursive" = false ] && [ "$rg_pool" = preferred ] &&
+         [ -n "$rg_fingerprint" ] && [ ! -e "$PENDING_TRANSACTION" ] &&
+         [ ! -e "$RECOVERY_HOLD" ]; then rg_reviewable=true; fi
+      printf '},"policy":{"approval":'; rg_quote "$rg_approval_code"
+      printf ',"message":'; rg_quote "$rg_approval"
+      printf ',"fingerprint":'; rg_quote "$rg_fingerprint"
+      printf ',"preferredRulelist":'; rg_quote "$(cat "$PREF_RULELIST" 2>/dev/null || :)"
+      printf ',"stubbyConfig":'; rg_quote "$WAN_STUBBY_CONFIG"
+      printf ',"caFile":'; rg_quote "$CA_FILE"
+      printf ',"reviewable":%s,"recursiveUnbound":%s,"automaticMarker":%s,' \
+        "$rg_reviewable" "$rg_recursive" \
+        "$( [ -f "$AUTO_FAILOVER_MARKER" ] && [ ! -L "$AUTO_FAILOVER_MARKER" ] && printf true || printf false )"
+      printf '"preferred":['
+      rg_sep=''
+      if [ -s "$PREF_PROVIDERS" ] && [ ! -L "$PREF_PROVIDERS" ]; then
+        while IFS='|' read -r rg_pid rg_pip rg_ptls rg_pinternal rg_pport rg_extra; do
+          case "$rg_pid" in wan[0-9]*) :;; *) continue;; esac
+          [ -z "$rg_extra" ] || continue
+          printf '%s{"id":' "$rg_sep"; rg_quote "$rg_pid"
+          printf ',"ip":';rg_quote "$rg_pip"
+          printf ',"tls":';rg_quote "$rg_ptls"
+          printf ',"port":';rg_quote "$rg_pport"
+          printf '}'
+          rg_sep=,
+        done < "$PREF_PROVIDERS"
+      fi
+      printf '],"checks":['
+      rg_sep=''
+      if [ -f "$CHECKS" ] && [ ! -L "$CHECKS" ]; then
+        while IFS='|' read -r rg_hostname rg_type rg_rcode rg_count rg_expected rg_extra; do
+          case "$rg_hostname" in ''|\#*) continue;; esac
+          [ -z "$rg_extra" ] || continue
+          printf '%s{"name":' "$rg_sep";rg_quote "$rg_hostname"
+          printf ',"type":';rg_quote "$rg_type"
+          printf ',"rcode":';rg_quote "$rg_rcode"
+          printf ',"minAnswers":';rg_quote "$rg_count"
+          printf ',"expected":';rg_quote "$rg_expected"
+          printf '}'
+          rg_sep=,
+        done < "$CHECKS"
+      fi
+      printf ']},"monitoringEnabled":%s,"autoFailoverEnabled":%s,"requiresPolicyReview":%s,"policySafetyHold":%s,' \
         "$( [ -f "$SCHEDULE_MARKER" ] && [ ! -L "$SCHEDULE_MARKER" ] && printf true || printf false )" \
         "$rg_auto" "$rg_hold" "$rg_hold"
       printf '"backups":['
@@ -5233,8 +5351,9 @@ _RGWebConfig_() (
   }
   rg_hook_current() {
     [ -f "$rg_hook" ] && [ ! -L "$rg_hook" ] || return 1
-    [ "$(grep -Fc '# RESOLVGUARD CONFIG' "$rg_hook" || :)" = 1 ] &&
-      grep -Fqx "$(rg_hook_body)" "$rg_hook"
+    [ "$(grep -Fxc "$(rg_hook_body)" "$rg_hook" || :)" = 1 ] &&
+      [ "$(grep -Fc '# RESOLVGUARD CONFIG' "$rg_hook" || :)" = 1 ] &&
+      [ "$(grep -Fc ResolvGuardCfg "$rg_hook" || :)" = 1 ]
   }
   rg_hook_update() {
     rg_verb="$1"
@@ -5243,42 +5362,26 @@ _RGWebConfig_() (
     [ ! -L "$rg_hook" ] && { [ ! -e "$rg_hook" ] || [ -f "$rg_hook" ]; } || return 1
     exec 9> "$rg_lock" && flock -x 9 || return 1
     rg_line="$(rg_hook_body)"
-    rg_nline=0;rg_nbeg=0;rg_nend=0
+    rg_nline=0; rg_ntag=0; rg_naction=0
     if [ -f "$rg_hook" ]; then
-      rg_nline=$(grep -Fc '# RESOLVGUARD CONFIG' "$rg_hook" || :)
-      rg_nbeg=$(grep -Fxc "$rg_beg" "$rg_hook" || :)
-      rg_nend=$(grep -Fxc "$rg_end" "$rg_hook" || :)
+      rg_nline=$(grep -Fxc "$rg_line" "$rg_hook" || :)
+      rg_ntag=$(grep -Fc '# RESOLVGUARD CONFIG' "$rg_hook" || :)
+      rg_naction=$(grep -Fc ResolvGuardCfg "$rg_hook" || :)
     fi
-    [ "$rg_nline" -le 1 ] && [ "$rg_nbeg" = "$rg_nend" ] &&
-      [ "$rg_nbeg" -le 1 ] && [ $((rg_nline+rg_nbeg)) -le 1 ] &&
-      [ "$(grep -Fc ResolvGuardCfg "$rg_hook" 2>/dev/null || :)" -eq $((rg_nline+rg_nbeg)) ] || return 1
-    if [ "$rg_nline" = 1 ]; then
-      grep -Fqx "$rg_line" "$rg_hook" || { rg_notice 'modified config hook'; return 1; }
-      [ "$rg_verb" = install ] && return 0
-    elif [ "$rg_nbeg" = 1 ]; then
-      rg_actual=$(sed -n '/^# RESOLVGUARD WEBUI CONFIG BEGIN$/,/^# RESOLVGUARD WEBUI CONFIG END$/p' "$rg_hook")
-      rg_expected="$(printf '%s\n' "$rg_beg" 'case "$1:$2" in' \
-        '  start:ResolvGuardCfg)' \
-        '    /bin/sh /jffs/addons/ResolvGuard.d/resolvguard.sh webui config-run >/tmp/resolvguard-webui-config.log 2>&1 &' \
-        '    ;;' 'esac' "$rg_end")"
-      [ "$rg_actual" = "$rg_expected" ] || { rg_notice 'modified config hook block'; return 1; }
-    elif [ "$rg_verb" = remove ]; then
+    [ "$rg_nline" -le 1 ] && [ "$rg_ntag" -eq "$rg_nline" ] &&
+      [ "$rg_naction" -eq "$rg_nline" ] || {
+        rg_notice 'unrecognized or duplicate config hook'; return 1;
+      }
+    if [ "$rg_nline" -eq 1 ] && [ "$rg_verb" = install ]; then
       return 0
     fi
-    if [ "$rg_nline" = 0 ] && [ "$rg_nbeg" = 0 ] && [ -f "$rg_hook" ] &&
-       grep -F 'ResolvGuardCfg' "$rg_hook" >/dev/null; then
-      rg_notice 'unrecognized config action'; return 1
+    if [ "$rg_nline" -eq 0 ] && [ "$rg_verb" = remove ]; then
+      return 0
     fi
     rg_stage=/jffs/scripts/.service-event-resolvguard-config-$$
     [ ! -e "$rg_stage" ] && [ ! -L "$rg_stage" ] || return 1
     if [ -f "$rg_hook" ]; then
-      if [ "$rg_nbeg" = 1 ]; then
-        sed '/^# RESOLVGUARD WEBUI CONFIG BEGIN$/,/^# RESOLVGUARD WEBUI CONFIG END$/d' "$rg_hook" > "$rg_stage" || return 1
-      elif [ "$rg_nline" = 1 ]; then
-        awk -v owned="$rg_line" '$0 != owned {print}' "$rg_hook" > "$rg_stage" || return 1
-      else
-        cat "$rg_hook" > "$rg_stage" || return 1
-      fi
+      awk -v owned="$rg_line" '$0 != owned {print}' "$rg_hook" > "$rg_stage" || return 1
     else
       printf '#!/bin/sh\n' > "$rg_stage" || return 1
     fi
@@ -5310,12 +5413,12 @@ _RGWebConfig_() (
     # amng_custom JSON. The payload is bounded and allowlisted below; it has
     # no reason to require a base64 applet or extra Entware dependency.
     # Preserve raw separators; the shell never evaluates payload contents.
-    [ "${#rg_token}" -le 560 ] || { rg_notice 'oversized config request'; return 1; }
+    [ "${#rg_token}" -le 960 ] || { rg_notice 'oversized config request'; return 1; }
     rg_payload="$rg_token"
     # ASCII-only data. No control characters, shell syntax, whitespace, or
     # line breaks may cross the firmware service event boundary.
-    case "$rg_payload" in ''|*[!A-Za-z0-9_.:/\|\-]*) rg_notice 'invalid data characters';return 1 ;; esac
-    IFS='|' read -r rg_id rg_op rg_a rg_b rg_c rg_d rg_overflow <<EOF_RG_WEB_CONFIG
+    case "$rg_payload" in ''|*[!A-Za-z0-9_.:/@+?%=\|\-]*) rg_notice 'invalid data characters';return 1 ;; esac
+    IFS='|' read -r rg_id rg_op rg_a rg_b rg_c rg_d rg_e rg_f rg_overflow <<EOF_RG_WEB_CONFIG
 $rg_payload
 EOF_RG_WEB_CONFIG
     case "$rg_id" in ''|*[!0-9]*) return 1 ;; esac
@@ -5329,6 +5432,13 @@ EOF_RG_WEB_CONFIG
       return 1
     fi
     rg_result_status=error;rg_message='Configuration rejected; see router log'
+    # Older actions use at most four arguments; reject surplus fields.
+    # Health-check edits use six fields with the existing transactional editor.
+    case "$rg_op" in
+      check-add|check-edit|check-delete) : ;;
+      *) [ "${#rg_token}" -le 560 ] && [ -z "$rg_e" ] && [ -z "$rg_f" ] || {
+           rg_notice 'oversized or extra request arguments'; return 1; } ;;
+    esac
     case "$rg_op" in
       setting)
         if [ -z "$rg_c" ] && [ -z "$rg_d" ]; then
@@ -5336,6 +5446,53 @@ EOF_RG_WEB_CONFIG
           SCHEDULE_INTERVAL_MINUTES|FAST_CONFIRM_SECONDS|FAIL_THRESHOLD|RECOVERY_THRESHOLD|TIMEOUT_SECONDS|BOOT_MIN_UPTIME_SECONDS|SYSLOG_HEALTH_INTERVAL_MINUTES)
             if _SetSetting_ "$rg_a" "$rg_b"; then rg_result_status=success;rg_message='Monitoring setting saved'; fi ;;
         esac
+        fi ;;
+      monitor-on|monitor-off)
+        rg_message='Monitoring state changed or scheduling safeguards rejected the request'
+        if [ -z "$rg_a" ] && [ -z "$rg_b" ] && [ -z "$rg_c" ] && [ -z "$rg_d" ]; then
+          if [ "$rg_op" = monitor-on ] && [ ! -e "$SCHEDULE_MARKER" ] &&
+             _EnableScheduledMonitoring_ confirmed quiet; then
+            rg_result_status=success;rg_message='Recurring DNS monitoring enabled'
+          elif [ "$rg_op" = monitor-off ] && [ -f "$SCHEDULE_MARKER" ] &&
+               _DisableScheduledMonitoring_ quiet; then
+            rg_result_status=success;rg_message='Monitoring and automatic failover disabled'
+          fi
+        fi ;;
+      auto-on|auto-off)
+        rg_message='Failover state changed or authorization/safety checks rejected the request'
+        if [ -z "$rg_a" ] && [ -z "$rg_b" ] && [ -z "$rg_c" ] && [ -z "$rg_d" ]; then
+          if [ "$rg_op" = auto-on ] && [ ! -e "$AUTO_FAILOVER_MARKER" ] &&
+             _EnableAutomaticFailover_ web; then
+            rg_result_status=success;rg_message='Automatic DNS failover enabled after policy and path verification'
+          elif [ "$rg_op" = auto-off ] && [ -f "$AUTO_FAILOVER_MARKER" ] &&
+               _DisableAutomaticFailover_ web; then
+            rg_result_status=success;rg_message='Automatic DNS failover disabled; monitoring remains enabled'
+          fi
+        fi ;;
+      check-add)
+        rg_message='DNS health-check rule rejected; check the fields or inspect the router log'
+        if [ -z "$rg_f" ] && _IsValidDNSCheck_ "$rg_a" "$rg_b" "$rg_c" "$rg_d" "$rg_e" &&
+           _ChangeTSVFile_ "$CHECKS" check add "$rg_a|$rg_b" "$rg_a|$rg_b|$rg_c|$rg_d|$rg_e"; then
+          rg_result_status=success;rg_message='DNS health check added; policy reapproval may be required'
+        fi ;;
+      check-edit)
+        rg_message='DNS health-check edit rejected; check current key and fields'
+        # Hostname/type identify the immutable check key during an edit.
+        # To change that identity, remove the rule then add a new one.
+        rg_old_host="${rg_a%/*}";rg_old_type="${rg_a##*/}"
+        if [ "$rg_old_host" != "$rg_a" ] && [ "$rg_old_host" = "$rg_b" ] &&
+           _IsValidRecordType_ "$rg_old_type" &&
+           { [ "$rg_old_type" = "$rg_c" ] || ! _IsSupportedHealthRecordType_ "$rg_old_type"; } &&
+           _IsValidDNSCheck_ "$rg_b" "$rg_c" "$rg_d" "$rg_e" "$rg_f" &&
+           _ChangeTSVFile_ "$CHECKS" check edit "$rg_b|$rg_c" "$rg_b|$rg_c|$rg_d|$rg_e|$rg_f"; then
+          rg_result_status=success;rg_message='DNS health check updated; policy reapproval may be required'
+        fi ;;
+      check-delete)
+        rg_message='DNS health-check deletion rejected (cannot remove the last valid rule)'
+        if [ -z "$rg_c" ] && [ -z "$rg_d" ] && [ -z "$rg_e" ] && [ -z "$rg_f" ] &&
+           _IsValidDomain_ "$rg_a" && _IsValidRecordType_ "$rg_b" &&
+           _ChangeTSVFile_ "$CHECKS" check del "$rg_a|$rg_b"; then
+          rg_result_status=success;rg_message='DNS health check removed; policy reapproval may be required'
         fi ;;
       backup-add|backup-edit)
         if [ -n "$rg_a" ] && [ "${#rg_a}" -le 32 ] && [ "${#rg_b}" -le 48 ] && [ "${#rg_c}" -le 253 ] &&
@@ -5358,6 +5515,20 @@ EOF_RG_WEB_CONFIG
           case "$rg_a" in GO|CS|QS)
             if _InstallBackupPreset_ "$rg_a"; then rg_result_status=success;rg_message='Backup resolver pair saved; policy review required'; fi ;;
           esac
+        fi ;;
+      policy-approve)
+        rg_message='Policy approval blocked. Review the current policy and check /tmp/resolvguard-webui-config.log.'
+        if [ -z "$rg_b" ] && [ -z "$rg_c" ] && [ -z "$rg_d" ] &&
+           [ "${#rg_a}" -eq 64 ]; then
+          case "$rg_a" in ''|*[!0-9a-f]*) :;; *)
+            if _ApprovePolicy_ 'Approve reviewed WAN DNS policy?' web "$rg_a"; then
+              rg_result_status=success
+              if [ -f "$AUTO_FAILOVER_MARKER" ] && [ ! -L "$AUTO_FAILOVER_MARKER" ]; then
+                rg_message='Reviewed policy approved; existing failover authorization marker may resume switching'
+              else
+                rg_message='Reviewed policy approved; automatic failover remains disabled until enabled separately'
+              fi
+            fi;; esac
         fi ;;
       script-check|script-install)
         rg_message='Unable to check the selected update channel'
@@ -5516,9 +5687,18 @@ _RGWebUI_() (
     done
     exec 8> "$RG_DATA/publish.lock" || return 1
     flock -x 8 || return 1
+    # Only one publisher can hold this lock. Previous active-members-PID
+    # scratch files are no longer in use, so clear them before the new cycle.
+    # Never remove symlinks, directories or names without a numeric PID.
+    for stale_member in "$RG_DATA"/active-members-*; do
+      [ -f "$stale_member" ] && [ ! -L "$stale_member" ] || continue
+      stale_pid=${stale_member##*/active-members-}
+      case "$stale_pid" in ''|*[!0-9]*) continue ;; esac
+      rm -f "$stale_member" || { err 'unable to remove stale active-members scratch file'; return 1; }
+    done
     cycle="$RG_DATA/cycle-$$"
     observations="$RG_DATA/observations-$$"
-    trap 'rm -f "$cycle" "$observations" "$RG_DATA"/active-members-"$$" "$RG_DATA"/status-"$$".tmp "$RG_DATA"/history-"$$".tmp "$RG_DATA"/events-"$$".tmp "$RG_DATA"/last-end.new."$$"' EXIT HUP INT TERM
+    trap 'rm -f "$cycle" "$observations" "$RG_DATA"/active-members-"$$" "$RG_DATA"/status-"$$".tmp "$RG_DATA"/history-"$$".tmp "$RG_DATA"/events-"$$".tmp "$RG_DATA"/history-failures-"$$".tmp "$RG_DATA"/trim-count.new."$$" "$RG_DATA"/last-end.new."$$"' EXIT HUP INT TERM
     extract_cycle > "$cycle" || :
     # First publish can precede the first cron cycle. Do not invent green state.
     header=$(sed -n '1p' "$cycle")
@@ -5654,10 +5834,12 @@ _RGWebUI_() (
         fi
         ;;
     esac
-    # Configuration checks only: these do not verify end-to-end LAN queries.
-    # Use the same read-only forwarding validator as the WAN safety gate, so
-    # DNS Paths reports direct Stubby and Unbound -> Stubby consistently.
+    # Read-only configuration facts, NOT end-to-end LAN traffic tests.
+    # Keep strict production forwarding validation unchanged for WAN switching.
+    # A separate DNSMasq -> Unbound configuration fact is needed for recursive
+    # Unbound: its lack of Stubby forwarding must not mark DNSMasq as broken.
     dnsmasq_verified=false
+    dnsmasq_unbound_configured=false
     strict_dot_verified=false
     if _VerifyLANForwardingConfig_ >/dev/null 2>&1; then
       dnsmasq_verified=true
@@ -5666,6 +5848,10 @@ _RGWebUI_() (
     IFS='|' read -r unbound_present unbound_running unbound_port unbound_route unbound_upstream <<EOF_UNBOUND
 $unbound_info
 EOF_UNBOUND
+    if [ "$unbound_route" = dnsmasq ] &&
+       _VerifyDNSMasqUnboundConfig_ >/dev/null 2>&1; then
+      dnsmasq_unbound_configured=true
+    fi
     if _IsStrictProductionDoT_ >/dev/null 2>&1; then
       strict_dot_verified=true
     fi
@@ -5679,7 +5865,7 @@ EOF_UNBOUND
       printf ',"pool":';jsonq "$current_pool"
       printf ',"mode":';jsonq "$mode"
       printf ',"scheduleMinutes":%s' "$(number "$interval")"
-      printf ',"dnsmasqDefaultVerified":%s,"strictDoTVerified":%s' "$dnsmasq_verified" "$strict_dot_verified"
+      printf ',"dnsmasqDefaultVerified":%s,"dnsmasqUnboundConfigured":%s,"strictDoTVerified":%s' "$dnsmasq_verified" "$dnsmasq_unbound_configured" "$strict_dot_verified"
       printf ',"unboundDetected":%s,"unboundRunning":%s' "$unbound_present" "$unbound_running"
       printf ',"unboundPort":';jsonq "$unbound_port"
       printf ',"unboundRoute":';jsonq "$unbound_route"
@@ -5806,7 +5992,12 @@ EOF_UNBOUND
     ) > "$tmp" || return 1
     mv "$tmp" "$RG_DATA/history.htm" || return 1
     _RGWebConfig_ snapshot || err "unable to publish configuration snapshot"
-    rm -f "$cycle" "$observations"
+    # The active roster is only needed until status.htm is assembled. If
+    # cleanup fails, keep the exit trap armed rather than leaking on success.
+    rm -f "$cycle" "$observations" "$active_members" \
+      "$RG_DATA"/status-"$$".tmp "$RG_DATA"/history-"$$".tmp \
+      "$RG_DATA"/events-"$$".tmp "$RG_DATA"/history-failures-"$$".tmp \
+      "$RG_DATA"/trim-count.new."$$" "$RG_DATA"/last-end.new."$$" || return 1
     trap - EXIT HUP INT TERM
     return 0
   }
@@ -5979,6 +6170,7 @@ EOF_UNBOUND
 )
 # RESOLVGUARD WEBUI INLINE END
 _ScheduleStartup_() {
+  _RequireGatewayRole_ || { _Say_ 'SKIP: unsupported router role; startup registration disabled.'; return 0; }
   # Background migration/registration even on legacy script-only upgrades.
   # Retry while boot is bringing up networking and /www, never block DNS recovery.
   (
@@ -6038,6 +6230,7 @@ _ReportScheduledSwitchingMode_() {
 
 _RunScheduledCheck_() {
   local outcome
+  _RequireGatewayRole_ || { _Say_ 'SKIP: unsupported router role; no DNS checks or switching.'; return 0; }
   [ -r "$SCHEDULE_MARKER" ] || { _Say_ 'SKIP: monitoring schedule not enabled'; return 0; }
   if _MaintenancePriorityPending_; then
     _Say_ 'SKIP: interactive DNS maintenance has priority; scheduled check deferred.'
@@ -6275,19 +6468,8 @@ _UpperMenuKeyChar_() {
 }
 
 _NormalizeMenuChoice_() {
-  local token first second cr
+  local token first second
   token="$1"
-  cr="$(printf '\r')"
-  # An SSH/terminal paste can leave a trailing carriage return.
-  case "$token" in *"$cr") token="${token%"$cr"}" ;; esac
-  # Ignore incidental spaces around the shortcut, but not inside it.
-  while :; do
-    case "$token" in
-      ' '*) token="${token# }" ;;
-      *' ') token="${token% }" ;;
-      *) break ;;
-    esac
-  done
   case "$token" in
     '') return 0 ;;
     [Ee][Xx][Ii][Tt]) printf 'EXIT' ;;
@@ -6365,18 +6547,63 @@ _InstallLauncher_() {
 }
 
 
+# Required fields retry on blank. e/exit is a deliberate cancellation unless
+# the caller is selecting from a menu which includes an e/exit option.
 _Ask_() {
-  local label default
-  label="$1"; default="${2:-}"
+  local label default mode choice
+  label="$1"; default="${2:-}"; mode="${3:-field}"
   _SetMenuPalette_
-  if [ -n "$default" ]; then
-    printf '\n  %s%s%s %s[%s]%s: ' "$RG_BOLD" "$label" "$RG_RESET" "$RG_CYAN" "$default" "$RG_RESET"
-  else
-    printf '\n  %s%s%s: ' "$RG_BOLD" "$label" "$RG_RESET"
-  fi
-  IFS= read -r RG_ANSWER || return 1
-  [ -n "$RG_ANSWER" ] || RG_ANSWER="$default"
+  while :; do
+    if [ -n "$default" ]; then
+      printf '\n  %s%s%s %s[%s]%s: ' "$RG_BOLD" "$label" "$RG_RESET" "$RG_CYAN" "$default" "$RG_RESET"
+    else
+      printf '\n  %s%s%s: ' "$RG_BOLD" "$label" "$RG_RESET"
+    fi
+    IFS= read -r choice || return 1
+    [ -n "$choice" ] || choice="$default"
+    case "$(_NormalizeMenuChoice_ "$choice")" in
+      E|EXIT)
+        if [ "$mode" = choice ]; then
+          RG_ANSWER="$choice"
+          return 0
+        fi
+        _Say_ '  Cancelled by user.'
+        return 2 ;;
+    esac
+    if [ -z "$choice" ]; then
+      _Say_ '  A value is required. Enter e/exit to cancel.'
+      continue
+    fi
+    RG_ANSWER="$choice"
+    return 0
+  done
 }
+
+# Validate individual interactive fields before moving to the next prompt.
+# The unchanged saved-configuration validators remain authoritative.
+_AskValidated_() {
+  local label default validator uppercase
+  label="$1"; default="$2"; validator="$3"; uppercase="${4:-}"
+  while :; do
+    _Ask_ "$label" "$default" || return 1
+    if [ "$uppercase" = upper ]; then
+      RG_ANSWER="$(printf '%s' "$RG_ANSWER" | tr 'abcdefghijklmnopqrstuvwxyz' 'ABCDEFGHIJKLMNOPQRSTUVWXYZ')"
+    fi
+    if "$validator" "$RG_ANSWER"; then return 0; fi
+    _Say_ '  Invalid value. Please try again, or enter e/exit to cancel.'
+  done
+}
+
+_IsValidBackupProviderID_() {
+  _IsValidID_ "$1" || return 1
+  case "$1" in wan[0-9]*) return 1 ;; *) return 0 ;; esac
+}
+
+_IsInspectorRecordChoice_() {
+  case "$1" in A|AAAA|BOTH) return 0 ;; *) return 1 ;; esac
+}
+
+_IsInspectorInput_() { _NormalizeProbeHostname_ "$1" >/dev/null 2>&1; }
 
 _IsSafeToken_() {
   case "$1" in ''|*[!A-Za-z0-9_.:@/+?%=-]*) return 1;; *) return 0;; esac
@@ -6478,8 +6705,8 @@ _ChangeTSVFile_() (
 )
 
 
-_SetSetting_() {
-  local key value staged
+_ValidateSettingValue_() {
+  local key value
   key="$1"; value="$2"
   case "$key" in
     SCHEDULE_INTERVAL_MINUTES) case "$value" in 1|2|5|10|15|20|30|60) :;; *) _Fail_ 'Choose 1/2/5/10/15/20/30/60'; return 1;; esac ;;
@@ -6496,6 +6723,12 @@ _SetSetting_() {
       [ -r "$value" ] || { _Fail_ 'File does not exist or cannot be read'; return 1; } ;;
     *) _Fail_ 'Unknown setting'; return 1 ;;
   esac
+}
+
+_SetSetting_() {
+  local key value staged
+  key="$1"; value="$2"
+  _ValidateSettingValue_ "$key" "$value" || return 1
   (
     _AcquireConfigLock_ || { _Fail_ 'Another configuration commit is running'; return 1; }
     trap '_ReleaseConfigLock_ >/dev/null 2>&1 || :' EXIT HUP INT TERM
@@ -6518,8 +6751,14 @@ _SetSetting_() {
 _PromptSetting_() {
   local key current hint
   key="$1"; current="$2"; hint="$3"
-  _Ask_ "$hint" "$current" || return 1
-  _SetSetting_ "$key" "$RG_ANSWER"
+  while :; do
+    _Ask_ "$hint" "$current" || return 1
+    if _ValidateSettingValue_ "$key" "$RG_ANSWER"; then
+      _SetSetting_ "$key" "$RG_ANSWER"
+      return $?
+    fi
+    _Say_ '  Invalid setting. Please try again, or enter e/exit to cancel.'
+  done
 }
 
 _ShowMonitoringSettingsMenu_() {
@@ -6583,17 +6822,17 @@ _ShowIntegrationSettingsMenu_() {
 }
 
 _IsValidDNSCheck_() {
-  _IsValidDomain_ "$1" && _IsValidRecordType_ "$2" && _IsValidRCODE_ "$3" &&
+  _IsValidDomain_ "$1" && _IsSupportedHealthRecordType_ "$2" && _IsValidRCODE_ "$3" &&
     _IsValidDNSAnswerCount_ "$4" && _IsSafeToken_ "$5"
 }
 
 _PromptDNSCheck_() {
   local qname qtype rcode count rdata
-  _Ask_ 'DNS hostname' "${1:-}" || return 1; qname="$RG_ANSWER"
-  _Ask_ 'DNS record type (A/AAAA etc.)' "${2:-A}" || return 1; qtype="$RG_ANSWER"
-  _Ask_ 'Expected RCODE' "${3:-NOERROR}" || return 1; rcode="$RG_ANSWER"
-  _Ask_ 'Expected answer count (ANY, AT_LEAST_1, or exact number)' "${4:-ANY}" || return 1; count="$RG_ANSWER"
-  _Ask_ 'Expected record data (- to ignore)' "${5:--}" || return 1; rdata="$RG_ANSWER"
+  _AskValidated_ 'DNS hostname' "${1:-}" _IsValidDomain_ || return 1; qname="$RG_ANSWER"
+  _AskValidated_ 'DNS record type (e.g. A/AAAA/CNAME/MX/TXT)' "${2:-A}" _IsSupportedHealthRecordType_ upper || return 1; qtype="$RG_ANSWER"
+  _AskValidated_ 'Expected RCODE' "${3:-NOERROR}" _IsValidRCODE_ upper || return 1; rcode="$RG_ANSWER"
+  _AskValidated_ 'Expected answer count (ANY, AT_LEAST_1, or exact number)' "${4:-ANY}" _IsValidDNSAnswerCount_ upper || return 1; count="$RG_ANSWER"
+  _AskValidated_ 'Expected record data (- to ignore)' "${5:--}" _IsSafeToken_ || return 1; rdata="$RG_ANSWER"
   _IsValidDNSCheck_ "$qname" "$qtype" "$rcode" "$count" "$rdata" || {
     _Fail_ 'Invalid DNS check fields'; return 1;
   }
@@ -6620,8 +6859,9 @@ _ShowDNSHealthChecksMenu_() {
         oldkey="$(printf '%s\n' "$RG_CHECK_ROW" | cut -d'|' -f1-2)"
         _ChangeTSVFile_ "$CHECKS" check add "$oldkey" "$RG_CHECK_ROW"; _PromptEnter_ ;;
       CH|DE)
-        _Ask_ 'Existing hostname' '' || return 0; host="$RG_ANSWER"
-        _Ask_ 'Existing record type' A || return 0; type="$RG_ANSWER"
+        _AskValidated_ 'Existing hostname' '' _IsValidDomain_ || continue; host="$RG_ANSWER"
+        # Lookup must still accept an old invalid type so it can be repaired.
+        _AskValidated_ 'Existing record type' A _IsValidRecordType_ upper || continue; type="$RG_ANSWER"
         oldkey="$host|$type"
         oldrow="$(awk -F'|' -v h="$host" -v t="$type" '$1==h && $2==t {print;exit}' "$CHECKS")"
         [ -n "$oldrow" ] || { _Fail_ 'DNS health check not found'; _PromptEnter_; continue; }
@@ -6716,10 +6956,13 @@ _InstallBackupPreset_() (
 )
 
 _AskBackupField_() {
-  _Ask_ "$1" "${2:-}" || return 1
-  case "$(_NormalizeMenuChoice_ "$RG_ANSWER")" in
-    E|EXIT) _Say_ '  Backup edit cancelled without saving.'; return 1 ;;
-  esac
+  local validator
+  validator="${3:-}"
+  if [ -n "$validator" ]; then
+    _AskValidated_ "$1" "${2:-}" "$validator"
+  else
+    _Ask_ "$1" "${2:-}"
+  fi
 }
 
 _ShowBackupResolversMenu_() {
@@ -6752,20 +6995,20 @@ _ShowBackupResolversMenu_() {
           fi
         fi
         if [ "$choice" = CH ]; then
-          _AskBackupField_ 'Existing resolver ID' '' || continue; id="$RG_ANSWER"
+          _AskBackupField_ 'Existing resolver ID' '' _IsValidBackupProviderID_ || continue; id="$RG_ANSWER"
           oldrow="$(awk -F'|' -v z="$id" '$1==z {print;exit}' "$EXTRA_PROVIDERS")"
           [ -n "$oldrow" ] || { _Fail_ 'Resolver not found'; _PromptEnter_; continue; }
           IFS='|' read -r id ip tls tport <<EOF_RG_PROVIDER
 $oldrow
 EOF_RG_PROVIDER
         else
-          _AskBackupField_ 'New resolver ID' '' || continue; id="$RG_ANSWER"
+          _AskBackupField_ 'New resolver ID' '' _IsValidBackupProviderID_ || continue; id="$RG_ANSWER"
           ip=''; tls=''; tport='853'
         fi
         _Say_ 'Enter e or exit at any prompt to cancel.'
-        _AskBackupField_ 'Resolver IPv4/IPv6' "$ip" || continue; ip="$RG_ANSWER"
-        _AskBackupField_ 'Certificate TLS authentication hostname' "$tls" || continue; tls="$RG_ANSWER"
-        _AskBackupField_ 'Upstream TLS port' "${tport:-853}" || continue; tport="$RG_ANSWER"
+        _AskBackupField_ 'Resolver IPv4/IPv6' "$ip" _IsValidIP_ || continue; ip="$RG_ANSWER"
+        _AskBackupField_ 'Certificate TLS authentication hostname' "$tls" _IsValidDomain_ || continue; tls="$RG_ANSWER"
+        _AskBackupField_ 'Upstream TLS port' "${tport:-853}" _IsValidTLSPort_ || continue; tport="$RG_ANSWER"
         if ! _IsValidID_ "$id" || ! _IsValidIP_ "$ip" || ! _IsValidDomain_ "$tls" || ! _IsValidTLSPort_ "$tport"; then
           _Fail_ 'Invalid provider ID, IPv4/IPv6, TLS name or port'; _PromptEnter_; continue
         fi
@@ -6778,7 +7021,7 @@ EOF_RG_PROVIDER
         _PromptEnter_ ;;
       DE)
         _CheckConfigurationSafety_ || { _PromptEnter_; continue; }
-        _AskBackupField_ 'Resolver ID to delete' '' || continue; id="$RG_ANSWER"
+        _AskBackupField_ 'Resolver ID to delete' '' _IsValidBackupProviderID_ || continue; id="$RG_ANSWER"
         _ConfirmYesNo_ "Delete backup resolver $id?" && _ChangeTSVFile_ "$EXTRA_PROVIDERS" provider del "$id"
         _PromptEnter_ ;;
       E|EXIT) return 0 ;;
@@ -6922,6 +7165,7 @@ _ReadReleaseManifest_() {
 }
 
 _UpdateSafetyPreflight_() {
+  _RequireGatewayRole_ || return 1
   _IsInstallationComplete_ || {
     _Fail_ 'ResolvGuard installation has not completed'; return 1;
   }
@@ -7325,12 +7569,9 @@ _UninstallNeverEnrolled_() {
     # an unenrolled installation: it only restores the independent WebUI.
     # Refuse stray/modified references rather than deleting a foreign hook.
     if grep -F "$ROOT/resolvguard.sh" "$hook" >/dev/null 2>&1 ||
-       grep -F '# RESOLVGUARD STARTUP' "$hook" >/dev/null ||
-       grep -Fqx '# RESOLVGUARD BEGIN' "$hook" ||
-       grep -Fqx '# RESOLVGUARD END' "$hook"; then
+       grep -F '# RESOLVGUARD STARTUP' "$hook" >/dev/null; then
       _CheckOwnedStartupHook_ || return 1
-      if { ! grep -Fqx "$(_StartupHookLine_)" "$hook" &&
-           ! grep -Fqx '# RESOLVGUARD BEGIN' "$hook"; } ||
+      if ! grep -Fqx "$(_StartupHookLine_)" "$hook" ||
          [ "$(grep -Fc "$ROOT/resolvguard.sh" "$hook")" -ne 1 ]; then
         _Fail_ 'Unrecognized ResolvGuard services-start reference; uninstall blocked'
         return 1
@@ -7408,8 +7649,8 @@ _UninstallLocked_() {
      { [ -f /jffs/scripts/service-event ] &&
        { grep -Fq '# RESOLVGUARD MANUAL' /jffs/scripts/service-event ||
          grep -Fq '# RESOLVGUARD CONFIG' /jffs/scripts/service-event ||
-         grep -Fq '# RESOLVGUARD WEBUI MANUAL BEGIN' /jffs/scripts/service-event ||
-         grep -Fq '# RESOLVGUARD WEBUI CONFIG BEGIN' /jffs/scripts/service-event; }; }; then
+         grep -Fq 'ResolvGuardManualCheck' /jffs/scripts/service-event ||
+         grep -Fq 'ResolvGuardCfg' /jffs/scripts/service-event; }; }; then
     _RGWebUI_ unmount || {
       _Fail_ 'WebUI cleanup failed; installation retained for inspection'
       return 1
@@ -7500,8 +7741,15 @@ _SaveInspectedDNSCheck_() {
       _Say_ '  4. RCODE, address and count'
     fi
     _Say_ '  e. Finish without saving this health check (exit also works)'
-    _Ask_ 'Rule precision' 1 || return 1
-    mode="$(_NormalizeMenuChoice_ "$RG_ANSWER")"
+    while :; do
+      _Ask_ 'Rule precision' 1 choice || return 1
+      mode="$(_NormalizeMenuChoice_ "$RG_ANSWER")"
+      case "$mode" in
+        1|2|E|EXIT) break ;;
+        3|4) if [ "$value" != '-' ]; then break; fi ;;
+      esac
+      _Say_ '  Choose one of the displayed options, or enter e/exit.'
+    done
     case "$mode" in
       1) : ;;
       2) expected_count="$count" ;;
@@ -7562,8 +7810,7 @@ _InspectAndSaveHealthCheck_() (
   _Say_ 'Live DNS Inspection and Guided Health Checks'
   _Say_ 'Enter a hostname or HTTP(S) URL. ResolvGuard queries every configured'
   _Say_ 'resolver through strict authenticated DoT, without changing WAN DNS.'
-  _Ask_ 'Hostname or HTTP(S) URL' '' || return 1
-  [ -n "$RG_ANSWER" ] || { _Say_ 'Cancelled.'; return 0; }
+  _AskValidated_ 'Hostname or HTTP(S) URL' '' _IsInspectorInput_ || return 1
   host="$RG_ANSWER"
   mode="$(_GetRouterIPv6Mode_)"
   case "$mode" in
@@ -7571,9 +7818,8 @@ _InspectAndSaveHealthCheck_() (
     disabled) recommended=A; _Say_ '  IPv6 is disabled; A recommended. AAAA remains available.' ;;
     *) recommended=A; _Say_ '  IPv6 state unknown; A recommended. AAAA remains available.' ;;
   esac
-  _Ask_ 'Record types (A/AAAA/BOTH)' "$recommended" || return 1
-  record_types="$(printf '%s' "$RG_ANSWER" | tr '[:lower:]' '[:upper:]')"
-  case "$record_types" in A|AAAA|BOTH) :;; *) _Fail_ 'Choose A, AAAA or BOTH'; return 1;; esac
+  _AskValidated_ 'Record types (A/AAAA/BOTH)' "$recommended" _IsInspectorRecordChoice_ upper || return 1
+  record_types="$RG_ANSWER"
   if ! _InspectDNS_ "$host" "$record_types" all summary "$capture"; then
     _Say_ 'Some resolver responses failed. Only usable results are offered below.'
   fi
@@ -7604,14 +7850,20 @@ _InspectAndSaveHealthCheck_() (
     [ "$available" -gt 0 ] || { _Say_ 'No successful DNS responses to save.'; return 1; }
     _Say_ '  Select a number only if you want to create a DNS health check.'
     _Say_ '  e. Finish inspection (exit also works)'
-    _Ask_ 'Result number or e to finish' '' || return 1
-    selection="$(_NormalizeMenuChoice_ "$RG_ANSWER")"
-    case "$selection" in
-      E|EXIT) _Say_ 'Inspection finished. No additional changes requested.'; return 0 ;;
-      '') _ShowInvalidSelection_; continue ;;
-      *[!0-9]*|0) _Fail_ 'Invalid result number'; return 1 ;;
-    esac
-    [ "$selection" -le "$available" ] || { _Fail_ 'Result number out of range'; return 1; }
+    while :; do
+      _Ask_ 'Result number or e to finish' '' choice || return 1
+      selection="$(_NormalizeMenuChoice_ "$RG_ANSWER")"
+      case "$selection" in
+        E|EXIT) _Say_ 'Inspection finished. No additional changes requested.'; return 0 ;;
+        ''|*[!0-9]*|0) _Say_ '  Enter a displayed result number, or e/exit to finish.'; continue ;;
+      esac
+      # Bound input before integer comparison: huge numeric pastes are invalid.
+      if [ "${#selection}" -gt 8 ] || [ "$selection" -gt "$available" ] || [ "$selection" -lt 1 ]; then
+        _Say_ '  Result number out of range. Please try again.'
+        continue
+      fi
+      break
+    done
     row="$(awk -F'|' -v n="$selection" '
         ($3=="A" || $3=="AAAA") && ($4=="NOERROR" || $4=="NXDOMAIN") {if (++i==n) {print;exit}}' "$capture")"
     [ -n "$row" ] || { _Fail_ 'Selected result unavailable'; return 1; }
@@ -7639,26 +7891,6 @@ _ShowDiscoveredProvidersAndPools_() {
   else
     _Say_ 'Resolver discovery: BUSY or WAN verification pending. Retry shortly.'
   fi
-}
-
-_ShowPolicyMenu_() {
-  local choice
-  while :; do
-    _ShowHeader_ 'Advanced Policy Administration'
-    _PrintMenuItem_ ap 'Review / Approve DNS Policy'
-    _PrintMenuItem_ rp 'Revoke DNS Policy'
-    _PrintMenuItem_ e 'Back'
-    _PrintMenuFooter_
-    IFS= read -r choice || return 0
-    choice="$(_NormalizeMenuChoice_ "$choice")"
-    printf '\n'
-    case "$choice" in
-      AP) _ApprovePolicy_; _PromptEnter_ ;;
-      RP) _RevokePolicy_; _PromptEnter_ ;;
-      E|EXIT) return 0 ;;
-      *) _ShowInvalidSelection_ ;;
-    esac
-  done
 }
 
 _ShowAdvancedSettingsMenu_() {
@@ -7730,6 +7962,9 @@ _ShowQuickStatus_() {
   local active mode approval pool_summary sync_ok
   local pool_colour mode_colour approval_colour
 
+  # View Status must also work when Quick Setup preferred enrollment is declined.
+  # The optional filtered-pool note below reads active even in that state.
+  active='NOT ENROLLED'
   sync_ok=1
   _ShowHeader_ 'Protection Status'
 
@@ -7834,11 +8069,17 @@ _ShowQuickStatus_() {
 }
 
 _ConfigureQuickBackup_() {
-  local selected name ip1 ip2 host proposed staged
+  local selected name ip1 ip2 host proposed staged recursive_unbound
+  recursive_unbound=0
+  if _RecursiveUnboundProduction_; then recursive_unbound=1; fi
   _PrepareProviders_ && _PrepareResolverPools_ || return 1
   if awk -F'|' '$1 ~ /^(backup|wanpool)[0-9]+$/ {found=1} END{exit !found}' "$POOLS"; then
     _ShowSetupStep_ 2 'ALTERNATE DNS POOLS'
     printf '  %sConfigured alternate pools: %s%s\n' "$RG_GREEN" "$(_DescribeAlternatePools_)" "$RG_RESET"
+    if [ "$recursive_unbound" -eq 1 ]; then
+      _Say_ '  Recursive Unbound: saved WAN DoT backups will not activate automatically.'
+      _Say_ '  Monitoring Only does not change Unbound or its routing.'
+    fi
     return 0
   fi
   if awk -F'|' '$1 !~ /^#/ && $1!="" {found=1} END{exit !found}' "$EXTRA_PROVIDERS"; then
@@ -7847,6 +8088,10 @@ _ConfigureQuickBackup_() {
   fi
   while :; do
     _ShowSetupStep_ 2 'BACKUP DNS'
+    if [ "$recursive_unbound" -eq 1 ]; then
+      _Say_ '  Recursive Unbound: backups are saved for WAN DoT, not Unbound.'
+      _Say_ '  Monitoring Only will not activate these backups automatically.'
+    fi
     _PrintBackupPresetChoices_
     if awk -F'|' '$1 ~ /^wan[0-9]+$/ && $3=="dns.google" {found=1} END{exit !found}' "$PREF_PROVIDERS"; then
       proposed=cs
@@ -7941,7 +8186,14 @@ _RunQuickSetupWizard_() {
     printf '  %sCurrent router DNS (Strict DoT):%s\n' "$RG_BOLD" "$RG_RESET"
     awk -F'|' -v col="$RG_CYAN" -v reset="$RG_RESET" \
       '$1 ~ /^wan[0-9]+$/ {printf "    %s%-39s%s %s\n",col,$2,reset,$3}' "$PROVIDERS"
-    _ConfirmYesNo_ 'Use ALL these as preferred DNS (and restore point)?' || return 1
+    _Say_ '  Enrollment saves these existing WAN DoT resolvers as a restore point.'
+    _Say_ '  It does NOT change ASUS WAN DNS, Unbound, or DNS routing.'
+    if _RecursiveUnboundProduction_; then
+      _Say_ '  Recursive Unbound uses a separate DNS path, not this WAN DoT pool.'
+      _ConfirmYesNo_ 'Save as preferred WAN DoT monitoring pool?' || return 1
+    else
+      _ConfirmYesNo_ 'Save as preferred WAN DoT pool?' || return 1
+    fi
     _EnrollPreferredDNS_ >/dev/null || return 1
     printf '  %sPreferred DNS saved.%s\n' "$RG_GREEN" "$RG_RESET"
   else
@@ -8078,7 +8330,6 @@ _ShowAdvancedOptionsMenu_() {
     _ShowHeader_ 'Advanced Options'
     _PrintMenuItem_ dc 'DNS Configuration, Health Checks and Resolvers'
     _PrintMenuItem_ md 'Monitoring, Diagnostics & Logs'
-    _PrintMenuItem_ pa 'Policy Approval and Revocation'
     _PrintMenuItem_ mr 'Maintenance & Recovery'
     _PrintMenuItem_ e 'Back'
     _PrintMenuFooter_
@@ -8089,7 +8340,6 @@ _ShowAdvancedOptionsMenu_() {
       DC) _ShowConfigurationMenu_ ;;
       # Backwards-compatible hidden alias: dt opens the merged diagnostics menu.
       MD|DT) _ShowMonitoringDiagnosticsMenu_ ;;
-      PA) _ShowPolicyMenu_ ;;
       MR) _ShowAdvancedSettingsMenu_ ;;
       E|EXIT) return 0 ;;
       *) _ShowInvalidSelection_ ;;
@@ -8129,7 +8379,7 @@ _ToggleAutomaticFailover_() {
 # Blank Enter at any selection menu is invalid; only e/exit navigates.
 # Defaults and confirmation prompts intentionally retain their own Enter semantics.
 _MainMenu_() {
-  local choice state
+  local choice state policy_action
   while :; do
     _ShowHeader_ 'Main Menu'
     if ! _IsQuickSetupComplete_; then
@@ -8149,6 +8399,17 @@ _MainMenu_() {
     else
       _PrintMenuItem_ af "Automatic DNS Failover: $state (Toggle)"
     fi
+    # Read the approval record itself, not the failover marker: a CHANGED,
+    # MISSING, INVALID or BLOCKED approval needs review; only VALID can revoke.
+    # Remember the rendered action so a concurrent WebUI policy change cannot
+    # silently turn an expected approval into revocation (or vice versa).
+    if _GetPolicyApprovalState_ >/dev/null 2>&1; then
+      policy_action='revoke'
+      _PrintMenuItem_ pa 'DNS Policy Approval: REVOKE (Approved)'
+    else
+      policy_action='approve'
+      _PrintMenuItem_ pa 'DNS Policy Approval: APPROVE (Approval Required)'
+    fi
     _PrintMenuItem_ vs 'View Status'
     _PrintMenuItem_ ch 'Check DNS Health Now'
     _PrintMenuItem_ in 'Inspect Live DNS'
@@ -8167,6 +8428,29 @@ _MainMenu_() {
         fi
         _PromptEnter_ ;;
       AF) _ToggleAutomaticFailover_; _PromptEnter_ ;;
+      PA)
+        # Never choose the opposite operation when the policy has changed
+        # between rendering the menu and the administrator's selection.
+        if [ "$policy_action" = revoke ]; then
+          if _GetPolicyApprovalState_ >/dev/null 2>&1; then
+            _RevokePolicy_
+          else
+            _Say_ 'DNS policy changed since this menu was displayed. Review the refreshed menu.'
+          fi
+        else
+          if _GetPolicyApprovalState_ >/dev/null 2>&1; then
+            _Say_ 'DNS policy became approved since this menu was displayed. Review the refreshed menu.'
+          else
+            # Approval of a changed policy may release an existing safety hold
+            # when unattended switching was previously enabled. Make that
+            # effect explicit before the unchanged review/consent workflow.
+            if [ -r "$AUTO_FAILOVER_MARKER" ] && [ -r "$SCHEDULE_MARKER" ]; then
+              _Say_ 'WARNING: Reapproving this policy may immediately resume automatic WAN switching.'
+            fi
+            _ApprovePolicy_
+          fi
+        fi
+        _PromptEnter_ ;;
       VS) _ShowQuickStatus_; _PromptEnter_ ;;
       CH) _ValidateConfiguration_ >/dev/null && _RunDNSHealthCheck_; _PromptEnter_ ;;
       IN) _InspectAndSaveHealthCheck_; _PromptEnter_ ;;
@@ -8268,7 +8552,7 @@ probe is a read-only DNS response inspector. Main Menu IN option can save select
 Install and first run initialize missing config/settings.conf, config/checks.tsv and config/extra-providers.tsv without overwriting existing files.
 Quick Setup checks for Entware bind-dig and offers to install it with permission if missing. A separate onboarding completion record is written only after successful setup (including Monitoring Only or deliberately inactive operation). Run dependencies to check/install dig separately.
 Install creates a shared services-start hook for the independent WebUI. It does not enable cron, DNS monitoring, or automatic failover.
-Main Menu toggles Automatic DNS Failover; policy review and scheduling are integrated.
+Main Menu toggles Automatic DNS Failover and offers a single context-sensitive DNS Policy Approval action (Approve when not valid, Revoke when valid); policy review and explicit confirmation remain required.
 Unattended failover requires a persistent, operator-approved DNS policy.
 Unexpected answer data/count is monitored as resolver-health failure. Automatic WAN switching still requires corroboration, a safe independently verified destination, and approved policy. An uncorroborated or universally stale DNS policy cannot authorize a switch.
 On boot, startup re-registers cron and reconciles known WAN state without WAN writes.

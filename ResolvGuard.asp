@@ -24,6 +24,34 @@
 #rg-shell-title { color:#eff5f5; padding:14px 18px 0; background:#101d24; font-size:17px; font-weight:bold; }
 #rg-shell-subtitle { padding:4px 18px 10px; background:#101d24; color:#9ab3b9; font-size:12px; }
 #rg-native-host { padding:8px; background:#26353a; }
+/* The ASUS action_wait spinner is a timer, not a completion signal. The
+   embedded dashboard uses its own correlated-result progress dialog. */
+#Loading { display:none!important; }
+#rg-progress-backdrop[hidden] { display:none!important; }
+#rg-progress-backdrop { position:fixed; inset:0; z-index:30000; display:flex;
+  align-items:center; justify-content:center; background:rgba(4,11,15,.78);
+  padding:20px; backdrop-filter:blur(3px); }
+#rg-progress-dialog { width:min(410px,100%); padding:25px; background:#14242c;
+  color:#edf6f5; border:1px solid #40616a; border-radius:16px;
+  box-shadow:0 22px 65px rgba(0,0,0,.6); font:14px/1.5 Inter,Arial,sans-serif; }
+#rg-progress-top { display:flex; align-items:center; gap:15px; }
+#rg-progress-spin { width:38px; height:38px; flex-shrink:0; border-radius:50%;
+  border:4px solid #33565b; border-top-color:#63e8b6; animation:rg-progress-spin .8s linear infinite; }
+#rg-progress-spin.rg-done { animation:none; border-color:#63e8b6; }
+#rg-progress-spin.rg-error { animation:none; border-color:#ff817e; }
+@keyframes rg-progress-spin { to { transform:rotate(360deg); } }
+#rg-progress-title { font-weight:750; font-size:17px; line-height:1.3; }
+#rg-progress-status { margin-top:8px; font-size:12px; color:#b7d0d0; min-height:32px; }
+#rg-progress-track { width:100%; height:9px; margin-top:14px; overflow:hidden;
+  background:#283f46; border-radius:8px; }
+#rg-progress-fill { width:0; height:100%; border-radius:8px; background:#63e8b6;
+  transition:width .35s ease; }
+#rg-progress-number { margin-top:8px; text-align:right; font-weight:750; color:#c0f6e0; }
+#rg-progress-caption { font-size:11px; color:#94aeb4; margin:2px 0 0; }
+#rg-progress-close { display:block; margin:16px 0 0 auto; background:#1c4953;
+  color:#f2faf8; border:1px solid #4e7883; padding:8px 18px; border-radius:10px; cursor:pointer; }
+#rg-progress-close[hidden] { display:none!important; }
+@media(prefers-reduced-motion:reduce) { #rg-progress-spin { animation:none; } #rg-progress-fill {transition:none;} }
 </style>
 <script type="text/javascript">
 function rgRequestManualCheck() {
@@ -66,6 +94,64 @@ function rgFinishConfiguration() {
   try { if (typeof hideLoading === 'function') hideLoading(); } catch(e) {}
   var overlay=document.getElementById('Loading');
   if (overlay) overlay.style.display='none';
+}
+// Router results, not action_wait, determine when this reaches 100%.
+// The intermediate percentage is an estimate; it never claims a completed
+// update or configuration change before the matching request is acknowledged.
+var rgOperation={active:false,timer:null,closeTimer:null,started:0,timeout:0,percent:0};
+function rgProgressPaint(percent,detail) {
+  if(!rgOperation.active) return;
+  rgOperation.percent=Math.max(rgOperation.percent,Math.min(100,Math.floor(percent)));
+  document.getElementById('rg-progress-fill').style.width=rgOperation.percent+'%';
+  document.getElementById('rg-progress-number').textContent=rgOperation.percent+'%';
+  document.getElementById('rg-progress-track').setAttribute('aria-valuenow',String(rgOperation.percent));
+  if(typeof detail==='string') document.getElementById('rg-progress-status').textContent=detail;
+}
+function rgProgressDismiss() {
+  if(rgOperation.timer) clearInterval(rgOperation.timer);
+  if(rgOperation.closeTimer) clearTimeout(rgOperation.closeTimer);
+  rgOperation.timer=null;rgOperation.closeTimer=null;rgOperation.active=false;
+  document.getElementById('rg-progress-backdrop').hidden=true;
+}
+function rgBeginOperation(label,timeout) {
+  if(rgOperation.active) return false;
+  if(rgOperation.timer) clearInterval(rgOperation.timer);
+  if(rgOperation.closeTimer) clearTimeout(rgOperation.closeTimer);
+  rgOperation={active:true,timer:null,closeTimer:null,started:Date.now(),
+    timeout:Math.max(1000,Number(timeout)||25000),percent:0};
+  document.getElementById('rg-progress-title').textContent=label;
+  document.getElementById('rg-progress-spin').className='';
+  document.getElementById('rg-progress-close').hidden=true;
+  document.getElementById('rg-progress-caption').textContent='Progress estimated while waiting; 100% requires a router response.';
+  document.getElementById('rg-progress-backdrop').hidden=false;
+  rgProgressPaint(10,'Submitting an authenticated request to the router…');
+  rgOperation.timer=setInterval(function(){
+    // Stop short of 100%; the router's matched result controls completion.
+    var elapsed=Date.now()-rgOperation.started;
+    var estimate=10+80*(1-Math.exp(-elapsed/(rgOperation.timeout*.35)));
+    rgProgressPaint(Math.min(90,estimate));
+  },500);
+  return true;
+}
+function rgProgressStage(detail,percent) { rgProgressPaint(Math.min(95,Number(percent)||rgOperation.percent),detail); }
+function rgEndOperation(succeeded,detail,confirmed) {
+  if(!rgOperation.active) return;
+  if(rgOperation.timer) clearInterval(rgOperation.timer);
+  rgOperation.timer=null;
+  var spinner=document.getElementById('rg-progress-spin');
+  spinner.className=succeeded?'rg-done':'rg-error';
+  if(confirmed){
+    rgProgressPaint(100,detail||(succeeded?'Router confirmed completion.':'Router reported an error.'));
+    document.getElementById('rg-progress-caption').textContent=succeeded?'Completed and confirmed by router.':'Router responded; this operation needs attention.';
+  }else{
+    rgProgressPaint(rgOperation.percent,detail||'Router confirmation missing. Check SSH before retrying.');
+    document.getElementById('rg-progress-caption').textContent='Unable to confirm completion; percentage intentionally stopped below 100%.';
+  }
+  if(succeeded&&confirmed){
+    rgOperation.closeTimer=setTimeout(rgProgressDismiss,1600);
+  }else{
+    document.getElementById('rg-progress-close').hidden=false;
+  }
 }
 function initial() {
   if (typeof show_menu === 'function') show_menu();
@@ -111,6 +197,15 @@ function rgDashboardLoaded() {
 <body class="bg" onload="initial();">
 <div id="TopBanner"></div>
 <div id="Loading" class="popup_bg"></div>
+<div id="rg-progress-backdrop" hidden>
+  <div id="rg-progress-dialog" role="dialog" aria-modal="true" aria-labelledby="rg-progress-title" aria-describedby="rg-progress-status">
+    <div id="rg-progress-top"><div id="rg-progress-spin" aria-hidden="true"></div><div id="rg-progress-title">Working…</div></div>
+    <div id="rg-progress-status" role="status" aria-live="polite">Waiting for router…</div>
+    <div id="rg-progress-track" role="progressbar" aria-label="Estimated operation progress" aria-valuemin="0" aria-valuemax="100"><div id="rg-progress-fill"></div></div>
+    <div id="rg-progress-number">0%</div><p id="rg-progress-caption"></p>
+    <button type="button" id="rg-progress-close" onclick="rgProgressDismiss()" hidden>Dismiss</button>
+  </div>
+</div>
 <table class="content" cellpadding="0" cellspacing="0" style="margin:0 auto;">
 <tr><td width="17">&nbsp;</td><td width="202" valign="top">
 <div id="mainMenu"></div><div id="subMenu"></div>
@@ -144,7 +239,7 @@ function rgDashboardLoaded() {
   <input type="hidden" name="action_script" value="" />
   <input type="hidden" name="amng_custom" value="" />
   <input type="hidden" name="action_mode" value="apply" />
-  <input type="hidden" name="action_wait" value="10" />
+  <input type="hidden" name="action_wait" value="0" />
   <input type="hidden" name="current_page" value="" />
   <input type="hidden" name="next_page" value="" />
   <input type="hidden" name="modified" value="0" />
@@ -378,6 +473,17 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
 .rg-help-trigger{flex:0 0 20px;width:20px;height:20px;display:inline-flex;align-items:center;justify-content:center;padding:0;border:1px solid #56847d;border-radius:50%;background:#1a3b3c;color:#bcefe2;font-size:12px;font-family:inherit;font-weight:800;line-height:1;cursor:help}
 .rg-help-trigger:hover,.rg-help-trigger:focus-visible{background:#315e54;border-color:#8aebc0;color:#fff;outline:2px solid transparent;box-shadow:0 0 0 2px #8aebc078}
 .rg-help-trigger[aria-expanded="true"]{background:#315e54;border-color:#8aebc0}
+/* DNS Policy Approval is reviewed inline so it works in Merlin's tall iframe. */
+.rg-policy-review{margin-top:14px;padding:15px;border:1px solid #355b60;border-radius:12px;background:#112830}
+.rg-policy-review[hidden]{display:none!important}
+.rg-policy-review h4{font-size:12px;margin:14px 0 6px;color:#b8e6d6}
+.rg-policy-review ul{margin:5px 0 0 19px;padding:0;line-height:1.75;font-size:12px;color:#d1e2df}
+.rg-policy-review li{overflow-wrap:anywhere}
+.rg-policy-review .rg-policy-fingerprint{overflow-wrap:anywhere;font-family:monospace;color:#92b7bc;font-size:11px}
+.rg-policy-consent{display:flex;align-items:flex-start;gap:10px;font-size:12px;line-height:1.5;margin:14px 0}
+.rg-policy-consent input{margin-top:3px;flex-shrink:0}
+.rg-policy-line{margin:8px 0;font-size:12px;color:#bbd4d0}
+.rg-policy-alert{border-left:3px solid #e8b976;background:#40302158;padding:10px 12px;border-radius:6px;color:#f3d3a2}
 .rg-settings-tooltip{position:fixed;z-index:1000;width:min(340px,calc(100vw - 24px));box-sizing:border-box;background:#193138;border:1px solid #689e93;border-radius:11px;box-shadow:0 14px 32px #000a;padding:14px 16px;color:#e8f5f1;font-size:12px;line-height:1.55;pointer-events:none}
 .rg-settings-tooltip[hidden]{display:none!important}
 .rg-settings-tooltip strong{display:block;color:#d4fff0;font-size:13px;margin-bottom:7px}
@@ -388,6 +494,8 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
 /* The Unbound scope notice appears only in recursive mode. Give the History
    toolbar breathing room without changing spacing when the notice is hidden. */
 #unboundHistoryNotice:not(.hidden) { margin-bottom:16px; }
+
+.rg-control-row{display:flex;align-items:center;justify-content:space-between;gap:18px}.rg-control-row>div{flex:1}.rg-control-row strong{font-size:13px}.rg-control-row .desc{margin:5px 0}.rg-state-toggle{min-width:90px;flex-shrink:0}.rg-state-toggle[aria-checked="true"]{background:#194a3b;border-color:#51c49a;color:#acffdc}.rg-state-toggle[disabled]{opacity:.48}.rg-state-toggle[aria-checked="true"]:disabled{opacity:.75}.rg-check-row{display:flex;justify-content:space-between;align-items:center;gap:14px;padding:14px 20px;border-top:1px solid #274049}.rg-check-info{min-width:0}.rg-check-info strong{font-size:12px;overflow-wrap:anywhere}.rg-check-info small{display:block;color:#85a3ad;margin-top:5px;font-size:11px}.rg-check-row .rg-actions{margin:0;flex-shrink:0}#checkExactField[hidden]{display:none!important}@media(max-width:650px){.rg-check-row{align-items:flex-start;flex-direction:column}.rg-check-row .rg-actions{width:100%}.rg-control-row{align-items:flex-start;flex-direction:column}.rg-state-toggle{align-self:flex-end}}
 </style>
 <script>document.body.classList.add('rg-embedded');</script>
 <div class="app">
@@ -398,11 +506,12 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
   <button class="nav" data-tab="history"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18M6 17l5-6 4 3 6-8"/></svg> Health history</button>
   <button class="nav" data-tab="paths"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="5" cy="12" r="3"/><circle cx="19" cy="5" r="3"/><circle cx="19" cy="19" r="3"/><path d="M8 12h5m0 0 3-5m-3 5 3 5"/></svg> DNS paths & exceptions</button>
   <button class="nav" data-tab="backups"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="12" r="3"/><circle cx="18" cy="6" r="3"/><circle cx="18" cy="18" r="3"/><path d="M9 12h6m-1-4 2-2m-2 10 2 2"/></svg> Backup &amp; Alternate Resolvers</button>
+  <button class="nav" data-tab="checks"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 5h14M5 12h14M5 19h14"/><circle cx="9" cy="5" r="2"/><circle cx="15" cy="12" r="2"/><circle cx="9" cy="19" r="2"/></svg> DNS Health Checks</button>
   <button class="nav" data-tab="settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v3m0 14v3M4 4l2.2 2.2M17.8 17.8 20 20M2 12h3m14 0h3M4 20l2.2-2.2M17.8 6.2 20 4"/></svg> Settings</button>
   <div class="side-bottom"><div class="small-pill"><span class="dot"></span> DNS monitoring</div><div class="small-note">Scheduled monitoring snapshots<br>Optional read-only live checks<br>Primary WAN DNS stays in ASUS settings</div></div>
 </aside>
 <main class="main">
-  <div class="tabs-mobile"><button class="m-tab active" data-tab="overview">Overview</button><button class="m-tab" data-tab="history">History</button><button class="m-tab" data-tab="paths">DNS Paths</button><button class="m-tab" data-tab="backups">Backups</button><button class="m-tab" data-tab="settings">Settings</button></div>
+  <div class="tabs-mobile"><button class="m-tab active" data-tab="overview">Overview</button><button class="m-tab" data-tab="history">History</button><button class="m-tab" data-tab="paths">DNS Paths</button><button class="m-tab" data-tab="backups">Backups</button><button class="m-tab" data-tab="checks">Health Checks</button><button class="m-tab" data-tab="settings">Settings</button></div>
   <header class="top"><div><div class="eyebrow">Intelligent DNS monitoring</div><h1 class="page-title" id="pageTitle">Dashboard overview</h1><div class="desc" id="pageDesc">Your DNS reliability, clearly visible.</div></div><div class="top-tools"><span class="tag demo" id="feedStatus">CONNECTING...</span><button class="btn primary" id="runHealthCheck"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v18M3 12h18"/></svg> Run Health Check</button></div></header>
   <section class="manual-panel" id="manualPanel" hidden aria-live="polite">
     <div class="manual-head"><div><strong id="manualTitle">Manual health check</strong><div class="manual-help" id="manualSummary">A separate, read-only authenticated DoT policy evaluation.</div></div><button type="button" class="inspector-close" id="manualClose" aria-label="Close manual health-check results">×</button></div>
@@ -417,7 +526,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     <div class="note hidden" id="unboundOverviewNotice" role="status" style="margin-top:12px"><strong>Recursive Unbound currently handles LAN DNS.</strong> ResolvGuard's DoT checks are separate, and WAN failover is disabled in recursive mode. To use ResolvGuard's DoT failover, select Unbound Manager's <strong>Integrate with Stubby</strong> option.</div>
     <div class="section-head"><h3 id="overviewMetricsHeading">Network health at a glance</h3><div class="hint">Scheduled monitoring · Manual checks are independent</div></div>
     <div class="stats">
-      <div class="stat"><div class="stat-label">Preferred resolvers</div><div class="stat-val green" id="statResolvers">—</div><div class="stat-sub" id="statResolversSub">Reachable and policy-compliant</div></div>
+      <div class="stat"><div class="stat-label" id="statResolversLabel">Preferred resolvers</div><div class="stat-val green" id="statResolvers">—</div><div class="stat-sub" id="statResolversSub">Reachable and policy-compliant</div></div>
       <div class="stat"><div class="stat-label" id="statPoliciesLabel">DNS probe results</div><div class="stat-val" id="statPolicies">—</div><div class="stat-sub" id="statPoliciesDescription">Passed / total attempts · latest cycle</div></div>
       <div class="stat"><div class="stat-label" id="statPoolLabel">Active production pool</div><div class="stat-val" id="statPool" style="font-size:23px">unknown</div><div class="stat-sub" id="statPoolSub">WAN DNS configuration</div></div>
       <div class="stat"><div class="stat-label">Next scheduled cycle</div><div class="stat-val" id="statCountdown">—</div><div class="stat-sub" id="statSeq">No completed check yet</div></div>
@@ -429,7 +538,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
       <div class="card-pad" style="padding-top:10px"><div class="note">Active membership comes from the verified production WAN DNS rulelist. PASS/FAIL refers to direct authenticated DNS observations in the latest completed cycle, not individual LAN query routing.</div></div>
     </div>
     <div class="two-col">
-      <div class="card"><div class="card-head"><div><div class="card-title">Preferred DNS resolvers</div><div class="card-sub">Tap a resolver for authentication and policy details</div></div><div class="small-pill" id="preferredCount">— healthy</div></div><div id="resolverList"></div><div class="card-pad" style="padding-top:10px"><div class="note" id="resolverScopeNote">These are <strong>direct authenticated DoT probes</strong>. Production LAN DNS still uses DNSMasq → Stubby by default.</div></div></div>
+      <div class="card"><div class="card-head"><div><div class="card-title" id="preferredResolversTitle">Preferred DNS resolvers</div><div class="card-sub">Tap a resolver for authentication and policy details</div></div><div class="small-pill" id="preferredCount">— healthy</div></div><div id="resolverList"></div><div class="card-pad" style="padding-top:10px"><div class="note" id="resolverScopeNote">These are <strong>direct authenticated DoT probes</strong>. Production LAN DNS still uses DNSMasq → Stubby by default.</div></div></div>
       <div class="card"><div class="card-head"><div><div class="card-title">Recent activity</div><div class="card-sub" id="recentActivityDescription">Actual completed failover and recovery events</div></div><button class="text-link" data-tab="history">All events →</button></div><div class="feed" id="eventFeed"></div></div>
     </div>
     <div class="section-head"><h3>Quick reliability history</h3><span class="hint">Last 24 hours · 30-minute segments · live check counts</span></div>
@@ -490,13 +599,32 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
       </div>
     </div>
   </section>
+  <section id="checks" class="tab">
+    <div class="section-head" style="margin-top:0"><h3>DNS Health Checks</h3><span class="hint" id="checkRulesCount">Configured DNS answer validation rules</span></div>
+    <div class="note rg-config-note">Rules are evaluated through independent authenticated DNS-over-TLS queries. Changing them requires renewed policy approval before automatic WAN DNS switching can continue. The router validates every edit and restores the old configuration if validation fails.</div>
+    <div class="card" style="margin-top:16px">
+      <div class="card-head"><div><div class="card-title">Configured health checks</div><div class="card-sub">Hostname + record type uniquely identify a rule</div></div></div>
+      <div id="checkRows"><div class="empty">Loading health checks…</div></div>
+    </div>
+    <div class="card" style="margin-top:18px">
+      <div class="card-head"><div><div class="card-title" id="checkEditorTitle">Add a DNS health check</div><div class="card-sub">To rename a hostname or record type, remove the old rule and add a new one.</div></div><button type="button" class="btn" id="checkReset">Clear</button></div>
+      <div class="card-pad">
+        <div class="rg-fields">
+          <label>DNS hostname<input class="rg-input" id="checkHost" maxlength="253" placeholder="a.root-servers.net" autocomplete="off"></label>
+          <label>Record type<select class="rg-input" id="checkType"><option value="A">A</option><option value="AAAA">AAAA</option><option value="AFSDB">AFSDB</option><option value="APL">APL</option><option value="CAA">CAA</option><option value="CDNSKEY">CDNSKEY</option><option value="CDS">CDS</option><option value="CERT">CERT</option><option value="CNAME">CNAME</option><option value="CSYNC">CSYNC</option><option value="DHCID">DHCID</option><option value="DNAME">DNAME</option><option value="DNSKEY">DNSKEY</option><option value="DS">DS</option><option value="HINFO">HINFO</option><option value="HIP">HIP</option><option value="HTTPS">HTTPS</option><option value="IPSECKEY">IPSECKEY</option><option value="KX">KX</option><option value="LOC">LOC</option><option value="MX">MX</option><option value="NAPTR">NAPTR</option><option value="NS">NS</option><option value="NSEC">NSEC</option><option value="NSEC3">NSEC3</option><option value="NSEC3PARAM">NSEC3PARAM</option><option value="OPENPGPKEY">OPENPGPKEY</option><option value="PTR">PTR</option><option value="RP">RP</option><option value="RRSIG">RRSIG</option><option value="SMIMEA">SMIMEA</option><option value="SOA">SOA</option><option value="SPF">SPF</option><option value="SRV">SRV</option><option value="SSHFP">SSHFP</option><option value="SVCB">SVCB</option><option value="TLSA">TLSA</option><option value="TXT">TXT</option><option value="URI">URI</option><option value="ZONEMD">ZONEMD</option></select></label>
+          <label>Expected response code<input class="rg-input" id="checkRcode" maxlength="32" value="NOERROR" autocomplete="off"></label>
+          <label>Expected answer count<select class="rg-input" id="checkCountMode"><option value="AT_LEAST_1">At least one</option><option value="ANY">Any answer count</option><option value="EXACT">Exact number</option></select></label>
+          <label id="checkExactField" hidden>Exact answer count<input class="rg-input" id="checkExact" type="number" min="0" max="9999" value="1"></label>
+          <label>Expected record data<input class="rg-input" id="checkExpected" maxlength="200" value="-" placeholder="- (ignore specific answer)"></label>
+        </div>
+        <p class="desc">Choose a recognized DNS record type (A/AAAA for normal address checks). Use <code>-</code> to ignore specific record data. If an earlier version saved an unsupported type, select Repair to correct it transactionally. Any change may require policy reapproval.</p>
+        <div class="rg-actions"><button type="button" class="btn primary" id="checkSave" disabled>Save health check</button><span class="hint" id="checkEditorMode">Add new rule</span></div>
+      </div>
+    </div>
+  </section>
   <section id="settings" class="tab">
     <div class="section-head" style="margin-top:0"><h3>ResolvGuard settings</h3></div>
     <div class="note rg-config-note">These settings govern ResolvGuard's monitoring behavior.</div>
-    <div class="card" style="margin-top:16px">
-      <div class="card-head"><div><div class="card-title">Monitoring &amp; health-check parameters</div><div class="card-sub" id="settingsSummary">Loading saved configuration…</div></div></div>
-      <div id="settingsRows"></div>
-    </div>
     <div class="card" style="margin-top:16px">
       <div class="card-head"><div><div class="card-title">Script Maintenance</div><div class="card-sub">Check the selected ResolvGuard channel before installing</div></div></div>
       <div class="card-pad">
@@ -504,6 +632,41 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
         <div class="rg-actions"><button type="button" class="btn" id="scriptCheck" disabled>Check for Updates</button><button type="button" class="btn primary" id="scriptInstall" hidden disabled>Update Now</button><button type="button" class="btn" id="scriptReload" hidden>Reload WebUI</button></div>
         <p class="desc" id="scriptUpdateFeedback" role="status" aria-live="polite">No update check performed.</p>
       </div>
+    </div>
+    <div class="card" style="margin-top:16px" id="rgPolicyCard">
+      <div class="card-head"><div><div class="card-title">DNS Policy Approval</div><div class="card-sub">Review and authorize the exact WAN DoT switching policy</div></div></div>
+      <div class="card-pad">
+        <p class="rg-policy-line">Approval: <strong id="rgPolicyState">Loading…</strong></p>
+        <p class="desc" id="rgPolicyMessage">Changes to preferred WAN DNS, health checks, backups, or thresholds require a new approval before automatic switching.</p>
+        <div class="rg-actions"><button type="button" class="btn" id="rgPolicyReview" disabled>Review Policy</button></div>
+        <div class="rg-policy-review" id="rgPolicyPanel" hidden>
+          <strong>Review the current DNS policy</strong>
+          <p class="desc">This authorizes ResolvGuard to change Merlin WAN DNS automatically when monitoring and failover are enabled. It does not change your DNS configuration during approval.</p>
+          <h4>Preferred WAN DoT resolvers</h4><ul id="rgPolicyPreferred"></ul>
+          <h4>Alternate DNS providers</h4><ul id="rgPolicyAlternates"></ul>
+          <details><summary>Exact preferred WAN DoT list and integration paths</summary><pre id="rgPolicyRaw" style="white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px"></pre></details>
+          <h4>DNS answer validation rules</h4><ul id="rgPolicyChecks"></ul>
+          <h4>Monitoring and recovery controls</h4><ul id="rgPolicyThresholds"></ul>
+          <p class="rg-policy-line" id="rgPolicySafetyNotice"></p>
+          <p class="rg-policy-fingerprint" id="rgPolicyFingerprint"></p>
+          <label class="rg-policy-consent"><input type="checkbox" id="rgPolicyConsent"> <span>I have reviewed these DNS providers and health checks and authorize automatic WAN DNS switching under this policy.</span></label>
+          <div class="rg-actions"><button type="button" class="btn primary" id="rgPolicyApprove" disabled>Approve Reviewed Policy</button><button type="button" class="btn" id="rgPolicyCancel">Cancel</button></div>
+          <p id="rgPolicyFeedback" class="desc" role="status" aria-live="polite"></p>
+        </div>
+      </div>
+    </div>
+    <div class="card" id="rgMonitoringProtection" style="margin-top:16px">
+      <div class="card-head"><div><div class="card-title">Monitoring &amp; Protection</div><div class="card-sub">Recurring checks and authorization to change WAN DNS automatically</div></div></div>
+      <div class="card-pad">
+        <div class="rg-control-row"><div><strong>Recurring DNS Monitoring</strong><p class="desc">Run scheduled DNS health checks. Turning this off also disables automatic failover.</p></div><button type="button" class="btn rg-state-toggle" role="switch" aria-checked="false" id="rgMonitoringToggle" disabled>OFF</button></div>
+        <div class="rg-divider"></div>
+        <div class="rg-control-row"><div><strong>Automatic DNS Failover</strong><p class="desc" id="rgFailoverExplanation">Allow approved WAN DNS recovery only after the policy and DNS path pass safety checks.</p></div><button type="button" class="btn rg-state-toggle" role="switch" aria-checked="false" id="rgFailoverToggle" disabled>OFF</button></div>
+        <p class="desc" id="rgProtectionNotice">Policy approval and a verified supported Strict DoT forwarding path are required to enable automatic failover.</p>
+      </div>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <div class="card-head"><div><div class="card-title">Monitoring &amp; health-check parameters</div><div class="card-sub" id="settingsSummary">Loading saved configuration…</div></div></div>
+      <div id="settingsRows"></div>
     </div>
   </section>
   <div class="rg-configuration-status" id="configFeedback" role="status" aria-live="polite" hidden></div>
@@ -551,7 +714,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     // health result. An old policy hold must not masquerade as current status.
     if(d.mode==='inactive')return {title:'Monitoring is inactive.',detail:'Scheduled DNS checks and automatic WAN switching are disabled. Results below are from the last completed check, not current DNS health.',status:'unknown'};
     if(isStale(d))return {title:'Monitoring data is stale.',detail:'No recent completed health evaluation is available. This is not a passing result.',status:'unknown'};
-    if(d.mode==='hold')return {title:'Policy safety hold — automatic failover suspended.',detail:'The approved DNS policy no longer matches the configured providers or settings, or authorization could not be verified. Scheduled DNS checks continue, but unattended WAN switching is blocked. Reapprove the current policy through SSH before restoring failover.',status:'critical'};
+    if(d.mode==='hold')return {title:'Policy safety hold — automatic failover suspended.',detail:'The approved DNS policy no longer matches the configured providers or settings, or authorization could not be verified. Scheduled DNS checks continue, but unattended WAN switching is blocked. Review and approve the current DNS policy in Settings before restoring failover.',status:'critical'};
     if(!hasRealChecks(d))return {title:'Waiting for health results.',detail:'The latest completed cycle had no DNS policy observations.',status:'unknown'};
     const p=pref(d), n=p.filter(r=>r.state==='ok').length;
     const allPreferredHealthy=p.length>0&&n===p.length;
@@ -778,6 +941,8 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     const inactive=d?.mode==='inactive',historical=inactive||!d||isStale(d);
     const recoveryAlert=!!(d?.pendingTransaction||d?.recoveryHold);
     const recursive=recursiveUnbound(d);
+    $('statResolversLabel').textContent=recursive?'Preferred WAN DoT resolvers':'Preferred resolvers';
+    $('preferredResolversTitle').textContent=recursive?'Preferred WAN DoT resolvers':'Preferred DNS resolvers';
     $('unboundOverviewNotice').classList.toggle('hidden',!recursive);
     $('overviewMetricsHeading').textContent=historical?'Last recorded DNS results':recursive?'External DoT checks at a glance':'Network health at a glance';
     $('resolverViewHeading').textContent=historical?'Last recorded resolver results':'Live resolver view';
@@ -999,11 +1164,14 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     const ubPort=String(d?.unboundPort||'unknown');
     const stubbyVerified=fresh&&d?.strictDoTVerified===true;
     const dnsmasqConfigured=fresh&&d?.dnsmasqDefaultVerified===true;
+    // Separate the read-only DNSMasq -> Unbound configuration check from the
+    // stricter WAN-switching readiness gate (which rejects recursive Unbound).
+    const unboundDnsmasqConfigured=fresh&&d?.dnsmasqUnboundConfigured===true;
     const wanVerified=verified&&viaStubby;
     const checks=[];
     if(viaUnbound){
-      checks.push({title:'DNSMasq route',state:direct?'Bypassed':dnsmasqConfigured?'Configuration verified':'Not verified',ok:!direct&&dnsmasqConfigured,
-        detail:direct?'DNSMasq DNS disabled in config':'Configured server: 127.0.0.1:53535 · LAN traffic not traced'});
+      checks.push({title:'DNSMasq route',state:direct?'Bypassed':unboundDnsmasqConfigured?'Configured':'Route detected',ok:!direct&&unboundDnsmasqConfigured,
+        detail:direct?'DNSMasq DNS disabled in config':unboundDnsmasqConfigured?'Exclusive default: 127.0.0.1:53535 · LAN traffic not traced':'Server: 127.0.0.1:53535 · exclusive default not verified; LAN traffic not traced'});
       checks.push({title:'Unbound',state:ubRunning?'Running':'Not running',ok:ubRunning,
         detail:ubPort==='unknown'?'Configured listener unknown':'Configured port '+ubPort+' · live listener not tested'});
       checks.push({title:'Unbound upstream',state:upstream==='stubby'?'Stubby forwarding':upstream==='recursive'?'Recursive mode':upstream==='other'?'Other forwarder':'Unknown',ok:upstream==='stubby'||upstream==='recursive',
@@ -1029,7 +1197,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     $('pathRouteDescription').textContent=viaUnbound?'Unbound configuration detected · LAN traffic not traced':'Configured forwarding route · selected WAN pool';
     $('pathPoolBadge').textContent=viaUnbound&&!viaStubby?'Unbound path':'Pool: '+pool;
     $('pathFeedBadge').textContent=!d?'Feed unavailable':fresh?'Current snapshot':'Stale snapshot';
-    $('pathDnsmasqDetail').textContent=viaUnbound?dnsmasqConfigured?'Unbound forwarding configuration verified':'Unbound forwarding unverified':checks[0].ok?'Default route verified':'Not verified';
+    $('pathDnsmasqDetail').textContent=viaUnbound?direct?'DNSMasq DNS bypassed':unboundDnsmasqConfigured?'Configured Unbound forwarding':'Unbound forwarding route detected; not fully verified':checks[0].ok?'Default route verified':'Not verified';
     $('pathUnboundDetail').textContent=ubRunning?'Process running · port '+ubPort:'Process not running';
     $('pathStubbyDetail').textContent=stubbyVerified?'Strict DoT configured':'Not verified';
     $('pathWanName').textContent=finalName;
@@ -1059,7 +1227,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     }
   }
   function closeInspector(){$('inspectBackdrop').classList.remove('open');$('inspector').classList.remove('open');$('inspector').setAttribute('aria-hidden','true');}
-  function tab(name){closeSettingHelp();state.tab=name;waveform.setVisible(name==='overview');syncWaveSignal(state.snapshot,state.feedConnected);document.querySelectorAll('[data-tab]').forEach(el=>{const active=el.dataset.tab===name;el.classList.toggle('active',active);});document.querySelectorAll('.tab').forEach(el=>el.classList.toggle('active',el.id===name));const m={overview:['Dashboard overview','Your DNS reliability, clearly visible.'],history:['Health history','Observed DNS reliability'],paths:['DNS paths & exceptions','Inspect production routing, and scoped bypasses.'],backups:['Backup & alternate resolvers','Manage ResolvGuard backup DoT endpoints.'],settings:['ResolvGuard settings','Configure monitoring thresholds and timing using TLS authentication.']}[name];$('pageTitle').textContent=m[0];$('pageDesc').textContent=m[1];if(name==='history')renderHistory();if(name==='paths')renderPaths();if(name==='settings'||name==='backups')loadConfig();}
+  function tab(name){closeSettingHelp();state.tab=name;waveform.setVisible(name==='overview');syncWaveSignal(state.snapshot,state.feedConnected);document.querySelectorAll('[data-tab]').forEach(el=>{const active=el.dataset.tab===name;el.classList.toggle('active',active);});document.querySelectorAll('.tab').forEach(el=>el.classList.toggle('active',el.id===name));const m={overview:['Dashboard overview','Your DNS reliability, clearly visible.'],history:['Health history','Observed DNS reliability'],paths:['DNS paths & exceptions','Inspect production routing, and scoped bypasses.'],backups:['Backup & alternate resolvers','Manage ResolvGuard backup DoT endpoints.'],checks:['DNS health checks','Add, edit and remove independent DNS answer validation rules.'],settings:['ResolvGuard settings','Configure monitoring thresholds and timing using TLS authentication.']}[name];$('pageTitle').textContent=m[0];$('pageDesc').textContent=m[1];if(name==='history')renderHistory();if(name==='paths')renderPaths();if(name==='settings'||name==='backups'||name==='checks')loadConfig();}
   async function load(url){const response=await fetch(url+'?t='+Date.now(),{cache:'no-store',credentials:'same-origin'});if(!response.ok)throw Error('HTTP '+response.status);const d=JSON.parse(await response.text());if(d.schema!==1)throw Error('Unsupported feed schema');return d;}
   async function refresh(){if(state.polling)return;state.polling=true;try{
       const d=await load('/ext/ResolvGuard/status.htm');
@@ -1319,6 +1487,12 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     document.querySelectorAll('#backups button,#settingsRows .rg-save-setting').forEach(e=>e.disabled=disabled);
     $('scriptCheck').disabled=disabled;
     $('scriptInstall').disabled=disabled||state.updateBusy||!state.updateAvailable;
+    $('rgPolicyReview').disabled=disabled||!state.config?.policy?.reviewable;
+    $('rgPolicyApprove').disabled=disabled||!state.policyReviewFingerprint||!$('rgPolicyConsent').checked;
+    document.querySelectorAll('#checks .rg-check-edit,#checks .rg-check-delete,#checkSave').forEach(e=>e.disabled=disabled);
+    $('rgMonitoringToggle').disabled=disabled;
+    $('rgFailoverToggle').disabled=disabled||(!state.config?.policy?.automaticMarker&&
+      (state.config?.policy?.recursiveUnbound||state.config?.policy?.approval!=='VALID'));
   }
   function controlsBusy(b){state.configBusy=Boolean(b);syncConfigControls();}
   function renderSettingsSummary(){
@@ -1331,12 +1505,135 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     const summary=cfg.monitoringEnabled?'Monitoring enabled'+(recursive?' · WAN failover disabled in recursive mode':hold?' · POLICY SAFETY HOLD — automatic failover suspended':automatic?' · Automatic failover authorized':' · Monitoring only'):'Monitoring disabled';
     $('settingsSummary').textContent=summary+(cfg.generatedEpoch?' · Router snapshot: '+new Date(Number(cfg.generatedEpoch)*1000).toLocaleString():'');
   }
+  function closePolicyReview(){
+    state.policyReviewFingerprint='';
+    $('rgPolicyConsent').checked=false;
+    $('rgPolicyPanel').hidden=true;
+    $('rgPolicyFeedback').textContent='';
+    syncConfigControls();
+  }
+  function renderPolicySummary(){
+    const p=state.config?.policy||{}, status=String(p.approval||'BLOCKED');
+    $('rgPolicyState').textContent=status;
+    $('rgPolicyState').className=status==='VALID'?'green':(status==='CHANGED'||status==='INVALID'||status==='BLOCKED'?'amber':'');
+    const detail=p.recursiveUnbound?'Recursive Unbound detected: WAN DoT switching approval is unavailable. Monitoring Only remains supported.':
+      !p.reviewable?'Approval requires enrolled preferred WAN DoT, an active preferred pool and no unresolved recovery transaction.':
+      status==='VALID'?'The saved authorization matches the current DNS policy.':'Review the current policy to authorize unattended WAN DNS switching.';
+    $('rgPolicyMessage').textContent=detail;
+  }
+  function openPolicyReview(){
+    const cfg=state.config,p=cfg?.policy;
+    if(state.configBusy||!state.configFresh||!p?.reviewable||!(/^[0-9a-f]{64}$/.test(p.fingerprint||'')))return;
+    const items=(id,arr)=>{$(id).innerHTML=arr.length?arr.map(x=>'<li>'+esc(x)+'</li>').join(''):'<li>None configured</li>';};
+    const preferred=Array.isArray(p.preferred)?p.preferred:[];
+    const backups=Array.isArray(cfg.backups)?cfg.backups:[];
+    const checks=Array.isArray(p.checks)?p.checks:[];
+    items('rgPolicyPreferred',preferred.map(x=>x.id+' · '+x.ip+':'+x.port+' · '+x.tls));
+    items('rgPolicyAlternates',backups.map(x=>x.id+' · '+x.ip+':'+x.port+' · '+x.tls));
+    // WAN-derived alternate groups are also considered by the router's
+    // approval validator, so do not misrepresent this list as exhaustive.
+    $('rgPolicyAlternates').insertAdjacentHTML('beforeend','<li>WAN-derived provider groups: router validates eligibility during approval</li>');
+    items('rgPolicyChecks',checks.map(x=>x.name+' · '+x.type+' · '+x.rcode+' · minimum '+x.minAnswers+' answers'+(x.expected?' · expected '+x.expected:'')));
+    items('rgPolicyThresholds',['Failure threshold: '+cfg.settings.FAIL_THRESHOLD,'Recovery threshold: '+cfg.settings.RECOVERY_THRESHOLD,
+      'Schedule interval: '+cfg.settings.SCHEDULE_INTERVAL_MINUTES+' minutes','Fast confirmation: '+cfg.settings.FAST_CONFIRM_SECONDS+' seconds',
+      'Probe timeout: '+cfg.settings.TIMEOUT_SECONDS+' seconds','Startup warmup: '+cfg.settings.BOOT_MIN_UPTIME_SECONDS+' seconds']);
+    $('rgPolicySafetyNotice').textContent=p.automaticMarker?
+      'CAUTION: An automatic-failover marker already exists. Approving this policy can immediately restore unattended switching after the router verifies its safety conditions.':
+      'Approval alone will NOT enable automatic failover. Enable it separately when ready; monitoring is a separate control.';
+    $('rgPolicySafetyNotice').className=p.automaticMarker?'rg-policy-line rg-policy-alert':'rg-policy-line';
+    $('rgPolicyRaw').textContent='WAN DoT list: '+(p.preferredRulelist||'Unavailable')+'\nStubby config: '+(p.stubbyConfig||'Unknown')+'\nTrusted CA file: '+(p.caFile||'Unknown');
+    $('rgPolicyFingerprint').textContent='Policy fingerprint (SHA-256): '+p.fingerprint;
+    state.policyReviewFingerprint=p.fingerprint;
+    $('rgPolicyPanel').hidden=false;
+    $('rgPolicyConsent').checked=false;
+    $('rgPolicyFeedback').textContent='';
+    syncConfigControls();
+  }
+  async function submitPolicyApproval(){
+    const reviewed=state.policyReviewFingerprint;
+    if(!reviewed||!$('rgPolicyConsent').checked||state.configBusy||!state.configFresh||
+       state.config?.policy?.fingerprint!==reviewed)return;
+    // The checksum is not an authorization on its own: the firmware service
+    // action checks approval prerequisites, policy identity and safety locks.
+    const reenable=state.config.policy.automaticMarker;
+    if(!confirm(reenable?
+      'Approve the reviewed DNS policy? An existing failover authorization marker may cause automatic WAN switching to resume immediately.':
+      'Approve this DNS policy? This authorizes future automatic WAN switching, but does not enable failover by itself.'))return;
+    closePolicyReview();
+    await applyConfig(['policy-approve',reviewed]);
+  }
+  function renderMonitoringProtection(){
+    const cfg=state.config;if(!cfg)return;
+    const monitor=cfg.monitoringEnabled===true, marker=cfg.policy?.automaticMarker===true;
+    const recursive=cfg.policy?.recursiveUnbound===true;
+    const hold=marker&&cfg.policy?.approval!=='VALID';
+    const mt=$('rgMonitoringToggle'),at=$('rgFailoverToggle');
+    mt.setAttribute('aria-checked',monitor?'true':'false');mt.textContent=monitor?'ON':'OFF';
+    at.setAttribute('aria-checked',marker?'true':'false');at.textContent=hold?'HOLD':marker?'ON':'OFF';
+    $('rgFailoverExplanation').textContent=recursive?'Recursive Unbound is active: WAN DoT failover is unavailable. Monitoring Only remains supported.':
+      hold?'Policy Safety Hold: automatic switching is blocked. Disable the old authorization or review and approve the changed policy.':
+      'Allow approved WAN DNS recovery only after the policy and DNS path pass safety checks.';
+    $('rgProtectionNotice').textContent=recursive?'Automatic failover cannot be enabled for recursive Unbound.':
+      !monitor?'Monitoring is disabled; enabling automatic failover will also enable monitoring.':
+      cfg.policy?.approval!=='VALID'?'Policy approval is required before enabling automatic failover.':
+      'The router rechecks the active preferred pool, forwarding path, and recovery state before enabling failover.';
+  }
+  // Keep the allowed health-policy RR set consistent with the shell validator.
+  const supportedCheckTypes=new Set(["A", "AAAA", "AFSDB", "APL", "CAA", "CDNSKEY", "CDS", "CERT", "CNAME", "CSYNC", "DHCID", "DNAME", "DNSKEY", "DS", "HINFO", "HIP", "HTTPS", "IPSECKEY", "KX", "LOC", "MX", "NAPTR", "NS", "NSEC", "NSEC3", "NSEC3PARAM", "OPENPGPKEY", "PTR", "RP", "RRSIG", "SMIMEA", "SOA", "SPF", "SRV", "SSHFP", "SVCB", "TLSA", "TXT", "URI", "ZONEMD"]);
+  function resetCheck(){
+    state.editingCheckKey='';
+    $('checkHost').readOnly=false;$('checkType').disabled=false;
+    $('checkHost').value='';$('checkType').value='A';$('checkRcode').value='NOERROR';
+    $('checkCountMode').value='AT_LEAST_1';$('checkExactField').hidden=true;$('checkExact').value='1';
+    $('checkExpected').value='-';$('checkEditorTitle').textContent='Add a DNS health check';
+    $('checkEditorMode').textContent='Add new rule';$('checkSave').textContent='Save health check';
+  }
+  function renderChecks(){
+    const checks=Array.isArray(state.config?.policy?.checks)?state.config.policy.checks:[];
+    $('checkRulesCount').textContent=checks.length+' configured';
+    $('checkRows').innerHTML=checks.length?checks.map(x=>`<div class="rg-check-row"><div class="rg-check-info"><strong>${esc(x.name)} · ${esc(x.type)}</strong><small>Response: ${esc(x.rcode)} · Answers: ${esc(x.minAnswers)} · Expected data: ${esc(x.expected||'-')}${!supportedCheckTypes.has(x.type)?' · Unsupported type: use Repair to select a valid record type':''}</small></div><div class="rg-actions"><button type="button" class="btn rg-check-edit" data-host="${esc(x.name)}" data-type="${esc(x.type)}">${supportedCheckTypes.has(x.type)?'Edit':'Repair'}</button><button type="button" class="btn rg-check-delete" data-host="${esc(x.name)}" data-type="${esc(x.type)}">Remove</button></div></div>`).join(''):
+      '<div class="empty">No DNS health checks configured. Add at least one valid rule before enabling monitoring.</div>';
+    syncConfigControls();
+  }
+  async function submitToggle(which){
+    if(state.configBusy||!state.configFresh||!state.config)return;
+    const cfg=state.config,monitor=cfg.monitoringEnabled===true,auto=cfg.policy?.automaticMarker===true;
+    if(which==='monitor'){
+      if(monitor){if(!confirm('Disable recurring DNS monitoring? This also disables automatic failover, but does not change WAN DNS.'))return;await applyConfig(['monitor-off']);}
+      else{if(!confirm('Enable recurring DNS monitoring? The router will verify readiness and register scheduled checks.'))return;await applyConfig(['monitor-on']);}
+    }else{
+      if(auto){if(!confirm('Disable automatic DNS failover while keeping monitoring enabled? Current WAN DNS will not be restored automatically.'))return;await applyConfig(['auto-off']);}
+      else{
+        if(cfg.policy?.recursiveUnbound||cfg.policy?.approval!=='VALID'){configNotice('Automatic failover requires a supported DNS path and a valid approved policy.',true);return;}
+        if(!confirm('Enable automatic WAN DNS switching? ResolvGuard will verify policy, preferred pool, forwarding and recovery state before allowing changes.'))return;
+        await applyConfig(['auto-on']);
+      }
+    }
+  }
+  function saveCheck(){
+    if(state.configBusy||!state.configFresh)return;
+    const name=$('checkHost').value.trim(),type=$('checkType').value.trim(),rcode=$('checkRcode').value.trim(),
+      mode=$('checkCountMode').value, count=mode==='EXACT'?$('checkExact').value.trim():mode, expected=$('checkExpected').value.trim();
+    if(!/^[A-Za-z0-9_.-]{1,253}$/.test(name)||!supportedCheckTypes.has(type)||
+       !/^[A-Z][A-Z0-9_]{0,31}$/.test(rcode)||
+       !(count==='ANY'||count==='AT_LEAST_1'||/^[0-9]{1,4}$/.test(count))||
+       !/^[A-Za-z0-9_.:@/+?%=-]{1,200}$/.test(expected)){
+      configNotice('Enter a valid hostname, record type, response code, count and expected record data.',true);return;
+    }
+    const edit=state.editingCheckKey;
+    if(edit){if(!confirm('Update this DNS health-check rule? Existing policy approval may become invalid.'))return;
+      applyConfig(['check-edit',edit,name,type,rcode,count,expected]);}
+    else applyConfig(['check-add',name,type,rcode,count,expected]);
+  }
   function renderSettings(){
     const cfg=state.config;if(!cfg)return;
+    renderPolicySummary();
     const script=cfg.script||{};
     $('scriptInstalled').textContent=script.version?'v'+script.version+(script.channel==='development'?'_'+script.build:''):'Unavailable';
     $('scriptChannel').textContent=script.channel||'Unknown';
     renderSettingsSummary();
+    renderMonitoringProtection();
+    closePolicyReview(); // A refreshed policy snapshot invalidates an open review.
     closeSettingHelp(); // A refreshed snapshot replaces the setting buttons.
     $('settingsRows').innerHTML=Object.entries(settingsDefs).map(([key,[title,options]])=>{
       const val=Number(cfg.settings?.[key]||0),list=options.length>2||['SCHEDULE_INTERVAL_MINUTES','SYSLOG_HEALTH_INTERVAL_MINUTES'].includes(key);
@@ -1380,7 +1677,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
         'The router confirmed the save but did not publish a newer configuration snapshot. Editing is disabled.':
         'No router configuration snapshot is available. Editing is disabled.');
       state.config=current;state.configFresh=true;
-      renderSettings();renderBackups();
+      renderSettings();renderBackups();renderChecks();
       if(afterRevision===0)$('configFeedback').hidden=true;
       return true;
     }catch(e){
@@ -1393,7 +1690,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
   function configPayload(parts){
     // All fields are ASCII data, not shell instructions. Values are revalidated
     // by the router using the same helpers as the SSH interface.
-    if(parts.some(p=>!(/^[A-Za-z0-9_.:/_-]+$/.test(String(p)))))throw Error('Only plain ASCII DNS values are accepted');
+    if(parts.some(p=>!(/^[A-Za-z0-9_.:/@+?%=-]+$/.test(String(p)))))throw Error('Only plain ASCII DNS values are accepted');
     return String(Date.now())+String(Math.floor(Math.random()*1000)).padStart(3,'0')+'|'+parts.join('|');
   }
   async function applyConfig(parts){
@@ -1401,24 +1698,41 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     let payload;try{payload=configPayload(parts);}catch(e){configNotice(e.message,true);return;}
     const requestId=payload.split('|')[0];
     const previousRevision=Number(state.config.revision||0);
+    const operation=String(parts[0]||'');
+    const timeout=(operation==='auto-on'||operation==='monitor-on')?120000:35000;
+    const operationTitle=operation.startsWith('check-')?'Updating DNS health checks':
+      operation.startsWith('monitor-')?'Updating recurring DNS monitoring':
+      operation.startsWith('auto-')?'Updating automatic DNS failover':'Applying ResolvGuard settings';
     controlsBusy(true);configNotice('Submitting configuration request to Merlin…');
+    let received=null,finishOk=false,finishMsg='';
     try {
-      if(window.parent===window || typeof window.parent.rgRequestConfiguration!=='function' || !window.parent.rgRequestConfiguration(payload))
+      if(window.parent===window || typeof window.parent.rgBeginOperation!=='function' ||
+         !window.parent.rgBeginOperation(operationTitle,timeout))
+        throw Error('Unable to open authenticated configuration progress.');
+      if(typeof window.parent.rgProgressStage==='function') window.parent.rgProgressStage('Waiting for configuration confirmation…',15);
+      if(typeof window.parent.rgRequestConfiguration!=='function' || !window.parent.rgRequestConfiguration(payload))
         throw Error('Open this page through WAN → ResolvGuard to use authenticated settings.');
-      const began=Date.now();let received=null;
-      while(Date.now()-began<25000){
+      const began=Date.now();
+      while(Date.now()-began<timeout){
         await new Promise(resolve=>setTimeout(resolve,1000));
         try{const d=await load('/ext/ResolvGuard/config-action.htm');if(d.requestId===requestId){received=d;break;}}catch(e){}
       }
       if(!received)throw Error('No matching response from the router. Check /tmp/resolvguard-webui-config.log; do not assume the setting was saved.');
       if(received.status!=='success')throw Error(received.message||'The router rejected the configuration request.');
+      if(typeof window.parent.rgProgressStage==='function') window.parent.rgProgressStage('Router confirmed the save. Refreshing settings…',95);
       configNotice(received.message||'Configuration saved');
-      if(!await loadConfig(previousRevision))
+      const snapshotOk=await loadConfig(previousRevision);
+      if(!snapshotOk)
         configNotice('Router confirmed the save, but the new configuration snapshot is unavailable. Further edits are disabled until refreshed.',true);
       await refresh();
       resetBackup();
-    }catch(e){configNotice(e.message,true);}finally{
+      if(snapshotOk&&operation.startsWith('check-'))resetCheck();
+      finishOk=snapshotOk;
+      finishMsg=snapshotOk?'Configuration saved and refreshed.':'Saved, but the refreshed configuration is unavailable.';
+    }catch(e){finishMsg=e.message||'Configuration request failed.';configNotice(finishMsg,true);}finally{
       controlsBusy(false);
+      try{if(window.parent!==window&&typeof window.parent.rgEndOperation==='function')
+        window.parent.rgEndOperation(finishOk,finishMsg,!!received);}catch(e){}
       // The firmware may keep its 'Complete' overlay after the action has
       // already finished. Never leave a blocking spinner over the dashboard.
       try { if(window.parent!==window && typeof window.parent.rgFinishConfiguration==='function') window.parent.rgFinishConfiguration(); }catch(e){}
@@ -1444,11 +1758,17 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
       state.updateAvailable=false;$('scriptInstall').hidden=true;
     }
     updateNotice(mode==='script-check'?'Checking '+script.channel+' for updates…':'Installing verified script update…');
+    let result=null,finishOk=false,finishMsg='';
     try{
-      if(window.parent===window||typeof window.parent.rgRequestConfiguration!=='function'||!window.parent.rgRequestConfiguration(payload))
-        throw Error('Open WAN → ResolvGuard to use authenticated updates.');
-      const started=Date.now();let result=null;
+      const title=mode==='script-check'?'Checking ResolvGuard updates':'Installing ResolvGuard update';
       const timeout=mode==='script-install'?240000:120000;
+      if(window.parent===window||typeof window.parent.rgBeginOperation!=='function'||
+         !window.parent.rgBeginOperation(title,timeout))
+        throw Error('Unable to open authenticated update progress.');
+      if(typeof window.parent.rgProgressStage==='function') window.parent.rgProgressStage('Waiting for the selected update channel…',15);
+      if(typeof window.parent.rgRequestConfiguration!=='function'||!window.parent.rgRequestConfiguration(payload))
+        throw Error('Open WAN → ResolvGuard to use authenticated updates.');
+      const started=Date.now();
       while(Date.now()-started<timeout){
         await new Promise(resolve=>setTimeout(resolve,1000));
         try{const d=await load('/ext/ResolvGuard/config-action.htm');if(d.requestId===requestId){result=d;break;}}catch(e){}
@@ -1456,6 +1776,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
       if(!result)throw Error('No matching router response. Inspect the installed version in SSH before retrying.');
       if(result.channel!==script.channel)throw Error('Update channel changed. Refresh and check again.');
       const availableVersion=String(result.latestVersion||''),availableBuild=String(result.latestBuild||'');
+      if(typeof window.parent.rgProgressStage==='function') window.parent.rgProgressStage('Router returned an update result. Verifying…',95);
       if(result.status==='available'&&mode==='script-check'){
         if(!/^\d+(\.\d+){1,3}$/.test(availableVersion)||
            (script.channel==='development'&&!/^\d{8,14}$/.test(availableBuild)))throw Error('Invalid remote version.');
@@ -1468,14 +1789,28 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
         state.updateAvailable=false;$('scriptInstall').hidden=true;$('scriptReload').hidden=false;
         updateNotice('Update installed and verified. Reload the WebUI to use the new version.','success');
       }else throw Error(result.message||'The router rejected the update request.');
+      finishOk=true;
+      finishMsg=mode==='script-install'?'Update installed and verified. Reload WebUI to use it.':
+        (result.status==='available'?'Update available.':'Update check complete.');
     }catch(e){
       if(mode==='script-install'){state.updateAvailable=false;$('scriptInstall').hidden=true;}
-      updateNotice(e.message||'Update check failed.','error');
+      finishMsg=e.message||'Update check failed.';updateNotice(finishMsg,'error');
     }finally{
       state.updateBusy=false;controlsBusy(false);
+      try{if(window.parent!==window&&typeof window.parent.rgEndOperation==='function')
+        window.parent.rgEndOperation(finishOk,finishMsg,!!result);}catch(e){}
       try{if(window.parent!==window&&typeof window.parent.rgFinishConfiguration==='function')window.parent.rgFinishConfiguration();}catch(e){}
     }
   }
+  $('rgMonitoringToggle').addEventListener('click',()=>submitToggle('monitor'));
+  $('rgFailoverToggle').addEventListener('click',()=>submitToggle('auto'));
+  $('checkReset').addEventListener('click',resetCheck);
+  $('checkCountMode').addEventListener('change',()=>{$('checkExactField').hidden=$('checkCountMode').value!=='EXACT';});
+  $('checkSave').addEventListener('click',saveCheck);
+  $('rgPolicyReview').addEventListener('click',openPolicyReview);
+  $('rgPolicyCancel').addEventListener('click',closePolicyReview);
+  $('rgPolicyConsent').addEventListener('change',syncConfigControls);
+  $('rgPolicyApprove').addEventListener('click',submitPolicyApproval);
   $('scriptCheck').addEventListener('click',()=>scriptUpdate('script-check'));
   $('scriptInstall').addEventListener('click',()=>scriptUpdate('script-install'));
   $('scriptReload').addEventListener('click',()=>window.parent.location.reload());
@@ -1486,6 +1821,23 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     applyConfig([state.editingBackupId?'backup-edit':'backup-add',id,ip,tls,port]);
   });
   document.addEventListener('click',e=>{
+    const editCheck=e.target.closest('.rg-check-edit');if(editCheck){
+      const x=state.config?.policy?.checks?.find(c=>c.name===editCheck.dataset.host&&c.type===editCheck.dataset.type);if(!x)return;
+      state.editingCheckKey=x.name+'/'+x.type;
+      const repair=!supportedCheckTypes.has(x.type);
+      $('checkHost').value=x.name;$('checkType').value=repair?(x.type==='AAAAA'?'AAAA':'A'):x.type;
+      $('checkHost').readOnly=true;$('checkType').disabled=!repair;
+      $('checkRcode').value=x.rcode;$('checkExpected').value=x.expected||'-';
+      if(x.minAnswers==='ANY'||x.minAnswers==='AT_LEAST_1'){$('checkCountMode').value=x.minAnswers;$('checkExactField').hidden=true;}
+      else{$('checkCountMode').value='EXACT';$('checkExactField').hidden=false;$('checkExact').value=x.minAnswers;}
+      $('checkEditorTitle').textContent=repair?'Repair unsupported DNS record type':'Edit DNS health check';
+      $('checkEditorMode').textContent=repair?'Replace unsupported '+x.type+' with a recognized DNS record type':x.name+' · '+x.type;
+      $('checkSave').textContent=repair?'Repair health check':'Update health check';return;
+    }
+    const delCheck=e.target.closest('.rg-check-delete');if(delCheck){
+      const name=delCheck.dataset.host,type=delCheck.dataset.type;
+      if(confirm('Remove DNS health check '+name+' ('+type+')? This may require policy reapproval.'))applyConfig(['check-delete',name,type]);return;
+    }
     const setting=e.target.closest('.rg-save-setting');if(setting){const key=setting.dataset.setting;const val=$('s_'+key).value;
       if(!/^\d+$/.test(val)){configNotice('Enter a valid numeric value.',true);return;}
       const options=settingsDefs[key]?.[1];if(!options)return;
@@ -1497,7 +1849,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
       $('backupMode').textContent='Editing '+r.id;$('backupSave').textContent='Update resolver';return;}
     const remove=e.target.closest('.rg-backup-delete');if(remove&&confirm('Remove backup resolver '+remove.dataset.id+'? This may require a new policy approval.'))applyConfig(['backup-delete',remove.dataset.id]);
   });
-  loadConfig();
+  resetCheck();loadConfig();
   $('runHealthCheck').addEventListener('click',runManualHealthCheck);
   $('manualClose').addEventListener('click',()=>{$('manualPanel').hidden=true;});
   $('period').addEventListener('change',e=>{state.period=e.target.value;renderHistory();});
