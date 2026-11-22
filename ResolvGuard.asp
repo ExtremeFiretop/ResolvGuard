@@ -494,6 +494,8 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
 /* The Unbound scope notice appears only in recursive mode. Give the History
    toolbar breathing room without changing spacing when the notice is hidden. */
 #unboundHistoryNotice:not(.hidden) { margin-bottom:16px; }
+
+.rg-control-row{display:flex;align-items:center;justify-content:space-between;gap:18px}.rg-control-row>div{flex:1}.rg-control-row strong{font-size:13px}.rg-control-row .desc{margin:5px 0}.rg-state-toggle{min-width:90px;flex-shrink:0}.rg-state-toggle[aria-checked="true"]{background:#194a3b;border-color:#51c49a;color:#acffdc}.rg-state-toggle[disabled]{opacity:.48}.rg-state-toggle[aria-checked="true"]:disabled{opacity:.75}.rg-check-row{display:flex;justify-content:space-between;align-items:center;gap:14px;padding:14px 20px;border-top:1px solid #274049}.rg-check-info{min-width:0}.rg-check-info strong{font-size:12px;overflow-wrap:anywhere}.rg-check-info small{display:block;color:#85a3ad;margin-top:5px;font-size:11px}.rg-check-row .rg-actions{margin:0;flex-shrink:0}#checkExactField[hidden]{display:none!important}@media(max-width:650px){.rg-check-row{align-items:flex-start;flex-direction:column}.rg-check-row .rg-actions{width:100%}.rg-control-row{align-items:flex-start;flex-direction:column}.rg-state-toggle{align-self:flex-end}}
 </style>
 <script>document.body.classList.add('rg-embedded');</script>
 <div class="app">
@@ -504,11 +506,12 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
   <button class="nav" data-tab="history"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18M6 17l5-6 4 3 6-8"/></svg> Health history</button>
   <button class="nav" data-tab="paths"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="5" cy="12" r="3"/><circle cx="19" cy="5" r="3"/><circle cx="19" cy="19" r="3"/><path d="M8 12h5m0 0 3-5m-3 5 3 5"/></svg> DNS paths & exceptions</button>
   <button class="nav" data-tab="backups"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="12" r="3"/><circle cx="18" cy="6" r="3"/><circle cx="18" cy="18" r="3"/><path d="M9 12h6m-1-4 2-2m-2 10 2 2"/></svg> Backup &amp; Alternate Resolvers</button>
+  <button class="nav" data-tab="checks"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 5h14M5 12h14M5 19h14"/><circle cx="9" cy="5" r="2"/><circle cx="15" cy="12" r="2"/><circle cx="9" cy="19" r="2"/></svg> DNS Health Checks</button>
   <button class="nav" data-tab="settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v3m0 14v3M4 4l2.2 2.2M17.8 17.8 20 20M2 12h3m14 0h3M4 20l2.2-2.2M17.8 6.2 20 4"/></svg> Settings</button>
   <div class="side-bottom"><div class="small-pill"><span class="dot"></span> DNS monitoring</div><div class="small-note">Scheduled monitoring snapshots<br>Optional read-only live checks<br>Primary WAN DNS stays in ASUS settings</div></div>
 </aside>
 <main class="main">
-  <div class="tabs-mobile"><button class="m-tab active" data-tab="overview">Overview</button><button class="m-tab" data-tab="history">History</button><button class="m-tab" data-tab="paths">DNS Paths</button><button class="m-tab" data-tab="backups">Backups</button><button class="m-tab" data-tab="settings">Settings</button></div>
+  <div class="tabs-mobile"><button class="m-tab active" data-tab="overview">Overview</button><button class="m-tab" data-tab="history">History</button><button class="m-tab" data-tab="paths">DNS Paths</button><button class="m-tab" data-tab="backups">Backups</button><button class="m-tab" data-tab="checks">Health Checks</button><button class="m-tab" data-tab="settings">Settings</button></div>
   <header class="top"><div><div class="eyebrow">Intelligent DNS monitoring</div><h1 class="page-title" id="pageTitle">Dashboard overview</h1><div class="desc" id="pageDesc">Your DNS reliability, clearly visible.</div></div><div class="top-tools"><span class="tag demo" id="feedStatus">CONNECTING...</span><button class="btn primary" id="runHealthCheck"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v18M3 12h18"/></svg> Run Health Check</button></div></header>
   <section class="manual-panel" id="manualPanel" hidden aria-live="polite">
     <div class="manual-head"><div><strong id="manualTitle">Manual health check</strong><div class="manual-help" id="manualSummary">A separate, read-only authenticated DoT policy evaluation.</div></div><button type="button" class="inspector-close" id="manualClose" aria-label="Close manual health-check results">×</button></div>
@@ -596,6 +599,29 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
       </div>
     </div>
   </section>
+  <section id="checks" class="tab">
+    <div class="section-head" style="margin-top:0"><h3>DNS Health Checks</h3><span class="hint" id="checkRulesCount">Configured DNS answer validation rules</span></div>
+    <div class="note rg-config-note">Rules are evaluated through independent authenticated DNS-over-TLS queries. Changing them requires renewed policy approval before automatic WAN DNS switching can continue. The router validates every edit and restores the old configuration if validation fails.</div>
+    <div class="card" style="margin-top:16px">
+      <div class="card-head"><div><div class="card-title">Configured health checks</div><div class="card-sub">Hostname + record type uniquely identify a rule</div></div></div>
+      <div id="checkRows"><div class="empty">Loading health checks…</div></div>
+    </div>
+    <div class="card" style="margin-top:18px">
+      <div class="card-head"><div><div class="card-title" id="checkEditorTitle">Add a DNS health check</div><div class="card-sub">To rename a hostname or record type, remove the old rule and add a new one.</div></div><button type="button" class="btn" id="checkReset">Clear</button></div>
+      <div class="card-pad">
+        <div class="rg-fields">
+          <label>DNS hostname<input class="rg-input" id="checkHost" maxlength="253" placeholder="a.root-servers.net" autocomplete="off"></label>
+          <label>Record type<input class="rg-input" id="checkType" maxlength="16" value="A" placeholder="A or AAAA" autocomplete="off"></label>
+          <label>Expected response code<input class="rg-input" id="checkRcode" maxlength="32" value="NOERROR" autocomplete="off"></label>
+          <label>Expected answer count<select class="rg-input" id="checkCountMode"><option value="AT_LEAST_1">At least one</option><option value="ANY">Any answer count</option><option value="EXACT">Exact number</option></select></label>
+          <label id="checkExactField" hidden>Exact answer count<input class="rg-input" id="checkExact" type="number" min="0" max="9999" value="1"></label>
+          <label>Expected record data<input class="rg-input" id="checkExpected" maxlength="200" value="-" placeholder="- (ignore specific answer)"></label>
+        </div>
+        <p class="desc">Use <code>-</code> to ignore specific record data. For numeric answer counts, select “Exact number.” Existing rules are validated using the same rules as SSH.</p>
+        <div class="rg-actions"><button type="button" class="btn primary" id="checkSave" disabled>Save health check</button><span class="hint" id="checkEditorMode">Add new rule</span></div>
+      </div>
+    </div>
+  </section>
   <section id="settings" class="tab">
     <div class="section-head" style="margin-top:0"><h3>ResolvGuard settings</h3></div>
     <div class="note rg-config-note">These settings govern ResolvGuard's monitoring behavior.</div>
@@ -627,6 +653,15 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
           <div class="rg-actions"><button type="button" class="btn primary" id="rgPolicyApprove" disabled>Approve Reviewed Policy</button><button type="button" class="btn" id="rgPolicyCancel">Cancel</button></div>
           <p id="rgPolicyFeedback" class="desc" role="status" aria-live="polite"></p>
         </div>
+      </div>
+    </div>
+    <div class="card" id="rgMonitoringProtection" style="margin-top:16px">
+      <div class="card-head"><div><div class="card-title">Monitoring &amp; Protection</div><div class="card-sub">Recurring checks and authorization to change WAN DNS automatically</div></div></div>
+      <div class="card-pad">
+        <div class="rg-control-row"><div><strong>Recurring DNS Monitoring</strong><p class="desc">Run scheduled DNS health checks. Turning this off also disables automatic failover.</p></div><button type="button" class="btn rg-state-toggle" role="switch" aria-checked="false" id="rgMonitoringToggle" disabled>OFF</button></div>
+        <div class="rg-divider"></div>
+        <div class="rg-control-row"><div><strong>Automatic DNS Failover</strong><p class="desc" id="rgFailoverExplanation">Allow approved WAN DNS recovery only after the policy and DNS path pass safety checks.</p></div><button type="button" class="btn rg-state-toggle" role="switch" aria-checked="false" id="rgFailoverToggle" disabled>OFF</button></div>
+        <p class="desc" id="rgProtectionNotice">Policy approval and a verified supported Strict DoT forwarding path are required to enable automatic failover.</p>
       </div>
     </div>
     <div class="card" style="margin-top:16px">
@@ -1192,7 +1227,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     }
   }
   function closeInspector(){$('inspectBackdrop').classList.remove('open');$('inspector').classList.remove('open');$('inspector').setAttribute('aria-hidden','true');}
-  function tab(name){closeSettingHelp();state.tab=name;waveform.setVisible(name==='overview');syncWaveSignal(state.snapshot,state.feedConnected);document.querySelectorAll('[data-tab]').forEach(el=>{const active=el.dataset.tab===name;el.classList.toggle('active',active);});document.querySelectorAll('.tab').forEach(el=>el.classList.toggle('active',el.id===name));const m={overview:['Dashboard overview','Your DNS reliability, clearly visible.'],history:['Health history','Observed DNS reliability'],paths:['DNS paths & exceptions','Inspect production routing, and scoped bypasses.'],backups:['Backup & alternate resolvers','Manage ResolvGuard backup DoT endpoints.'],settings:['ResolvGuard settings','Configure monitoring thresholds and timing using TLS authentication.']}[name];$('pageTitle').textContent=m[0];$('pageDesc').textContent=m[1];if(name==='history')renderHistory();if(name==='paths')renderPaths();if(name==='settings'||name==='backups')loadConfig();}
+  function tab(name){closeSettingHelp();state.tab=name;waveform.setVisible(name==='overview');syncWaveSignal(state.snapshot,state.feedConnected);document.querySelectorAll('[data-tab]').forEach(el=>{const active=el.dataset.tab===name;el.classList.toggle('active',active);});document.querySelectorAll('.tab').forEach(el=>el.classList.toggle('active',el.id===name));const m={overview:['Dashboard overview','Your DNS reliability, clearly visible.'],history:['Health history','Observed DNS reliability'],paths:['DNS paths & exceptions','Inspect production routing, and scoped bypasses.'],backups:['Backup & alternate resolvers','Manage ResolvGuard backup DoT endpoints.'],checks:['DNS health checks','Add, edit and remove independent DNS answer validation rules.'],settings:['ResolvGuard settings','Configure monitoring thresholds and timing using TLS authentication.']}[name];$('pageTitle').textContent=m[0];$('pageDesc').textContent=m[1];if(name==='history')renderHistory();if(name==='paths')renderPaths();if(name==='settings'||name==='backups'||name==='checks')loadConfig();}
   async function load(url){const response=await fetch(url+'?t='+Date.now(),{cache:'no-store',credentials:'same-origin'});if(!response.ok)throw Error('HTTP '+response.status);const d=JSON.parse(await response.text());if(d.schema!==1)throw Error('Unsupported feed schema');return d;}
   async function refresh(){if(state.polling)return;state.polling=true;try{
       const d=await load('/ext/ResolvGuard/status.htm');
@@ -1454,6 +1489,10 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     $('scriptInstall').disabled=disabled||state.updateBusy||!state.updateAvailable;
     $('rgPolicyReview').disabled=disabled||!state.config?.policy?.reviewable;
     $('rgPolicyApprove').disabled=disabled||!state.policyReviewFingerprint||!$('rgPolicyConsent').checked;
+    document.querySelectorAll('#checks .rg-check-edit,#checks .rg-check-delete,#checkSave').forEach(e=>e.disabled=disabled);
+    $('rgMonitoringToggle').disabled=disabled;
+    $('rgFailoverToggle').disabled=disabled||(!state.config?.policy?.automaticMarker&&
+      (state.config?.policy?.recursiveUnbound||state.config?.policy?.approval!=='VALID'));
   }
   function controlsBusy(b){state.configBusy=Boolean(b);syncConfigControls();}
   function renderSettingsSummary(){
@@ -1523,6 +1562,67 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     closePolicyReview();
     await applyConfig(['policy-approve',reviewed]);
   }
+  function renderMonitoringProtection(){
+    const cfg=state.config;if(!cfg)return;
+    const monitor=cfg.monitoringEnabled===true, marker=cfg.policy?.automaticMarker===true;
+    const recursive=cfg.policy?.recursiveUnbound===true;
+    const hold=marker&&cfg.policy?.approval!=='VALID';
+    const mt=$('rgMonitoringToggle'),at=$('rgFailoverToggle');
+    mt.setAttribute('aria-checked',monitor?'true':'false');mt.textContent=monitor?'ON':'OFF';
+    at.setAttribute('aria-checked',marker?'true':'false');at.textContent=hold?'HOLD':marker?'ON':'OFF';
+    $('rgFailoverExplanation').textContent=recursive?'Recursive Unbound is active: WAN DoT failover is unavailable. Monitoring Only remains supported.':
+      hold?'Policy Safety Hold: automatic switching is blocked. Disable the old authorization or review and approve the changed policy.':
+      'Allow approved WAN DNS recovery only after the policy and DNS path pass safety checks.';
+    $('rgProtectionNotice').textContent=recursive?'Automatic failover cannot be enabled for recursive Unbound.':
+      !monitor?'Monitoring is disabled; enabling automatic failover will also enable monitoring.':
+      cfg.policy?.approval!=='VALID'?'Policy approval is required before enabling automatic failover.':
+      'The router rechecks the active preferred pool, forwarding path, and recovery state before enabling failover.';
+  }
+  function resetCheck(){
+    state.editingCheckKey='';
+    $('checkHost').readOnly=false;$('checkType').readOnly=false;
+    $('checkHost').value='';$('checkType').value='A';$('checkRcode').value='NOERROR';
+    $('checkCountMode').value='AT_LEAST_1';$('checkExactField').hidden=true;$('checkExact').value='1';
+    $('checkExpected').value='-';$('checkEditorTitle').textContent='Add a DNS health check';
+    $('checkEditorMode').textContent='Add new rule';$('checkSave').textContent='Save health check';
+  }
+  function renderChecks(){
+    const checks=Array.isArray(state.config?.policy?.checks)?state.config.policy.checks:[];
+    $('checkRulesCount').textContent=checks.length+' configured';
+    $('checkRows').innerHTML=checks.length?checks.map(x=>`<div class="rg-check-row"><div class="rg-check-info"><strong>${esc(x.name)} · ${esc(x.type)}</strong><small>Response: ${esc(x.rcode)} · Answers: ${esc(x.minAnswers)} · Expected data: ${esc(x.expected||'-')}</small></div><div class="rg-actions"><button type="button" class="btn rg-check-edit" data-host="${esc(x.name)}" data-type="${esc(x.type)}">Edit</button><button type="button" class="btn rg-check-delete" data-host="${esc(x.name)}" data-type="${esc(x.type)}">Remove</button></div></div>`).join(''):
+      '<div class="empty">No DNS health checks configured. Add at least one valid rule before enabling monitoring.</div>';
+    syncConfigControls();
+  }
+  async function submitToggle(which){
+    if(state.configBusy||!state.configFresh||!state.config)return;
+    const cfg=state.config,monitor=cfg.monitoringEnabled===true,auto=cfg.policy?.automaticMarker===true;
+    if(which==='monitor'){
+      if(monitor){if(!confirm('Disable recurring DNS monitoring? This also disables automatic failover, but does not change WAN DNS.'))return;await applyConfig(['monitor-off']);}
+      else{if(!confirm('Enable recurring DNS monitoring? The router will verify readiness and register scheduled checks.'))return;await applyConfig(['monitor-on']);}
+    }else{
+      if(auto){if(!confirm('Disable automatic DNS failover while keeping monitoring enabled? Current WAN DNS will not be restored automatically.'))return;await applyConfig(['auto-off']);}
+      else{
+        if(cfg.policy?.recursiveUnbound||cfg.policy?.approval!=='VALID'){configNotice('Automatic failover requires a supported DNS path and a valid approved policy.',true);return;}
+        if(!confirm('Enable automatic WAN DNS switching? ResolvGuard will verify policy, preferred pool, forwarding and recovery state before allowing changes.'))return;
+        await applyConfig(['auto-on']);
+      }
+    }
+  }
+  function saveCheck(){
+    if(state.configBusy||!state.configFresh)return;
+    const name=$('checkHost').value.trim(),type=$('checkType').value.trim(),rcode=$('checkRcode').value.trim(),
+      mode=$('checkCountMode').value, count=mode==='EXACT'?$('checkExact').value.trim():mode, expected=$('checkExpected').value.trim();
+    if(!/^[A-Za-z0-9_.-]{1,253}$/.test(name)||!/^[A-Z][A-Z0-9]{0,15}$/.test(type)||
+       !/^[A-Z][A-Z0-9_]{0,31}$/.test(rcode)||
+       !(count==='ANY'||count==='AT_LEAST_1'||/^[0-9]{1,4}$/.test(count))||
+       !/^[A-Za-z0-9_.:@/+?%=-]{1,200}$/.test(expected)){
+      configNotice('Enter a valid hostname, record type, response code, count and expected record data.',true);return;
+    }
+    const edit=state.editingCheckKey;
+    if(edit){if(!confirm('Update this DNS health-check rule? Existing policy approval may become invalid.'))return;
+      applyConfig(['check-edit',edit,name,type,rcode,count,expected]);}
+    else applyConfig(['check-add',name,type,rcode,count,expected]);
+  }
   function renderSettings(){
     const cfg=state.config;if(!cfg)return;
     renderPolicySummary();
@@ -1530,6 +1630,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     $('scriptInstalled').textContent=script.version?'v'+script.version+(script.channel==='development'?'_'+script.build:''):'Unavailable';
     $('scriptChannel').textContent=script.channel||'Unknown';
     renderSettingsSummary();
+    renderMonitoringProtection();
     closePolicyReview(); // A refreshed policy snapshot invalidates an open review.
     closeSettingHelp(); // A refreshed snapshot replaces the setting buttons.
     $('settingsRows').innerHTML=Object.entries(settingsDefs).map(([key,[title,options]])=>{
@@ -1574,7 +1675,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
         'The router confirmed the save but did not publish a newer configuration snapshot. Editing is disabled.':
         'No router configuration snapshot is available. Editing is disabled.');
       state.config=current;state.configFresh=true;
-      renderSettings();renderBackups();
+      renderSettings();renderBackups();renderChecks();
       if(afterRevision===0)$('configFeedback').hidden=true;
       return true;
     }catch(e){
@@ -1587,7 +1688,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
   function configPayload(parts){
     // All fields are ASCII data, not shell instructions. Values are revalidated
     // by the router using the same helpers as the SSH interface.
-    if(parts.some(p=>!(/^[A-Za-z0-9_.:/_-]+$/.test(String(p)))))throw Error('Only plain ASCII DNS values are accepted');
+    if(parts.some(p=>!(/^[A-Za-z0-9_.:/@+?%=-]+$/.test(String(p)))))throw Error('Only plain ASCII DNS values are accepted');
     return String(Date.now())+String(Math.floor(Math.random()*1000)).padStart(3,'0')+'|'+parts.join('|');
   }
   async function applyConfig(parts){
@@ -1595,17 +1696,22 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     let payload;try{payload=configPayload(parts);}catch(e){configNotice(e.message,true);return;}
     const requestId=payload.split('|')[0];
     const previousRevision=Number(state.config.revision||0);
+    const operation=String(parts[0]||'');
+    const timeout=(operation==='auto-on'||operation==='monitor-on')?120000:35000;
+    const operationTitle=operation.startsWith('check-')?'Updating DNS health checks':
+      operation.startsWith('monitor-')?'Updating recurring DNS monitoring':
+      operation.startsWith('auto-')?'Updating automatic DNS failover':'Applying ResolvGuard settings';
     controlsBusy(true);configNotice('Submitting configuration request to Merlin…');
     let received=null,finishOk=false,finishMsg='';
     try {
       if(window.parent===window || typeof window.parent.rgBeginOperation!=='function' ||
-         !window.parent.rgBeginOperation('Applying ResolvGuard settings',25000))
+         !window.parent.rgBeginOperation(operationTitle,timeout))
         throw Error('Unable to open authenticated configuration progress.');
       if(typeof window.parent.rgProgressStage==='function') window.parent.rgProgressStage('Waiting for configuration confirmation…',15);
       if(typeof window.parent.rgRequestConfiguration!=='function' || !window.parent.rgRequestConfiguration(payload))
         throw Error('Open this page through WAN → ResolvGuard to use authenticated settings.');
       const began=Date.now();
-      while(Date.now()-began<25000){
+      while(Date.now()-began<timeout){
         await new Promise(resolve=>setTimeout(resolve,1000));
         try{const d=await load('/ext/ResolvGuard/config-action.htm');if(d.requestId===requestId){received=d;break;}}catch(e){}
       }
@@ -1618,6 +1724,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
         configNotice('Router confirmed the save, but the new configuration snapshot is unavailable. Further edits are disabled until refreshed.',true);
       await refresh();
       resetBackup();
+      if(snapshotOk&&operation.startsWith('check-'))resetCheck();
       finishOk=snapshotOk;
       finishMsg=snapshotOk?'Configuration saved and refreshed.':'Saved, but the refreshed configuration is unavailable.';
     }catch(e){finishMsg=e.message||'Configuration request failed.';configNotice(finishMsg,true);}finally{
@@ -1693,6 +1800,11 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
       try{if(window.parent!==window&&typeof window.parent.rgFinishConfiguration==='function')window.parent.rgFinishConfiguration();}catch(e){}
     }
   }
+  $('rgMonitoringToggle').addEventListener('click',()=>submitToggle('monitor'));
+  $('rgFailoverToggle').addEventListener('click',()=>submitToggle('auto'));
+  $('checkReset').addEventListener('click',resetCheck);
+  $('checkCountMode').addEventListener('change',()=>{$('checkExactField').hidden=$('checkCountMode').value!=='EXACT';});
+  $('checkSave').addEventListener('click',saveCheck);
   $('rgPolicyReview').addEventListener('click',openPolicyReview);
   $('rgPolicyCancel').addEventListener('click',closePolicyReview);
   $('rgPolicyConsent').addEventListener('change',syncConfigControls);
@@ -1707,6 +1819,21 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     applyConfig([state.editingBackupId?'backup-edit':'backup-add',id,ip,tls,port]);
   });
   document.addEventListener('click',e=>{
+    const editCheck=e.target.closest('.rg-check-edit');if(editCheck){
+      const x=state.config?.policy?.checks?.find(c=>c.name===editCheck.dataset.host&&c.type===editCheck.dataset.type);if(!x)return;
+      state.editingCheckKey=x.name+'/'+x.type;
+      $('checkHost').value=x.name;$('checkType').value=x.type;
+      $('checkHost').readOnly=true;$('checkType').readOnly=true;
+      $('checkRcode').value=x.rcode;$('checkExpected').value=x.expected||'-';
+      if(x.minAnswers==='ANY'||x.minAnswers==='AT_LEAST_1'){$('checkCountMode').value=x.minAnswers;$('checkExactField').hidden=true;}
+      else{$('checkCountMode').value='EXACT';$('checkExactField').hidden=false;$('checkExact').value=x.minAnswers;}
+      $('checkEditorTitle').textContent='Edit DNS health check';$('checkEditorMode').textContent=x.name+' · '+x.type;
+      $('checkSave').textContent='Update health check';return;
+    }
+    const delCheck=e.target.closest('.rg-check-delete');if(delCheck){
+      const name=delCheck.dataset.host,type=delCheck.dataset.type;
+      if(confirm('Remove DNS health check '+name+' ('+type+')? This may require policy reapproval.'))applyConfig(['check-delete',name,type]);return;
+    }
     const setting=e.target.closest('.rg-save-setting');if(setting){const key=setting.dataset.setting;const val=$('s_'+key).value;
       if(!/^\d+$/.test(val)){configNotice('Enter a valid numeric value.',true);return;}
       const options=settingsDefs[key]?.[1];if(!options)return;
@@ -1718,7 +1845,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
       $('backupMode').textContent='Editing '+r.id;$('backupSave').textContent='Update resolver';return;}
     const remove=e.target.closest('.rg-backup-delete');if(remove&&confirm('Remove backup resolver '+remove.dataset.id+'? This may require a new policy approval.'))applyConfig(['backup-delete',remove.dataset.id]);
   });
-  loadConfig();
+  resetCheck();loadConfig();
   $('runHealthCheck').addEventListener('click',runManualHealthCheck);
   $('manualClose').addEventListener('click',()=>{$('manualPanel').hidden=true;});
   $('period').addEventListener('change',e=>{state.period=e.target.value;renderHistory();});

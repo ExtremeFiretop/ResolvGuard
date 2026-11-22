@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.2
-readonly SCRIPT_VERSTAG="26112111"
+readonly SCRIPT_VERSTAG="26112112"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -4670,13 +4670,19 @@ _EnableAutomaticFailover_() {
   _ShowDNSMasqScopedSetupWarning_
 
   if ! approval_status="$(_GetPolicyApprovalState_)"; then
+    if [ "$view" = web ]; then
+      _Fail_ "Review and approve the current policy before enabling automatic failover: $approval_status"
+      return 1
+    fi
     if [ "$view" != quick ]; then
       _Say_ "DNS policy approval required: $approval_status"
     fi
     _ApprovePolicy_ 'Approve policy and enable automatic failover?' "$view" || return 1
   else
     _CheckPolicyAuthorization_ || return 1
-    _ConfirmYesNo_ 'Enable automatic WAN DNS failover?' || return 1
+    if [ "$view" != web ]; then
+      _ConfirmYesNo_ 'Enable automatic WAN DNS failover?' || return 1
+    fi
   fi
   _CheckPolicyAuthorization_ || return 1
   # Consent is not authorization to write. Strict forwarding/service ownership
@@ -4711,7 +4717,9 @@ _DisableAutomaticFailover_() {
   if [ ! -e "$AUTO_FAILOVER_MARKER" ]; then
     _Say_ 'Automatic failover: already OFF'; return 0
   fi
-  _ConfirmYesNo_ 'Disable automatic DNS switching (keep monitoring)?' || return 1
+  if [ "${1:-}" != web ]; then
+    _ConfirmYesNo_ 'Disable automatic DNS switching (keep monitoring)?' || return 1
+  fi
   [ ! -L "$AUTO_FAILOVER_MARKER" ] || { _Fail_ 'Unsafe authorization marker'; return 1; }
   rm -f "$AUTO_FAILOVER_MARKER" || return 1
   # Re-entering Monitoring Only is a new state transition for event history.
@@ -5381,12 +5389,12 @@ _RGWebConfig_() (
     # amng_custom JSON. The payload is bounded and allowlisted below; it has
     # no reason to require a base64 applet or extra Entware dependency.
     # Preserve raw separators; the shell never evaluates payload contents.
-    [ "${#rg_token}" -le 560 ] || { rg_notice 'oversized config request'; return 1; }
+    [ "${#rg_token}" -le 960 ] || { rg_notice 'oversized config request'; return 1; }
     rg_payload="$rg_token"
     # ASCII-only data. No control characters, shell syntax, whitespace, or
     # line breaks may cross the firmware service event boundary.
-    case "$rg_payload" in ''|*[!A-Za-z0-9_.:/\|\-]*) rg_notice 'invalid data characters';return 1 ;; esac
-    IFS='|' read -r rg_id rg_op rg_a rg_b rg_c rg_d rg_overflow <<EOF_RG_WEB_CONFIG
+    case "$rg_payload" in ''|*[!A-Za-z0-9_.:/@+?%=\|\-]*) rg_notice 'invalid data characters';return 1 ;; esac
+    IFS='|' read -r rg_id rg_op rg_a rg_b rg_c rg_d rg_e rg_f rg_overflow <<EOF_RG_WEB_CONFIG
 $rg_payload
 EOF_RG_WEB_CONFIG
     case "$rg_id" in ''|*[!0-9]*) return 1 ;; esac
@@ -5400,6 +5408,13 @@ EOF_RG_WEB_CONFIG
       return 1
     fi
     rg_result_status=error;rg_message='Configuration rejected; see router log'
+    # Older actions use at most four arguments; reject surplus fields.
+    # Health-check edits use six fields with the existing transactional editor.
+    case "$rg_op" in
+      check-add|check-edit|check-delete) : ;;
+      *) [ "${#rg_token}" -le 560 ] && [ -z "$rg_e" ] && [ -z "$rg_f" ] || {
+           rg_notice 'oversized or extra request arguments'; return 1; } ;;
+    esac
     case "$rg_op" in
       setting)
         if [ -z "$rg_c" ] && [ -z "$rg_d" ]; then
@@ -5407,6 +5422,52 @@ EOF_RG_WEB_CONFIG
           SCHEDULE_INTERVAL_MINUTES|FAST_CONFIRM_SECONDS|FAIL_THRESHOLD|RECOVERY_THRESHOLD|TIMEOUT_SECONDS|BOOT_MIN_UPTIME_SECONDS|SYSLOG_HEALTH_INTERVAL_MINUTES)
             if _SetSetting_ "$rg_a" "$rg_b"; then rg_result_status=success;rg_message='Monitoring setting saved'; fi ;;
         esac
+        fi ;;
+      monitor-on|monitor-off)
+        rg_message='Monitoring state changed or scheduling safeguards rejected the request'
+        if [ -z "$rg_a" ] && [ -z "$rg_b" ] && [ -z "$rg_c" ] && [ -z "$rg_d" ]; then
+          if [ "$rg_op" = monitor-on ] && [ ! -e "$SCHEDULE_MARKER" ] &&
+             _EnableScheduledMonitoring_ confirmed quiet; then
+            rg_result_status=success;rg_message='Recurring DNS monitoring enabled'
+          elif [ "$rg_op" = monitor-off ] && [ -f "$SCHEDULE_MARKER" ] &&
+               _DisableScheduledMonitoring_ quiet; then
+            rg_result_status=success;rg_message='Monitoring and automatic failover disabled'
+          fi
+        fi ;;
+      auto-on|auto-off)
+        rg_message='Failover state changed or authorization/safety checks rejected the request'
+        if [ -z "$rg_a" ] && [ -z "$rg_b" ] && [ -z "$rg_c" ] && [ -z "$rg_d" ]; then
+          if [ "$rg_op" = auto-on ] && [ ! -e "$AUTO_FAILOVER_MARKER" ] &&
+             _EnableAutomaticFailover_ web; then
+            rg_result_status=success;rg_message='Automatic DNS failover enabled after policy and path verification'
+          elif [ "$rg_op" = auto-off ] && [ -f "$AUTO_FAILOVER_MARKER" ] &&
+               _DisableAutomaticFailover_ web; then
+            rg_result_status=success;rg_message='Automatic DNS failover disabled; monitoring remains enabled'
+          fi
+        fi ;;
+      check-add)
+        rg_message='DNS health-check rule rejected; check the fields or inspect the router log'
+        if [ -z "$rg_f" ] && _IsValidDNSCheck_ "$rg_a" "$rg_b" "$rg_c" "$rg_d" "$rg_e" &&
+           _ChangeTSVFile_ "$CHECKS" check add "$rg_a|$rg_b" "$rg_a|$rg_b|$rg_c|$rg_d|$rg_e"; then
+          rg_result_status=success;rg_message='DNS health check added; policy reapproval may be required'
+        fi ;;
+      check-edit)
+        rg_message='DNS health-check edit rejected; check current key and fields'
+        # Hostname/type identify the immutable check key during an edit.
+        # To change that identity, remove the rule then add a new one.
+        rg_old_host="${rg_a%/*}";rg_old_type="${rg_a##*/}"
+        if [ "$rg_old_host" != "$rg_a" ] && [ "$rg_old_host" = "$rg_b" ] &&
+           [ "$rg_old_type" = "$rg_c" ] &&
+           _IsValidDNSCheck_ "$rg_b" "$rg_c" "$rg_d" "$rg_e" "$rg_f" &&
+           _ChangeTSVFile_ "$CHECKS" check edit "$rg_b|$rg_c" "$rg_b|$rg_c|$rg_d|$rg_e|$rg_f"; then
+          rg_result_status=success;rg_message='DNS health check updated; policy reapproval may be required'
+        fi ;;
+      check-delete)
+        rg_message='DNS health-check deletion rejected (cannot remove the last valid rule)'
+        if [ -z "$rg_c" ] && [ -z "$rg_d" ] && [ -z "$rg_e" ] && [ -z "$rg_f" ] &&
+           _IsValidDomain_ "$rg_a" && _IsValidRecordType_ "$rg_b" &&
+           _ChangeTSVFile_ "$CHECKS" check del "$rg_a|$rg_b"; then
+          rg_result_status=success;rg_message='DNS health check removed; policy reapproval may be required'
         fi ;;
       backup-add|backup-edit)
         if [ -n "$rg_a" ] && [ "${#rg_a}" -le 32 ] && [ "${#rg_b}" -le 48 ] && [ "${#rg_c}" -le 253 ] &&
