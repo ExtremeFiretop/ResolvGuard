@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.2
-readonly SCRIPT_VERSTAG="26112113"
+readonly SCRIPT_VERSTAG="26112114"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -474,6 +474,15 @@ _IsValidPort_() {
 _IsValidRecordType_() {
   printf '%s\n' "$1" | LC_ALL=C grep -Eq '^[A-Z][A-Z0-9]{0,15}$'
 }
+# Health-check policy must name a registered, meaningful DNS RR type.
+# Probe/inspection retains its separate generic record-type syntax check.
+# Explicit list prevents typo types (e.g. AAAAA) from becoming active policy.
+_IsSupportedHealthRecordType_() {
+  case "$1" in
+    A|AAAA|AFSDB|APL|CAA|CDNSKEY|CDS|CERT|CNAME|CSYNC|DHCID|DNAME|DNSKEY|DS|HINFO|HIP|HTTPS|IPSECKEY|KX|LOC|MX|NAPTR|NS|NSEC|NSEC3|NSEC3PARAM|OPENPGPKEY|PTR|RP|RRSIG|SMIMEA|SOA|SPF|SRV|SSHFP|SVCB|TLSA|TXT|URI|ZONEMD) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 _IsValidRCODE_() {
   printf '%s\n' "$1" | LC_ALL=C grep -Eq '^[A-Z][A-Z0-9_]{0,31}$'
 }
@@ -639,7 +648,7 @@ _ValidateConfiguration_() {
   }
   while IFS='|' read -r qname qtype rcode answers expected extra; do
     case "$qname" in ''|\#*) continue;; esac
-    [ -z "${extra:-}" ] && _IsValidDomain_ "$qname" && _IsValidRecordType_ "$qtype" &&
+    [ -z "${extra:-}" ] && _IsValidDomain_ "$qname" && _IsSupportedHealthRecordType_ "$qtype" &&
       _IsValidRCODE_ "$rcode" && _IsValidDNSAnswerCount_ "$answers" && _IsSafeToken_ "$expected" || {
       _Fail_ "Invalid DNS health check: $qname $qtype"; return 1;
     }
@@ -5397,7 +5406,8 @@ EOF_RG_WEB_CONFIG
         # To change that identity, remove the rule then add a new one.
         rg_old_host="${rg_a%/*}";rg_old_type="${rg_a##*/}"
         if [ "$rg_old_host" != "$rg_a" ] && [ "$rg_old_host" = "$rg_b" ] &&
-           [ "$rg_old_type" = "$rg_c" ] &&
+           _IsValidRecordType_ "$rg_old_type" &&
+           { [ "$rg_old_type" = "$rg_c" ] || ! _IsSupportedHealthRecordType_ "$rg_old_type"; } &&
            _IsValidDNSCheck_ "$rg_b" "$rg_c" "$rg_d" "$rg_e" "$rg_f" &&
            _ChangeTSVFile_ "$CHECKS" check edit "$rg_b|$rg_c" "$rg_b|$rg_c|$rg_d|$rg_e|$rg_f"; then
           rg_result_status=success;rg_message='DNS health check updated; policy reapproval may be required'
@@ -6675,14 +6685,14 @@ _ShowIntegrationSettingsMenu_() {
 }
 
 _IsValidDNSCheck_() {
-  _IsValidDomain_ "$1" && _IsValidRecordType_ "$2" && _IsValidRCODE_ "$3" &&
+  _IsValidDomain_ "$1" && _IsSupportedHealthRecordType_ "$2" && _IsValidRCODE_ "$3" &&
     _IsValidDNSAnswerCount_ "$4" && _IsSafeToken_ "$5"
 }
 
 _PromptDNSCheck_() {
   local qname qtype rcode count rdata
   _Ask_ 'DNS hostname' "${1:-}" || return 1; qname="$RG_ANSWER"
-  _Ask_ 'DNS record type (A/AAAA etc.)' "${2:-A}" || return 1; qtype="$RG_ANSWER"
+  _Ask_ 'DNS record type (e.g. A/AAAA/CNAME/MX/TXT)' "${2:-A}" || return 1; qtype="$RG_ANSWER"
   _Ask_ 'Expected RCODE' "${3:-NOERROR}" || return 1; rcode="$RG_ANSWER"
   _Ask_ 'Expected answer count (ANY, AT_LEAST_1, or exact number)' "${4:-ANY}" || return 1; count="$RG_ANSWER"
   _Ask_ 'Expected record data (- to ignore)' "${5:--}" || return 1; rdata="$RG_ANSWER"

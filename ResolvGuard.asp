@@ -611,13 +611,13 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
       <div class="card-pad">
         <div class="rg-fields">
           <label>DNS hostname<input class="rg-input" id="checkHost" maxlength="253" placeholder="a.root-servers.net" autocomplete="off"></label>
-          <label>Record type<input class="rg-input" id="checkType" maxlength="16" value="A" placeholder="A or AAAA" autocomplete="off"></label>
+          <label>Record type<select class="rg-input" id="checkType"><option value="A">A</option><option value="AAAA">AAAA</option><option value="AFSDB">AFSDB</option><option value="APL">APL</option><option value="CAA">CAA</option><option value="CDNSKEY">CDNSKEY</option><option value="CDS">CDS</option><option value="CERT">CERT</option><option value="CNAME">CNAME</option><option value="CSYNC">CSYNC</option><option value="DHCID">DHCID</option><option value="DNAME">DNAME</option><option value="DNSKEY">DNSKEY</option><option value="DS">DS</option><option value="HINFO">HINFO</option><option value="HIP">HIP</option><option value="HTTPS">HTTPS</option><option value="IPSECKEY">IPSECKEY</option><option value="KX">KX</option><option value="LOC">LOC</option><option value="MX">MX</option><option value="NAPTR">NAPTR</option><option value="NS">NS</option><option value="NSEC">NSEC</option><option value="NSEC3">NSEC3</option><option value="NSEC3PARAM">NSEC3PARAM</option><option value="OPENPGPKEY">OPENPGPKEY</option><option value="PTR">PTR</option><option value="RP">RP</option><option value="RRSIG">RRSIG</option><option value="SMIMEA">SMIMEA</option><option value="SOA">SOA</option><option value="SPF">SPF</option><option value="SRV">SRV</option><option value="SSHFP">SSHFP</option><option value="SVCB">SVCB</option><option value="TLSA">TLSA</option><option value="TXT">TXT</option><option value="URI">URI</option><option value="ZONEMD">ZONEMD</option></select></label>
           <label>Expected response code<input class="rg-input" id="checkRcode" maxlength="32" value="NOERROR" autocomplete="off"></label>
           <label>Expected answer count<select class="rg-input" id="checkCountMode"><option value="AT_LEAST_1">At least one</option><option value="ANY">Any answer count</option><option value="EXACT">Exact number</option></select></label>
           <label id="checkExactField" hidden>Exact answer count<input class="rg-input" id="checkExact" type="number" min="0" max="9999" value="1"></label>
           <label>Expected record data<input class="rg-input" id="checkExpected" maxlength="200" value="-" placeholder="- (ignore specific answer)"></label>
         </div>
-        <p class="desc">Use <code>-</code> to ignore specific record data. For numeric answer counts, select “Exact number.” Existing rules are validated using the same rules as SSH.</p>
+        <p class="desc">Choose a recognized DNS record type (A/AAAA for normal address checks). Use <code>-</code> to ignore specific record data. If an earlier version saved an unsupported type, select Repair to correct it transactionally. Any change may require policy reapproval.</p>
         <div class="rg-actions"><button type="button" class="btn primary" id="checkSave" disabled>Save health check</button><span class="hint" id="checkEditorMode">Add new rule</span></div>
       </div>
     </div>
@@ -1578,9 +1578,11 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
       cfg.policy?.approval!=='VALID'?'Policy approval is required before enabling automatic failover.':
       'The router rechecks the active preferred pool, forwarding path, and recovery state before enabling failover.';
   }
+  // Keep the allowed health-policy RR set consistent with the shell validator.
+  const supportedCheckTypes=new Set(["A", "AAAA", "AFSDB", "APL", "CAA", "CDNSKEY", "CDS", "CERT", "CNAME", "CSYNC", "DHCID", "DNAME", "DNSKEY", "DS", "HINFO", "HIP", "HTTPS", "IPSECKEY", "KX", "LOC", "MX", "NAPTR", "NS", "NSEC", "NSEC3", "NSEC3PARAM", "OPENPGPKEY", "PTR", "RP", "RRSIG", "SMIMEA", "SOA", "SPF", "SRV", "SSHFP", "SVCB", "TLSA", "TXT", "URI", "ZONEMD"]);
   function resetCheck(){
     state.editingCheckKey='';
-    $('checkHost').readOnly=false;$('checkType').readOnly=false;
+    $('checkHost').readOnly=false;$('checkType').disabled=false;
     $('checkHost').value='';$('checkType').value='A';$('checkRcode').value='NOERROR';
     $('checkCountMode').value='AT_LEAST_1';$('checkExactField').hidden=true;$('checkExact').value='1';
     $('checkExpected').value='-';$('checkEditorTitle').textContent='Add a DNS health check';
@@ -1589,7 +1591,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
   function renderChecks(){
     const checks=Array.isArray(state.config?.policy?.checks)?state.config.policy.checks:[];
     $('checkRulesCount').textContent=checks.length+' configured';
-    $('checkRows').innerHTML=checks.length?checks.map(x=>`<div class="rg-check-row"><div class="rg-check-info"><strong>${esc(x.name)} · ${esc(x.type)}</strong><small>Response: ${esc(x.rcode)} · Answers: ${esc(x.minAnswers)} · Expected data: ${esc(x.expected||'-')}</small></div><div class="rg-actions"><button type="button" class="btn rg-check-edit" data-host="${esc(x.name)}" data-type="${esc(x.type)}">Edit</button><button type="button" class="btn rg-check-delete" data-host="${esc(x.name)}" data-type="${esc(x.type)}">Remove</button></div></div>`).join(''):
+    $('checkRows').innerHTML=checks.length?checks.map(x=>`<div class="rg-check-row"><div class="rg-check-info"><strong>${esc(x.name)} · ${esc(x.type)}</strong><small>Response: ${esc(x.rcode)} · Answers: ${esc(x.minAnswers)} · Expected data: ${esc(x.expected||'-')}${!supportedCheckTypes.has(x.type)?' · Unsupported type: use Repair to select a valid record type':''}</small></div><div class="rg-actions"><button type="button" class="btn rg-check-edit" data-host="${esc(x.name)}" data-type="${esc(x.type)}">${supportedCheckTypes.has(x.type)?'Edit':'Repair'}</button><button type="button" class="btn rg-check-delete" data-host="${esc(x.name)}" data-type="${esc(x.type)}">Remove</button></div></div>`).join(''):
       '<div class="empty">No DNS health checks configured. Add at least one valid rule before enabling monitoring.</div>';
     syncConfigControls();
   }
@@ -1612,7 +1614,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     if(state.configBusy||!state.configFresh)return;
     const name=$('checkHost').value.trim(),type=$('checkType').value.trim(),rcode=$('checkRcode').value.trim(),
       mode=$('checkCountMode').value, count=mode==='EXACT'?$('checkExact').value.trim():mode, expected=$('checkExpected').value.trim();
-    if(!/^[A-Za-z0-9_.-]{1,253}$/.test(name)||!/^[A-Z][A-Z0-9]{0,15}$/.test(type)||
+    if(!/^[A-Za-z0-9_.-]{1,253}$/.test(name)||!supportedCheckTypes.has(type)||
        !/^[A-Z][A-Z0-9_]{0,31}$/.test(rcode)||
        !(count==='ANY'||count==='AT_LEAST_1'||/^[0-9]{1,4}$/.test(count))||
        !/^[A-Za-z0-9_.:@/+?%=-]{1,200}$/.test(expected)){
@@ -1822,13 +1824,15 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     const editCheck=e.target.closest('.rg-check-edit');if(editCheck){
       const x=state.config?.policy?.checks?.find(c=>c.name===editCheck.dataset.host&&c.type===editCheck.dataset.type);if(!x)return;
       state.editingCheckKey=x.name+'/'+x.type;
-      $('checkHost').value=x.name;$('checkType').value=x.type;
-      $('checkHost').readOnly=true;$('checkType').readOnly=true;
+      const repair=!supportedCheckTypes.has(x.type);
+      $('checkHost').value=x.name;$('checkType').value=repair?(x.type==='AAAAA'?'AAAA':'A'):x.type;
+      $('checkHost').readOnly=true;$('checkType').disabled=!repair;
       $('checkRcode').value=x.rcode;$('checkExpected').value=x.expected||'-';
       if(x.minAnswers==='ANY'||x.minAnswers==='AT_LEAST_1'){$('checkCountMode').value=x.minAnswers;$('checkExactField').hidden=true;}
       else{$('checkCountMode').value='EXACT';$('checkExactField').hidden=false;$('checkExact').value=x.minAnswers;}
-      $('checkEditorTitle').textContent='Edit DNS health check';$('checkEditorMode').textContent=x.name+' · '+x.type;
-      $('checkSave').textContent='Update health check';return;
+      $('checkEditorTitle').textContent=repair?'Repair unsupported DNS record type':'Edit DNS health check';
+      $('checkEditorMode').textContent=repair?'Replace unsupported '+x.type+' with a recognized DNS record type':x.name+' · '+x.type;
+      $('checkSave').textContent=repair?'Repair health check':'Update health check';return;
     }
     const delCheck=e.target.closest('.rg-check-delete');if(delCheck){
       const name=delCheck.dataset.host,type=delCheck.dataset.type;
