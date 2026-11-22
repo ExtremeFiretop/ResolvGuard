@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.3
-readonly SCRIPT_VERSTAG="26112205"
+readonly SCRIPT_VERSTAG="26112207"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -6587,7 +6587,7 @@ _AskValidated_() {
   while :; do
     _Ask_ "$label" "$default" || return 1
     if [ "$uppercase" = upper ]; then
-      RG_ANSWER="$(printf '%s' "$RG_ANSWER" | tr '[:lower:]' '[:upper:]')"
+      RG_ANSWER="$(printf '%s' "$RG_ANSWER" | tr 'abcdefghijklmnopqrstuvwxyz' 'ABCDEFGHIJKLMNOPQRSTUVWXYZ')"
     fi
     if "$validator" "$RG_ANSWER"; then return 0; fi
     _Say_ '  Invalid value. Please try again, or enter e/exit to cancel.'
