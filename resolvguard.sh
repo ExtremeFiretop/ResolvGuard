@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.3
-readonly SCRIPT_VERSTAG="26112202"
+readonly SCRIPT_VERSTAG="26112204"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -403,16 +403,23 @@ _LogHealthyHeartbeat_() {
   _LogEvent_ info "DNS HEALTHY: preferred WAN Strict DoT checks passed (heartbeat ${SYSLOG_HEALTH_INTERVAL_MINUTES}m)"
 }
 _Fail_() { _Say_ "ERROR: $*" >&2; return 1; }
+# Explicit [y/N]: empty means No; unknown answers are never interpreted
+# as consent or refusal. Re-prompt instead of terminating the operation.
 _ConfirmYesNo_() {
   local response
   _SetMenuPalette_
-  printf '\n  %s%s%s %s[y/N]%s: ' "$RG_BOLD" "$1" "$RG_RESET" "$RG_CYAN" "$RG_RESET"
-  IFS= read -r response || return 1
-  printf '\n'
-  case "$response" in
-    y|Y|yes|YES|Yes) return 0 ;;
-    *) [ "${2:-}" = quiet ] || _Say_ '  Cancelled.'; return 1 ;;
-  esac
+  while :; do
+    printf '\n  %s%s%s %s[y/N]%s: ' "$RG_BOLD" "$1" "$RG_RESET" "$RG_CYAN" "$RG_RESET"
+    IFS= read -r response || return 1
+    printf '\n'
+    case "$response" in
+      [Yy]|[Yy][Ee][Ss]) return 0 ;;
+      ''|[Nn]|[Nn][Oo]|[Ee]|[Ee][Xx][Ii][Tt])
+        [ "${2:-}" = quiet ] || _Say_ '  Cancelled.'
+        return 1 ;;
+      *) _Say_ '  Please answer y/yes or n/no (e/exit cancels).' ;;
+    esac
+  done
 }
 _IsValidID_() { case "$1" in ''|*[!A-Za-z0-9_-]*) return 1;; *) return 0;; esac; }
 _IsValidDomain_() {
@@ -6447,19 +6454,8 @@ _UpperMenuKeyChar_() {
 }
 
 _NormalizeMenuChoice_() {
-  local token first second cr
+  local token first second
   token="$1"
-  cr="$(printf '\r')"
-  # An SSH/terminal paste can leave a trailing carriage return.
-  case "$token" in *"$cr") token="${token%"$cr"}" ;; esac
-  # Ignore incidental spaces around the shortcut, but not inside it.
-  while :; do
-    case "$token" in
-      ' '*) token="${token# }" ;;
-      *' ') token="${token% }" ;;
-      *) break ;;
-    esac
-  done
   case "$token" in
     '') return 0 ;;
     [Ee][Xx][Ii][Tt]) printf 'EXIT' ;;
@@ -6537,18 +6533,63 @@ _InstallLauncher_() {
 }
 
 
+# Required fields retry on blank. e/exit is a deliberate cancellation unless
+# the caller is selecting from a menu which includes an e/exit option.
 _Ask_() {
-  local label default
-  label="$1"; default="${2:-}"
+  local label default mode choice
+  label="$1"; default="${2:-}"; mode="${3:-field}"
   _SetMenuPalette_
-  if [ -n "$default" ]; then
-    printf '\n  %s%s%s %s[%s]%s: ' "$RG_BOLD" "$label" "$RG_RESET" "$RG_CYAN" "$default" "$RG_RESET"
-  else
-    printf '\n  %s%s%s: ' "$RG_BOLD" "$label" "$RG_RESET"
-  fi
-  IFS= read -r RG_ANSWER || return 1
-  [ -n "$RG_ANSWER" ] || RG_ANSWER="$default"
+  while :; do
+    if [ -n "$default" ]; then
+      printf '\n  %s%s%s %s[%s]%s: ' "$RG_BOLD" "$label" "$RG_RESET" "$RG_CYAN" "$default" "$RG_RESET"
+    else
+      printf '\n  %s%s%s: ' "$RG_BOLD" "$label" "$RG_RESET"
+    fi
+    IFS= read -r choice || return 1
+    [ -n "$choice" ] || choice="$default"
+    case "$(_NormalizeMenuChoice_ "$choice")" in
+      E|EXIT)
+        if [ "$mode" = choice ]; then
+          RG_ANSWER="$choice"
+          return 0
+        fi
+        _Say_ '  Cancelled by user.'
+        return 2 ;;
+    esac
+    if [ -z "$choice" ]; then
+      _Say_ '  A value is required. Enter e/exit to cancel.'
+      continue
+    fi
+    RG_ANSWER="$choice"
+    return 0
+  done
 }
+
+# Validate individual interactive fields before moving to the next prompt.
+# The unchanged saved-configuration validators remain authoritative.
+_AskValidated_() {
+  local label default validator uppercase
+  label="$1"; default="$2"; validator="$3"; uppercase="${4:-}"
+  while :; do
+    _Ask_ "$label" "$default" || return 1
+    if [ "$uppercase" = upper ]; then
+      RG_ANSWER="$(printf '%s' "$RG_ANSWER" | tr '[:lower:]' '[:upper:]')"
+    fi
+    if "$validator" "$RG_ANSWER"; then return 0; fi
+    _Say_ '  Invalid value. Please try again, or enter e/exit to cancel.'
+  done
+}
+
+_IsValidBackupProviderID_() {
+  _IsValidID_ "$1" || return 1
+  case "$1" in wan[0-9]*) return 1 ;; *) return 0 ;; esac
+}
+
+_IsInspectorRecordChoice_() {
+  case "$1" in A|AAAA|BOTH) return 0 ;; *) return 1 ;; esac
+}
+
+_IsInspectorInput_() { _NormalizeProbeHostname_ "$1" >/dev/null 2>&1; }
 
 _IsSafeToken_() {
   case "$1" in ''|*[!A-Za-z0-9_.:@/+?%=-]*) return 1;; *) return 0;; esac
@@ -6650,8 +6691,8 @@ _ChangeTSVFile_() (
 )
 
 
-_SetSetting_() {
-  local key value staged
+_ValidateSettingValue_() {
+  local key value
   key="$1"; value="$2"
   case "$key" in
     SCHEDULE_INTERVAL_MINUTES) case "$value" in 1|2|5|10|15|20|30|60) :;; *) _Fail_ 'Choose 1/2/5/10/15/20/30/60'; return 1;; esac ;;
@@ -6668,6 +6709,12 @@ _SetSetting_() {
       [ -r "$value" ] || { _Fail_ 'File does not exist or cannot be read'; return 1; } ;;
     *) _Fail_ 'Unknown setting'; return 1 ;;
   esac
+}
+
+_SetSetting_() {
+  local key value staged
+  key="$1"; value="$2"
+  _ValidateSettingValue_ "$key" "$value" || return 1
   (
     _AcquireConfigLock_ || { _Fail_ 'Another configuration commit is running'; return 1; }
     trap '_ReleaseConfigLock_ >/dev/null 2>&1 || :' EXIT HUP INT TERM
@@ -6690,8 +6737,14 @@ _SetSetting_() {
 _PromptSetting_() {
   local key current hint
   key="$1"; current="$2"; hint="$3"
-  _Ask_ "$hint" "$current" || return 1
-  _SetSetting_ "$key" "$RG_ANSWER"
+  while :; do
+    _Ask_ "$hint" "$current" || return 1
+    if _ValidateSettingValue_ "$key" "$RG_ANSWER"; then
+      _SetSetting_ "$key" "$RG_ANSWER"
+      return $?
+    fi
+    _Say_ '  Invalid setting. Please try again, or enter e/exit to cancel.'
+  done
 }
 
 _ShowMonitoringSettingsMenu_() {
@@ -6761,11 +6814,11 @@ _IsValidDNSCheck_() {
 
 _PromptDNSCheck_() {
   local qname qtype rcode count rdata
-  _Ask_ 'DNS hostname' "${1:-}" || return 1; qname="$RG_ANSWER"
-  _Ask_ 'DNS record type (e.g. A/AAAA/CNAME/MX/TXT)' "${2:-A}" || return 1; qtype="$RG_ANSWER"
-  _Ask_ 'Expected RCODE' "${3:-NOERROR}" || return 1; rcode="$RG_ANSWER"
-  _Ask_ 'Expected answer count (ANY, AT_LEAST_1, or exact number)' "${4:-ANY}" || return 1; count="$RG_ANSWER"
-  _Ask_ 'Expected record data (- to ignore)' "${5:--}" || return 1; rdata="$RG_ANSWER"
+  _AskValidated_ 'DNS hostname' "${1:-}" _IsValidDomain_ || return 1; qname="$RG_ANSWER"
+  _AskValidated_ 'DNS record type (e.g. A/AAAA/CNAME/MX/TXT)' "${2:-A}" _IsSupportedHealthRecordType_ upper || return 1; qtype="$RG_ANSWER"
+  _AskValidated_ 'Expected RCODE' "${3:-NOERROR}" _IsValidRCODE_ upper || return 1; rcode="$RG_ANSWER"
+  _AskValidated_ 'Expected answer count (ANY, AT_LEAST_1, or exact number)' "${4:-ANY}" _IsValidDNSAnswerCount_ upper || return 1; count="$RG_ANSWER"
+  _AskValidated_ 'Expected record data (- to ignore)' "${5:--}" _IsSafeToken_ || return 1; rdata="$RG_ANSWER"
   _IsValidDNSCheck_ "$qname" "$qtype" "$rcode" "$count" "$rdata" || {
     _Fail_ 'Invalid DNS check fields'; return 1;
   }
@@ -6792,8 +6845,9 @@ _ShowDNSHealthChecksMenu_() {
         oldkey="$(printf '%s\n' "$RG_CHECK_ROW" | cut -d'|' -f1-2)"
         _ChangeTSVFile_ "$CHECKS" check add "$oldkey" "$RG_CHECK_ROW"; _PromptEnter_ ;;
       CH|DE)
-        _Ask_ 'Existing hostname' '' || return 0; host="$RG_ANSWER"
-        _Ask_ 'Existing record type' A || return 0; type="$RG_ANSWER"
+        _AskValidated_ 'Existing hostname' '' _IsValidDomain_ || continue; host="$RG_ANSWER"
+        # Lookup must still accept an old invalid type so it can be repaired.
+        _AskValidated_ 'Existing record type' A _IsValidRecordType_ upper || continue; type="$RG_ANSWER"
         oldkey="$host|$type"
         oldrow="$(awk -F'|' -v h="$host" -v t="$type" '$1==h && $2==t {print;exit}' "$CHECKS")"
         [ -n "$oldrow" ] || { _Fail_ 'DNS health check not found'; _PromptEnter_; continue; }
@@ -6888,10 +6942,13 @@ _InstallBackupPreset_() (
 )
 
 _AskBackupField_() {
-  _Ask_ "$1" "${2:-}" || return 1
-  case "$(_NormalizeMenuChoice_ "$RG_ANSWER")" in
-    E|EXIT) _Say_ '  Backup edit cancelled without saving.'; return 1 ;;
-  esac
+  local validator
+  validator="${3:-}"
+  if [ -n "$validator" ]; then
+    _AskValidated_ "$1" "${2:-}" "$validator"
+  else
+    _Ask_ "$1" "${2:-}"
+  fi
 }
 
 _ShowBackupResolversMenu_() {
@@ -6924,20 +6981,20 @@ _ShowBackupResolversMenu_() {
           fi
         fi
         if [ "$choice" = CH ]; then
-          _AskBackupField_ 'Existing resolver ID' '' || continue; id="$RG_ANSWER"
+          _AskBackupField_ 'Existing resolver ID' '' _IsValidBackupProviderID_ || continue; id="$RG_ANSWER"
           oldrow="$(awk -F'|' -v z="$id" '$1==z {print;exit}' "$EXTRA_PROVIDERS")"
           [ -n "$oldrow" ] || { _Fail_ 'Resolver not found'; _PromptEnter_; continue; }
           IFS='|' read -r id ip tls tport <<EOF_RG_PROVIDER
 $oldrow
 EOF_RG_PROVIDER
         else
-          _AskBackupField_ 'New resolver ID' '' || continue; id="$RG_ANSWER"
+          _AskBackupField_ 'New resolver ID' '' _IsValidBackupProviderID_ || continue; id="$RG_ANSWER"
           ip=''; tls=''; tport='853'
         fi
         _Say_ 'Enter e or exit at any prompt to cancel.'
-        _AskBackupField_ 'Resolver IPv4/IPv6' "$ip" || continue; ip="$RG_ANSWER"
-        _AskBackupField_ 'Certificate TLS authentication hostname' "$tls" || continue; tls="$RG_ANSWER"
-        _AskBackupField_ 'Upstream TLS port' "${tport:-853}" || continue; tport="$RG_ANSWER"
+        _AskBackupField_ 'Resolver IPv4/IPv6' "$ip" _IsValidIP_ || continue; ip="$RG_ANSWER"
+        _AskBackupField_ 'Certificate TLS authentication hostname' "$tls" _IsValidDomain_ || continue; tls="$RG_ANSWER"
+        _AskBackupField_ 'Upstream TLS port' "${tport:-853}" _IsValidTLSPort_ || continue; tport="$RG_ANSWER"
         if ! _IsValidID_ "$id" || ! _IsValidIP_ "$ip" || ! _IsValidDomain_ "$tls" || ! _IsValidTLSPort_ "$tport"; then
           _Fail_ 'Invalid provider ID, IPv4/IPv6, TLS name or port'; _PromptEnter_; continue
         fi
@@ -6950,7 +7007,7 @@ EOF_RG_PROVIDER
         _PromptEnter_ ;;
       DE)
         _CheckConfigurationSafety_ || { _PromptEnter_; continue; }
-        _AskBackupField_ 'Resolver ID to delete' '' || continue; id="$RG_ANSWER"
+        _AskBackupField_ 'Resolver ID to delete' '' _IsValidBackupProviderID_ || continue; id="$RG_ANSWER"
         _ConfirmYesNo_ "Delete backup resolver $id?" && _ChangeTSVFile_ "$EXTRA_PROVIDERS" provider del "$id"
         _PromptEnter_ ;;
       E|EXIT) return 0 ;;
@@ -7670,8 +7727,15 @@ _SaveInspectedDNSCheck_() {
       _Say_ '  4. RCODE, address and count'
     fi
     _Say_ '  e. Finish without saving this health check (exit also works)'
-    _Ask_ 'Rule precision' 1 || return 1
-    mode="$(_NormalizeMenuChoice_ "$RG_ANSWER")"
+    while :; do
+      _Ask_ 'Rule precision' 1 choice || return 1
+      mode="$(_NormalizeMenuChoice_ "$RG_ANSWER")"
+      case "$mode" in
+        1|2|E|EXIT) break ;;
+        3|4) if [ "$value" != '-' ]; then break; fi ;;
+      esac
+      _Say_ '  Choose one of the displayed options, or enter e/exit.'
+    done
     case "$mode" in
       1) : ;;
       2) expected_count="$count" ;;
@@ -7732,8 +7796,7 @@ _InspectAndSaveHealthCheck_() (
   _Say_ 'Live DNS Inspection and Guided Health Checks'
   _Say_ 'Enter a hostname or HTTP(S) URL. ResolvGuard queries every configured'
   _Say_ 'resolver through strict authenticated DoT, without changing WAN DNS.'
-  _Ask_ 'Hostname or HTTP(S) URL' '' || return 1
-  [ -n "$RG_ANSWER" ] || { _Say_ 'Cancelled.'; return 0; }
+  _AskValidated_ 'Hostname or HTTP(S) URL' '' _IsInspectorInput_ || return 1
   host="$RG_ANSWER"
   mode="$(_GetRouterIPv6Mode_)"
   case "$mode" in
@@ -7741,9 +7804,8 @@ _InspectAndSaveHealthCheck_() (
     disabled) recommended=A; _Say_ '  IPv6 is disabled; A recommended. AAAA remains available.' ;;
     *) recommended=A; _Say_ '  IPv6 state unknown; A recommended. AAAA remains available.' ;;
   esac
-  _Ask_ 'Record types (A/AAAA/BOTH)' "$recommended" || return 1
-  record_types="$(printf '%s' "$RG_ANSWER" | tr '[:lower:]' '[:upper:]')"
-  case "$record_types" in A|AAAA|BOTH) :;; *) _Fail_ 'Choose A, AAAA or BOTH'; return 1;; esac
+  _AskValidated_ 'Record types (A/AAAA/BOTH)' "$recommended" _IsInspectorRecordChoice_ upper || return 1
+  record_types="$RG_ANSWER"
   if ! _InspectDNS_ "$host" "$record_types" all summary "$capture"; then
     _Say_ 'Some resolver responses failed. Only usable results are offered below.'
   fi
@@ -7774,14 +7836,20 @@ _InspectAndSaveHealthCheck_() (
     [ "$available" -gt 0 ] || { _Say_ 'No successful DNS responses to save.'; return 1; }
     _Say_ '  Select a number only if you want to create a DNS health check.'
     _Say_ '  e. Finish inspection (exit also works)'
-    _Ask_ 'Result number or e to finish' '' || return 1
-    selection="$(_NormalizeMenuChoice_ "$RG_ANSWER")"
-    case "$selection" in
-      E|EXIT) _Say_ 'Inspection finished. No additional changes requested.'; return 0 ;;
-      '') _ShowInvalidSelection_; continue ;;
-      *[!0-9]*|0) _Fail_ 'Invalid result number'; return 1 ;;
-    esac
-    [ "$selection" -le "$available" ] || { _Fail_ 'Result number out of range'; return 1; }
+    while :; do
+      _Ask_ 'Result number or e to finish' '' choice || return 1
+      selection="$(_NormalizeMenuChoice_ "$RG_ANSWER")"
+      case "$selection" in
+        E|EXIT) _Say_ 'Inspection finished. No additional changes requested.'; return 0 ;;
+        ''|*[!0-9]*|0) _Say_ '  Enter a displayed result number, or e/exit to finish.'; continue ;;
+      esac
+      # Bound input before integer comparison: huge numeric pastes are invalid.
+      if [ "${#selection}" -gt 8 ] || [ "$selection" -gt "$available" ] || [ "$selection" -lt 1 ]; then
+        _Say_ '  Result number out of range. Please try again.'
+        continue
+      fi
+      break
+    done
     row="$(awk -F'|' -v n="$selection" '
         ($3=="A" || $3=="AAAA") && ($4=="NOERROR" || $4=="NXDOMAIN") {if (++i==n) {print;exit}}' "$capture")"
     [ -n "$row" ] || { _Fail_ 'Selected result unavailable'; return 1; }
