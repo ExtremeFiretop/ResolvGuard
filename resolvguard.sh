@@ -20,8 +20,8 @@ CONFIG_SCHEMA=5
 set -u
 
 ## Set version for each Production Release ##
-readonly SCRIPT_VERSION=0.2.3
-readonly SCRIPT_VERSTAG="26112207"
+readonly SCRIPT_VERSION=0.2.4
+readonly SCRIPT_VERSTAG="26112209"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -570,7 +570,13 @@ _IsValidDNSAnswerCount_() {
 }
 
 _ParseWANUpstreams_() {
-  [ -r "$WAN_STUBBY_CONFIG" ] || { _Fail_ "WAN Stubby config missing: $WAN_STUBBY_CONFIG"; return 1; }
+  if [ ! -r "$WAN_STUBBY_CONFIG" ]; then
+    _Fail_ "WAN Strict DoT (Stubby) configuration missing or unreadable: $WAN_STUBBY_CONFIG"
+    _Say_ '  ResolvGuard requires router-managed authenticated DNS-over-TLS resolvers.' >&2
+    _Say_ '  Check the WAN DNS Privacy settings, configured DoT servers, and active Stubby YAML path.' >&2
+    _Say_ '  Without a router-managed WAN DoT pool, there are no supported upstreams to monitor.' >&2
+    return 1
+  fi
   awk '
     function trim(s) {
       sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s)
