@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.2
-readonly SCRIPT_VERSTAG="26112112"
+readonly SCRIPT_VERSTAG="26112113"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -4451,36 +4451,23 @@ _RegisterScheduleCron_() {
     _Fail_ 'Registered cron job could not be verified'; return 1; }
 }
 
-# Keep the startup entry as a single, exactly owned line. Legacy blocks
-# from an existing installed ResolvGuard may be replaced only if unmodified.
+# Keep the startup entry as a single, exactly owned line. Reject unknown or
+# modified ResolvGuard entries rather than altering other add-ons' hooks.
 _StartupHookLine_() {
   printf '%s/resolvguard.sh startup & # RESOLVGUARD STARTUP\n' "$ROOT"
 }
 
 _CheckOwnedStartupHook_() {
-  local hook line n_line n_begin n_end n_refs actual expected
+  local hook line n_line n_tag n_refs
   hook="$HOOK_DIR/services-start"
   [ ! -e "$hook" ] && [ ! -L "$hook" ] && return 0
   [ -f "$hook" ] && [ ! -L "$hook" ] || { _Fail_ 'Unsafe services-start hook'; return 1; }
   line="$(_StartupHookLine_)"
-  n_line="$(grep -Fc '# RESOLVGUARD STARTUP' "$hook" || :)"
-  n_begin="$(grep -Fxc '# RESOLVGUARD BEGIN' "$hook" || :)"
-  n_end="$(grep -Fxc '# RESOLVGUARD END' "$hook" || :)"
-  [ "$n_line" -le 1 ] && [ "$n_begin" = "$n_end" ] && [ "$n_begin" -le 1 ] &&
-    [ $((n_line+n_begin)) -le 1 ] || { _Fail_ 'Ambiguous ResolvGuard startup hook'; return 1; }
-  if [ "$n_line" = 1 ]; then
-    grep -Fqx "$line" "$hook" || { _Fail_ 'Modified ResolvGuard startup hook'; return 1; }
-  elif [ "$n_begin" = 1 ]; then
-    expected="$(printf '%s\n' '# RESOLVGUARD BEGIN' \
-      "/bin/sh $ROOT/resolvguard.sh startup >> /tmp/resolvguard-startup.log 2>&1 &" \
-      '# RESOLVGUARD END')"
-    actual="$(sed -n '/^# RESOLVGUARD BEGIN$/,/^# RESOLVGUARD END$/p' "$hook")"
-    [ "$actual" = "$expected" ] || { _Fail_ 'Modified ResolvGuard startup block'; return 1; }
-  fi
-  # The one owned entry is the only permitted startup invocation.
+  n_line="$(grep -Fxc "$line" "$hook" || :)"
+  n_tag="$(grep -Fc '# RESOLVGUARD STARTUP' "$hook" || :)"
   n_refs="$(grep -Fc "$ROOT/resolvguard.sh startup" "$hook" || :)"
-  [ "$n_refs" -eq $((n_line+n_begin)) ] || {
-    _Fail_ 'Unrecognized ResolvGuard startup command'; return 1;
+  [ "$n_line" -le 1 ] && [ "$n_tag" -eq "$n_line" ] && [ "$n_refs" -eq "$n_line" ] || {
+    _Fail_ 'Unrecognized or duplicate ResolvGuard startup hook'; return 1;
   }
 }
 
@@ -4498,11 +4485,7 @@ _InstallScheduleHook_() {
   staged="$HOOK_DIR/.services-start-resolvguard-$$"
   [ ! -e "$staged" ] && [ ! -L "$staged" ] || return 1
   if [ -f "$hook" ]; then
-    if grep -Fqx '# RESOLVGUARD BEGIN' "$hook"; then
-      sed '/^# RESOLVGUARD BEGIN$/,/^# RESOLVGUARD END$/d' "$hook" > "$staged" || return 1
-    else
-      cat "$hook" > "$staged" || return 1
-    fi
+    cat "$hook" > "$staged" || return 1
   else
     (umask 077; printf '#!/bin/sh\n' > "$staged") || return 1
   fi
@@ -4516,16 +4499,10 @@ _RemoveScheduleHook_() {
   _CheckOwnedStartupHook_ || return 1
   [ -f "$hook" ] || return 0
   line="$(_StartupHookLine_)"
-  if ! grep -Fqx "$line" "$hook" && ! grep -Fqx '# RESOLVGUARD BEGIN' "$hook"; then
-    return 0
-  fi
+  grep -Fqx "$line" "$hook" || return 0
   staged="$HOOK_DIR/.services-start-uninstall-$$"
   [ ! -e "$staged" ] && [ ! -L "$staged" ] || return 1
-  if grep -Fqx '# RESOLVGUARD BEGIN' "$hook"; then
-    sed '/^# RESOLVGUARD BEGIN$/,/^# RESOLVGUARD END$/d' "$hook" > "$staged" || return 1
-  else
-    awk -v owned="$line" '$0 != owned {print}' "$hook" > "$staged" || return 1
-  fi
+  awk -v owned="$line" '$0 != owned {print}' "$hook" > "$staged" || return 1
   chmod 755 "$staged" && mv -f "$staged" "$hook" || { rm -f "$staged"; return 1; }
 }
 
@@ -4909,8 +4886,6 @@ _RGManual_() (
   RG_M_DATA="${RUNTIME}/webui"
   RG_M_HOOK=/jffs/scripts/service-event
   RG_M_LOCK=/tmp/addonwebui.lock
-  RG_M_BEG='# RESOLVGUARD WEBUI MANUAL BEGIN'
-  RG_M_END='# RESOLVGUARD WEBUI MANUAL END'
 
   message() { printf '%s\n' "ResolvGuard WebUI manual: $*" >&2; }
   quote() {
@@ -4958,8 +4933,9 @@ _RGManual_() (
   }
   hook_current() {
     [ -f "$RG_M_HOOK" ] && [ ! -L "$RG_M_HOOK" ] || return 1
-    [ "$(grep -Fc '# RESOLVGUARD MANUAL' "$RG_M_HOOK" || :)" = 1 ] &&
-      grep -Fqx "$(hook_body)" "$RG_M_HOOK"
+    [ "$(grep -Fxc "$(hook_body)" "$RG_M_HOOK" || :)" = 1 ] &&
+      [ "$(grep -Fc '# RESOLVGUARD MANUAL' "$RG_M_HOOK" || :)" = 1 ] &&
+      [ "$(grep -Fc ResolvGuardManualCheck "$RG_M_HOOK" || :)" = 1 ]
   }
   update_hook() {
     action="$1"
@@ -4970,45 +4946,26 @@ _RGManual_() (
     [ -d /jffs/scripts ] && [ ! -L /jffs/scripts ] || { message 'scripts directory missing or unsafe'; return 1; }
     exec 9> "$RG_M_LOCK" && flock -x 9 || return 1
     compact="$(hook_body)"
-    count_compact=0;count_begin=0;count_end=0
+    count_compact=0; count_tag=0; count_action=0
     if [ -f "$RG_M_HOOK" ]; then
-      count_compact=$(grep -Fc '# RESOLVGUARD MANUAL' "$RG_M_HOOK" || :)
-      count_begin=$(grep -Fxc "$RG_M_BEG" "$RG_M_HOOK" || :)
-      count_end=$(grep -Fxc "$RG_M_END" "$RG_M_HOOK" || :)
+      count_compact=$(grep -Fxc "$compact" "$RG_M_HOOK" || :)
+      count_tag=$(grep -Fc '# RESOLVGUARD MANUAL' "$RG_M_HOOK" || :)
+      count_action=$(grep -Fc ResolvGuardManualCheck "$RG_M_HOOK" || :)
     fi
-    [ "$count_compact" -le 1 ] && [ "$count_begin" = "$count_end" ] &&
-      [ "$count_begin" -le 1 ] && [ $((count_compact+count_begin)) -le 1 ] &&
-      [ "$(grep -Fc ResolvGuardManualCheck "$RG_M_HOOK" 2>/dev/null || :)" -eq $((count_compact+count_begin)) ] || {
-        message 'ambiguous service-event manual hook'; return 1;
+    [ "$count_compact" -le 1 ] && [ "$count_tag" -eq "$count_compact" ] &&
+      [ "$count_action" -eq "$count_compact" ] || {
+        message 'unrecognized or duplicate service-event manual hook'; return 1;
       }
-    if [ "$count_compact" = 1 ]; then
-      grep -Fqx "$compact" "$RG_M_HOOK" || { message 'modified manual hook'; return 1; }
-      [ "$action" = install ] && return 0
-    elif [ "$count_begin" = 1 ]; then
-      actual=$(sed -n '/^# RESOLVGUARD WEBUI MANUAL BEGIN$/,/^# RESOLVGUARD WEBUI MANUAL END$/p' "$RG_M_HOOK")
-      expected="$(printf '%s\n' "$RG_M_BEG" \
-        'if [ "$1" = "start" ] && [ "$2" = "ResolvGuardManualCheck" ]; then' \
-        '  /bin/sh /jffs/addons/ResolvGuard.d/resolvguard.sh webui manual-run >/tmp/resolvguard-webui-manual.log 2>&1 &' \
-        'fi' "$RG_M_END")"
-      [ "$actual" = "$expected" ] || { message 'modified manual hook block'; return 1; }
-    elif [ "$action" = remove ]; then
+    if [ "$count_compact" -eq 1 ] && [ "$action" = install ]; then
       return 0
     fi
-    # An unowned action must not be overwritten or duplicated.
-    if [ "$count_compact" = 0 ] && [ "$count_begin" = 0 ] && [ -f "$RG_M_HOOK" ] &&
-       grep -F 'ResolvGuardManualCheck' "$RG_M_HOOK" >/dev/null; then
-      message 'unrecognized manual action'; return 1
+    if [ "$count_compact" -eq 0 ] && [ "$action" = remove ]; then
+      return 0
     fi
     staged=/jffs/scripts/.service-event-resolvguard-manual-$$
     [ ! -e "$staged" ] && [ ! -L "$staged" ] || return 1
     if [ -f "$RG_M_HOOK" ]; then
-      if [ "$count_begin" = 1 ]; then
-        sed '/^# RESOLVGUARD WEBUI MANUAL BEGIN$/,/^# RESOLVGUARD WEBUI MANUAL END$/d' "$RG_M_HOOK" > "$staged" || return 1
-      elif [ "$count_compact" = 1 ]; then
-        awk -v owned="$compact" '$0 != owned {print}' "$RG_M_HOOK" > "$staged" || return 1
-      else
-        cat "$RG_M_HOOK" > "$staged" || return 1
-      fi
+      awk -v owned="$compact" '$0 != owned {print}' "$RG_M_HOOK" > "$staged" || return 1
     else
       printf '#!/bin/sh\n' > "$staged" || return 1
     fi
@@ -5136,8 +5093,6 @@ _RGWebConfig_() (
   umask 077
   rg_dir="$RUNTIME/webui"
   rg_hook=/jffs/scripts/service-event
-  rg_beg='# RESOLVGUARD WEBUI CONFIG BEGIN'
-  rg_end='# RESOLVGUARD WEBUI CONFIG END'
   rg_lock=/tmp/addonwebui.lock
   rg_result="$rg_dir/config-action.htm"
   rg_config="$rg_dir/config.htm"
@@ -5312,8 +5267,9 @@ _RGWebConfig_() (
   }
   rg_hook_current() {
     [ -f "$rg_hook" ] && [ ! -L "$rg_hook" ] || return 1
-    [ "$(grep -Fc '# RESOLVGUARD CONFIG' "$rg_hook" || :)" = 1 ] &&
-      grep -Fqx "$(rg_hook_body)" "$rg_hook"
+    [ "$(grep -Fxc "$(rg_hook_body)" "$rg_hook" || :)" = 1 ] &&
+      [ "$(grep -Fc '# RESOLVGUARD CONFIG' "$rg_hook" || :)" = 1 ] &&
+      [ "$(grep -Fc ResolvGuardCfg "$rg_hook" || :)" = 1 ]
   }
   rg_hook_update() {
     rg_verb="$1"
@@ -5322,42 +5278,26 @@ _RGWebConfig_() (
     [ ! -L "$rg_hook" ] && { [ ! -e "$rg_hook" ] || [ -f "$rg_hook" ]; } || return 1
     exec 9> "$rg_lock" && flock -x 9 || return 1
     rg_line="$(rg_hook_body)"
-    rg_nline=0;rg_nbeg=0;rg_nend=0
+    rg_nline=0; rg_ntag=0; rg_naction=0
     if [ -f "$rg_hook" ]; then
-      rg_nline=$(grep -Fc '# RESOLVGUARD CONFIG' "$rg_hook" || :)
-      rg_nbeg=$(grep -Fxc "$rg_beg" "$rg_hook" || :)
-      rg_nend=$(grep -Fxc "$rg_end" "$rg_hook" || :)
+      rg_nline=$(grep -Fxc "$rg_line" "$rg_hook" || :)
+      rg_ntag=$(grep -Fc '# RESOLVGUARD CONFIG' "$rg_hook" || :)
+      rg_naction=$(grep -Fc ResolvGuardCfg "$rg_hook" || :)
     fi
-    [ "$rg_nline" -le 1 ] && [ "$rg_nbeg" = "$rg_nend" ] &&
-      [ "$rg_nbeg" -le 1 ] && [ $((rg_nline+rg_nbeg)) -le 1 ] &&
-      [ "$(grep -Fc ResolvGuardCfg "$rg_hook" 2>/dev/null || :)" -eq $((rg_nline+rg_nbeg)) ] || return 1
-    if [ "$rg_nline" = 1 ]; then
-      grep -Fqx "$rg_line" "$rg_hook" || { rg_notice 'modified config hook'; return 1; }
-      [ "$rg_verb" = install ] && return 0
-    elif [ "$rg_nbeg" = 1 ]; then
-      rg_actual=$(sed -n '/^# RESOLVGUARD WEBUI CONFIG BEGIN$/,/^# RESOLVGUARD WEBUI CONFIG END$/p' "$rg_hook")
-      rg_expected="$(printf '%s\n' "$rg_beg" 'case "$1:$2" in' \
-        '  start:ResolvGuardCfg)' \
-        '    /bin/sh /jffs/addons/ResolvGuard.d/resolvguard.sh webui config-run >/tmp/resolvguard-webui-config.log 2>&1 &' \
-        '    ;;' 'esac' "$rg_end")"
-      [ "$rg_actual" = "$rg_expected" ] || { rg_notice 'modified config hook block'; return 1; }
-    elif [ "$rg_verb" = remove ]; then
+    [ "$rg_nline" -le 1 ] && [ "$rg_ntag" -eq "$rg_nline" ] &&
+      [ "$rg_naction" -eq "$rg_nline" ] || {
+        rg_notice 'unrecognized or duplicate config hook'; return 1;
+      }
+    if [ "$rg_nline" -eq 1 ] && [ "$rg_verb" = install ]; then
       return 0
     fi
-    if [ "$rg_nline" = 0 ] && [ "$rg_nbeg" = 0 ] && [ -f "$rg_hook" ] &&
-       grep -F 'ResolvGuardCfg' "$rg_hook" >/dev/null; then
-      rg_notice 'unrecognized config action'; return 1
+    if [ "$rg_nline" -eq 0 ] && [ "$rg_verb" = remove ]; then
+      return 0
     fi
     rg_stage=/jffs/scripts/.service-event-resolvguard-config-$$
     [ ! -e "$rg_stage" ] && [ ! -L "$rg_stage" ] || return 1
     if [ -f "$rg_hook" ]; then
-      if [ "$rg_nbeg" = 1 ]; then
-        sed '/^# RESOLVGUARD WEBUI CONFIG BEGIN$/,/^# RESOLVGUARD WEBUI CONFIG END$/d' "$rg_hook" > "$rg_stage" || return 1
-      elif [ "$rg_nline" = 1 ]; then
-        awk -v owned="$rg_line" '$0 != owned {print}' "$rg_hook" > "$rg_stage" || return 1
-      else
-        cat "$rg_hook" > "$rg_stage" || return 1
-      fi
+      awk -v owned="$rg_line" '$0 != owned {print}' "$rg_hook" > "$rg_stage" || return 1
     else
       printf '#!/bin/sh\n' > "$rg_stage" || return 1
     fi
@@ -7477,12 +7417,9 @@ _UninstallNeverEnrolled_() {
     # an unenrolled installation: it only restores the independent WebUI.
     # Refuse stray/modified references rather than deleting a foreign hook.
     if grep -F "$ROOT/resolvguard.sh" "$hook" >/dev/null 2>&1 ||
-       grep -F '# RESOLVGUARD STARTUP' "$hook" >/dev/null ||
-       grep -Fqx '# RESOLVGUARD BEGIN' "$hook" ||
-       grep -Fqx '# RESOLVGUARD END' "$hook"; then
+       grep -F '# RESOLVGUARD STARTUP' "$hook" >/dev/null; then
       _CheckOwnedStartupHook_ || return 1
-      if { ! grep -Fqx "$(_StartupHookLine_)" "$hook" &&
-           ! grep -Fqx '# RESOLVGUARD BEGIN' "$hook"; } ||
+      if ! grep -Fqx "$(_StartupHookLine_)" "$hook" ||
          [ "$(grep -Fc "$ROOT/resolvguard.sh" "$hook")" -ne 1 ]; then
         _Fail_ 'Unrecognized ResolvGuard services-start reference; uninstall blocked'
         return 1
@@ -7560,8 +7497,8 @@ _UninstallLocked_() {
      { [ -f /jffs/scripts/service-event ] &&
        { grep -Fq '# RESOLVGUARD MANUAL' /jffs/scripts/service-event ||
          grep -Fq '# RESOLVGUARD CONFIG' /jffs/scripts/service-event ||
-         grep -Fq '# RESOLVGUARD WEBUI MANUAL BEGIN' /jffs/scripts/service-event ||
-         grep -Fq '# RESOLVGUARD WEBUI CONFIG BEGIN' /jffs/scripts/service-event; }; }; then
+         grep -Fq 'ResolvGuardManualCheck' /jffs/scripts/service-event ||
+         grep -Fq 'ResolvGuardCfg' /jffs/scripts/service-event; }; }; then
     _RGWebUI_ unmount || {
       _Fail_ 'WebUI cleanup failed; installation retained for inspection'
       return 1
