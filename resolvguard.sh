@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.3
-readonly SCRIPT_VERSTAG="26112204"
+readonly SCRIPT_VERSTAG="26112205"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -5687,9 +5687,18 @@ _RGWebUI_() (
     done
     exec 8> "$RG_DATA/publish.lock" || return 1
     flock -x 8 || return 1
+    # Only one publisher can hold this lock. Previous active-members-PID
+    # scratch files are no longer in use, so clear them before the new cycle.
+    # Never remove symlinks, directories or names without a numeric PID.
+    for stale_member in "$RG_DATA"/active-members-*; do
+      [ -f "$stale_member" ] && [ ! -L "$stale_member" ] || continue
+      stale_pid=${stale_member##*/active-members-}
+      case "$stale_pid" in ''|*[!0-9]*) continue ;; esac
+      rm -f "$stale_member" || { err 'unable to remove stale active-members scratch file'; return 1; }
+    done
     cycle="$RG_DATA/cycle-$$"
     observations="$RG_DATA/observations-$$"
-    trap 'rm -f "$cycle" "$observations" "$RG_DATA"/active-members-"$$" "$RG_DATA"/status-"$$".tmp "$RG_DATA"/history-"$$".tmp "$RG_DATA"/events-"$$".tmp "$RG_DATA"/last-end.new."$$"' EXIT HUP INT TERM
+    trap 'rm -f "$cycle" "$observations" "$RG_DATA"/active-members-"$$" "$RG_DATA"/status-"$$".tmp "$RG_DATA"/history-"$$".tmp "$RG_DATA"/events-"$$".tmp "$RG_DATA"/history-failures-"$$".tmp "$RG_DATA"/trim-count.new."$$" "$RG_DATA"/last-end.new."$$"' EXIT HUP INT TERM
     extract_cycle > "$cycle" || :
     # First publish can precede the first cron cycle. Do not invent green state.
     header=$(sed -n '1p' "$cycle")
@@ -5983,7 +5992,12 @@ EOF_UNBOUND
     ) > "$tmp" || return 1
     mv "$tmp" "$RG_DATA/history.htm" || return 1
     _RGWebConfig_ snapshot || err "unable to publish configuration snapshot"
-    rm -f "$cycle" "$observations"
+    # The active roster is only needed until status.htm is assembled. If
+    # cleanup fails, keep the exit trap armed rather than leaking on success.
+    rm -f "$cycle" "$observations" "$active_members" \
+      "$RG_DATA"/status-"$$".tmp "$RG_DATA"/history-"$$".tmp \
+      "$RG_DATA"/events-"$$".tmp "$RG_DATA"/history-failures-"$$".tmp \
+      "$RG_DATA"/trim-count.new."$$" "$RG_DATA"/last-end.new."$$" || return 1
     trap - EXIT HUP INT TERM
     return 0
   }
