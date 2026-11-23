@@ -3,7 +3,7 @@
 # ResolvGuard.sh
 #
 # Project Created: 2026-Oct-29 by @ExtremeFiretop
-# Last Modified: 2026-Nov-22
+# Last Modified: 2026-Nov-23
 #
 # ResolvGuard™
 # Official project: https://github.com/ExtremeFiretop/ResolvGuard
@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.4
-readonly SCRIPT_VERSTAG="26112209"
+readonly SCRIPT_VERSTAG="26112310"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -741,6 +741,8 @@ _RunAuthenticatedDoTQuery_() {
   case "${5:-health}" in
     health) set -- +noall +comments +answer +stats ;;
     inspection) set -- +noall +comments +answer +authority +additional +stats ;;
+    dnssec) set -- +dnssec +noall +comments +answer +stats ;;
+    dnssec-cd) set -- +dnssec +cdflag +noall +comments +answer +stats ;;
     *) return 1 ;;
   esac
 
@@ -778,6 +780,139 @@ EOF_RG_DIRECT_DOT
 
   return 0
 }
+
+# DNSSEC diagnostics are intentionally observational. They are not policy
+# health checks, do not enter a scheduler, and cannot contribute to WAN failover.
+# Inspect the verified dig reply rather than the process exit code alone.
+_DNSSECResponseStatus_() {
+  sed -n 's/^;; ->>HEADER<<- opcode: QUERY, status: \([A-Z][A-Z0-9_]*\), id: [0-9][0-9]*.*/\1/p' "$1" | head -n 1
+}
+
+_DNSSECResponseHasFlag_() {
+  awk -v flag="$2" '
+    /^;; flags: / {
+      for (i=3; i<=NF; i++) {
+        f=$i; sub(/;.*/, "", f)
+        if (f==flag) found=1
+      }
+    }
+    END {exit !found}
+  ' "$1"
+}
+
+_DNSSECResponseHasA_() {
+  awk '
+    /^;; ANSWER SECTION:$/ {in_answer=1; next}
+    /^;; / {in_answer=0; next}
+    /^;/ {next}
+    in_answer && NF>=5 && $2 ~ /^[0-9]+$/ && $3=="IN" && $4=="A" {found=1}
+    END {exit !found}
+  ' "$1"
+}
+
+# One-time, read-only, direct authenticated DoT diagnostics. All three queries
+# are per resolver; the deliberate SERVFAIL is a successful negative test.
+# No saved health checks, NVRAM, monitoring counters, or policy marks are written.
+_RunDNSSECDiagnostics_() (
+  local selected attempt id ip tls port extra file label response pass fail inconclusive
+  selected="${1:-all}"
+  [ "$selected" = all ] || _IsValidID_ "$selected" || {
+    _Fail_ 'Usage: dnssec [all|provider-id]'; return 2;
+  }
+  _RequireProbeDependencies_ || return 2
+  RG_INSPECT_CONFIG_HELD=0
+  RG_INSPECT_DIR=''
+  trap '_CleanupInspectorSession_' EXIT HUP INT TERM
+  attempt=0
+  until _AcquireConfigLock_; do
+    attempt=$((attempt+1))
+    [ "$attempt" -lt 6 ] || { _Fail_ 'Configuration busy; DNSSEC diagnostics deferred'; return 2; }
+    sleep 1
+  done
+  RG_INSPECT_CONFIG_HELD=1
+  [ ! -L "$RUNTIME/inspectors" ] || { _Fail_ 'Unsafe inspector directory'; return 2; }
+  mkdir -p "$RUNTIME/inspectors" || return 2
+  RG_INSPECT_DIR="$RUNTIME/inspectors/$$"
+  [ ! -e "$RG_INSPECT_DIR" ] && [ ! -L "$RG_INSPECT_DIR" ] && mkdir "$RG_INSPECT_DIR" || {
+    _Fail_ 'Unable to reserve DNSSEC diagnostic session'; return 2;
+  }
+  PROVIDERS="$RG_INSPECT_DIR/providers.tsv"
+  _PrepareProviders_ || return 2
+  if ! _ReleaseConfigLock_; then
+    _Fail_ 'Could not release DNSSEC diagnostic admission lock'; return 2
+  fi
+  RG_INSPECT_CONFIG_HELD=0
+  if [ "$selected" != all ]; then
+    _GetProviderInfo_ "$selected" >/dev/null || {
+      _Fail_ "Unknown configured provider: $selected"; return 2;
+    }
+  fi
+  _Say_ ''
+  _Say_ 'DNSSEC Validation Diagnostics (READ ONLY)'
+  _Say_ 'Signed: cloudflare.com / Broken: dnssec-failed.org'
+  _Say_ 'The deliberate SERVFAIL is expected, not a resolver health failure.'
+  _Say_ 'No changes to WAN DNS, scheduled health checks, or failover counters.'
+  pass=0; fail=0; inconclusive=0
+  while IFS='|' read -r id ip tls port extra; do
+    [ -n "$id" ] || continue
+    if [ "$selected" != all ] && [ "$id" != "$selected" ]; then continue; fi
+    printf '\nResolver: %s (%s:%s; TLS %s)\n' "$id" "$ip" "$port" "$tls"
+    for label in signed rejected bypass; do
+      file="$RG_INSPECT_DIR/$label.txt"
+      case "$label" in
+        signed)
+          if _RunAuthenticatedDoTQuery_ "$id" cloudflare.com A "$file" dnssec; then
+            response="$(_DNSSECResponseStatus_ "$file")"
+            if [ "$response" = NOERROR ] && _DNSSECResponseHasFlag_ "$file" ad &&
+               _DNSSECResponseHasA_ "$file"; then
+              _Say_ '  Signed domain (NOERROR + AD + A): PASS'
+              pass=$((pass+1))
+            else
+              _Say_ "  Signed domain (NOERROR + AD + A): FAIL (observed ${response:-unknown})"
+              fail=$((fail+1))
+            fi
+          else
+            _Say_ '  Signed domain: INCONCLUSIVE (authenticated DoT query failed)'
+            inconclusive=$((inconclusive+1))
+          fi ;;
+        rejected)
+          if _RunAuthenticatedDoTQuery_ "$id" dnssec-failed.org A "$file" dnssec; then
+            response="$(_DNSSECResponseStatus_ "$file")"
+            if [ "$response" = SERVFAIL ] && ! _DNSSECResponseHasFlag_ "$file" ad; then
+              _Say_ '  Broken signature (SERVFAIL): PASS'
+              pass=$((pass+1))
+            else
+              _Say_ "  Broken signature (SERVFAIL): FAIL (observed ${response:-unknown})"
+              fail=$((fail+1))
+            fi
+          else
+            _Say_ '  Broken signature: INCONCLUSIVE (authenticated DoT query failed)'
+            inconclusive=$((inconclusive+1))
+          fi ;;
+        bypass)
+          if _RunAuthenticatedDoTQuery_ "$id" dnssec-failed.org A "$file" dnssec-cd; then
+            response="$(_DNSSECResponseStatus_ "$file")"
+            if [ "$response" = NOERROR ] && _DNSSECResponseHasFlag_ "$file" cd &&
+               _DNSSECResponseHasA_ "$file"; then
+              _Say_ '  Checking disabled (NOERROR + CD + A): PASS'
+              pass=$((pass+1))
+            else
+              _Say_ "  Checking disabled (NOERROR + CD + A): FAIL (observed ${response:-unknown})"
+              fail=$((fail+1))
+            fi
+          else
+            _Say_ '  Checking disabled: INCONCLUSIVE (authenticated DoT query failed)'
+            inconclusive=$((inconclusive+1))
+          fi ;;
+      esac
+    done
+  done < "$PROVIDERS"
+  printf '\nDNSSEC diagnostics: %s PASS, %s FAIL, %s INCONCLUSIVE\n' "$pass" "$fail" "$inconclusive"
+  _Say_ 'Observational only; these results do not affect automatic failover.'
+  if [ "$fail" -gt 0 ]; then return 1; fi
+  if [ "$inconclusive" -gt 0 ] || [ "$pass" -eq 0 ]; then return 2; fi
+  return 0
+)
 
 # Only DNS ANSWER SECTION resource records can satisfy health policies.
 # Other sections may contain valid records of the requested type, but they
@@ -6314,6 +6449,7 @@ _ShowMonitoringDiagnosticsMenu_() {
     _PrintMenuItem_ ss 'Show Schedule and Recovery Status'
     _PrintMenuItem_ lo 'View Recent Scheduled Check Log'
     _PrintMenuItem_ dp 'Show Discovered Providers and Resolver Pools'
+    _PrintMenuItem_ ds 'Run DNSSEC Validation Diagnostics (Read Only)'
     _PrintMenuItem_ ts 'Full Technical Status'
     _PrintMenuItem_ e 'Back'
     _PrintMenuFooter_
@@ -6324,6 +6460,7 @@ _ShowMonitoringDiagnosticsMenu_() {
       SS) _ShowScheduleStatus_; _PromptEnter_ ;;
       LO) _ManageScheduledMonitoring_ logs; _PromptEnter_ ;;
       DP) _ShowDiscoveredProvidersAndPools_; _PromptEnter_ ;;
+      DS) _RunDNSSECDiagnostics_ all; _PromptEnter_ ;;
       TS) _ShowStatus_; _PromptEnter_ ;;
       E|EXIT) return 0 ;;
       *) _ShowInvalidSelection_ ;;
@@ -8538,11 +8675,12 @@ case "${1:-menu}" in
   discover) _DiscoverResolvers_ ;;
   check) _RunDNSHealthCheck_ ;;
   probe) _InspectDNS_ "${2:-}" "${3:-BOTH}" "${4:-all}" "${5:-summary}" ;;
+  dnssec) _RunDNSSECDiagnostics_ "${2:-all}" ;;
   status) _ShowStatus_ ;;
   help|-h|--help)
     cat <<HELP
 ResolvGuard v$SCRIPT_VERSION (WAN DNS-over-TLS monitoring and failover)
-Usage: sh $ROOT/resolvguard.sh [install|menu|quick-setup|dependencies|configure|uninstall|discover|validate|enroll|pools|check|status|restore|probe <hostname-or-URL> [BOTH|TYPE] [provider-id|all] [summary|full]|schedule [status|enable|disable|logs]|startup|webui [bootstrap|mount|unmount|publish|status]|policy [status|approve|revoke]|amtmupdate [check|status|update]|develop|stable]
+Usage: sh $ROOT/resolvguard.sh [install|menu|quick-setup|dependencies|configure|uninstall|discover|validate|enroll|pools|check|status|restore|probe <hostname-or-URL> [BOTH|TYPE] [provider-id|all] [summary|full]|dnssec [all|provider-id]|schedule [status|enable|disable|logs]|startup|webui [bootstrap|mount|unmount|publish|status]|policy [status|approve|revoke]|amtmupdate [check|status|update]|develop|stable]
 
 No arguments: if installation is needed, install and offer Quick Setup once; otherwise open the SSH menu. An incomplete setup remains selectable from the menu. e or exit leaves the current menu.
 install verifies prerequisites (including optional bind-dig installation), initializes missing config, and publishes the main script only after preparation succeeds.
@@ -8554,6 +8692,7 @@ Manual restoration is available through Maintenance & Recovery.
 The preferred WAN snapshot and transaction journal live in ResolvGuard.d/state.
 Probes use short-lived local authenticated DoT resolvers.
 Monitored hostnames are NEVER forwarded through separate DNS routes.
+dnssec performs three read-only DNSSEC checks against each selected authenticated DoT resolver. It does not affect failover, monitoring counters, or saved policy.
 probe is a read-only DNS response inspector. Main Menu IN option can save selected successful observations as policy checks with explicit confirmation.
 Install and first run initialize missing config/settings.conf, config/checks.tsv and config/extra-providers.tsv without overwriting existing files.
 Quick Setup checks for Entware bind-dig and offers to install it with permission if missing. A separate onboarding completion record is written only after successful setup (including Monitoring Only or deliberately inactive operation). Run dependencies to check/install dig separately.
