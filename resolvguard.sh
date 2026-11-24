@@ -3,7 +3,7 @@
 # ResolvGuard.sh
 #
 # Project Created: 2026-Oct-29 by @ExtremeFiretop
-# Last Modified: 2026-Nov-23
+# Last Modified: 2026-Nov-24
 #
 # ResolvGuard™
 # Official project: https://github.com/ExtremeFiretop/ResolvGuard
@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.4
-readonly SCRIPT_VERSTAG="26112311"
+readonly SCRIPT_VERSTAG="26112401"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -811,8 +811,10 @@ _DNSSECResponseHasA_() {
 }
 
 # Shared per-query evaluator for SSH and WebUI read-only DNSSEC diagnostics.
-# A transport/certificate failure is INCONCLUSIVE, not a DNSSEC rejection.
-# Results are returned only in shell-local variables, never in failover state.
+# Classification is deliberately narrow: only observable violations of an
+# expected DNSSEC property count as FAIL. An unexpected DNS rcode, missing A
+# record, malformed reply or TLS error cannot prove failed DNSSEC validation.
+# Results are returned in shell-local variables, never in policy/failover state.
 _EvaluateDNSSECProbe_() {
   local id label file hostname mode response
   id="$1"; label="$2"; file="$3"
@@ -828,19 +830,58 @@ _EvaluateDNSSECProbe_() {
     return 0
   fi
   response="$(_DNSSECResponseStatus_ "$file")"
-  RG_DNSSEC_RESULT=FAIL
-  RG_DNSSEC_OBSERVED="${response:-UNKNOWN}"
+  RG_DNSSEC_OBSERVED="${response:-MALFORMED_RESPONSE}"
+  [ -n "$response" ] || return 0
   case "$label" in
     signed)
-      if [ "$response" = NOERROR ] && _DNSSECResponseHasFlag_ "$file" ad &&
-         _DNSSECResponseHasA_ "$file"; then RG_DNSSEC_RESULT=PASS; fi ;;
+      if [ "$response" = NOERROR ]; then
+        if ! _DNSSECResponseHasA_ "$file"; then
+          RG_DNSSEC_OBSERVED=NOERROR_NO_A
+        elif _DNSSECResponseHasFlag_ "$file" cd; then
+          # An unexpected CD bit makes the AD interpretation ambiguous.
+          RG_DNSSEC_OBSERVED=NOERROR_UNEXPECTED_CD
+        elif _DNSSECResponseHasFlag_ "$file" ad; then
+          RG_DNSSEC_RESULT=PASS
+        else
+          # The resolver delivered the signed answer without asserting AD.
+          RG_DNSSEC_RESULT=FAIL
+          RG_DNSSEC_OBSERVED=NOERROR_WITHOUT_AD
+        fi
+      else
+        RG_DNSSEC_OBSERVED="${response}_UNEXPECTED"
+      fi
+      ;;
     rejected)
-      if [ "$response" = SERVFAIL ] && ! _DNSSECResponseHasFlag_ "$file" ad; then
+      if [ "$response" = SERVFAIL ] &&
+         ! _DNSSECResponseHasFlag_ "$file" ad &&
+         ! _DNSSECResponseHasFlag_ "$file" cd; then
+        # An intentionally bogus signature MUST be rejected without CD.
         RG_DNSSEC_RESULT=PASS
-      fi ;;
+      elif [ "$response" = NOERROR ] &&
+           _DNSSECResponseHasA_ "$file" &&
+           ! _DNSSECResponseHasFlag_ "$file" cd; then
+        # A bogus signed A record was actually returned without a CD request.
+        RG_DNSSEC_RESULT=FAIL
+        RG_DNSSEC_OBSERVED=NOERROR_BOGUS_A
+      elif [ "$response" = NOERROR ]; then
+        RG_DNSSEC_OBSERVED=NOERROR_NO_VERIFIABLE_BOGUS_A
+      else
+        RG_DNSSEC_OBSERVED="${response}_UNEXPECTED"
+      fi
+      ;;
     bypass)
-      if [ "$response" = NOERROR ] && _DNSSECResponseHasFlag_ "$file" cd &&
-         _DNSSECResponseHasA_ "$file"; then RG_DNSSEC_RESULT=PASS; fi ;;
+      if [ "$response" = NOERROR ] &&
+         _DNSSECResponseHasFlag_ "$file" cd &&
+         _DNSSECResponseHasA_ "$file"; then
+        RG_DNSSEC_RESULT=PASS
+      elif [ "$response" = NOERROR ]; then
+        # CD flag stripped, empty answer, policy filtering or transient DNS:
+        # none alone establishes that DNSSEC validation failed.
+        RG_DNSSEC_OBSERVED=NOERROR_CD_BYPASS_UNVERIFIED
+      else
+        RG_DNSSEC_OBSERVED="${response}_CD_BYPASS_UNVERIFIED"
+      fi
+      ;;
   esac
   return 0
 }
@@ -902,7 +943,7 @@ _RunDNSSECDiagnostics_() (
       case "$RG_DNSSEC_RESULT" in
         PASS) _Say_ "  $title: PASS"; pass=$((pass+1)) ;;
         FAIL) _Say_ "  $title: FAIL (observed ${RG_DNSSEC_OBSERVED})"; fail=$((fail+1)) ;;
-        INCONCLUSIVE) _Say_ "  $title: INCONCLUSIVE (authenticated DoT query failed)"; inconclusive=$((inconclusive+1)) ;;
+        INCONCLUSIVE) _Say_ "  $title: INCONCLUSIVE (observed ${RG_DNSSEC_OBSERVED})"; inconclusive=$((inconclusive+1)) ;;
       esac
     done
   done < "$PROVIDERS"
