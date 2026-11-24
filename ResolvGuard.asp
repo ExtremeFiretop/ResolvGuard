@@ -64,6 +64,16 @@ function rgRequestManualCheck() {
   form.submit();
   return true;
 }
+// Dedicated DNSSEC action; intentionally independent of the existing
+// manual policy-health check and any scheduled monitoring/failover actions.
+function rgRequestDNSSECDiagnostics() {
+  var form=document.getElementById('rg_dnssec_form');
+  if(!form || !form.elements.namedItem('action_script'))return false;
+  form.elements.namedItem('current_page').value='';
+  form.elements.namedItem('next_page').value='';
+  form.submit();
+  return true;
+}
 // Use the same firmware-native custom settings transport as MerlinAU:
 // fixed service action name, separate namespaced data, preserve other add-ons.
 var rgSharedCustomSettings = <% get_custom_settings(); %>;
@@ -229,6 +239,14 @@ function rgDashboardLoaded() {
 <iframe name="hidden_frame" id="hidden_frame" title="ResolvGuard command response" style="display:none;width:0;height:0;border:0" aria-hidden="true"></iframe>
 <form id="rg_manual_form" method="post" action="start_apply.htm" target="hidden_frame" style="display:none">
   <input type="hidden" name="action_script" value="start_ResolvGuardManualCheck" />
+  <input type="hidden" name="action_mode" value="apply" />
+  <input type="hidden" name="action_wait" value="0" />
+  <input type="hidden" name="current_page" value="" />
+  <input type="hidden" name="next_page" value="" />
+  <input type="hidden" name="modified" value="0" />
+</form>
+<form id="rg_dnssec_form" method="post" action="start_apply.htm" target="hidden_frame" style="display:none">
+  <input type="hidden" name="action_script" value="start_ResolvGuardDNSSEC" />
   <input type="hidden" name="action_mode" value="apply" />
   <input type="hidden" name="action_wait" value="0" />
   <input type="hidden" name="current_page" value="" />
@@ -602,6 +620,15 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
   <section id="checks" class="tab">
     <div class="section-head" style="margin-top:0"><h3>DNS Health Checks</h3><span class="hint" id="checkRulesCount">Configured DNS answer validation rules</span></div>
     <div class="note rg-config-note">Rules are evaluated through independent authenticated DNS-over-TLS queries. Changing them requires renewed policy approval before automatic WAN DNS switching can continue. The router validates every edit and restores the old configuration if validation fails.</div>
+    <div class="card" id="rgDNSSECCard" style="margin-top:16px">
+      <div class="card-head"><div><div class="card-title">DNSSEC validation diagnostics</div><div class="card-sub">On-demand authenticated DoT checks · observational only</div></div><button type="button" class="btn primary" id="runDNSSEC">Run DNSSEC Diagnostics</button></div>
+      <div class="card-pad">
+        <p class="desc">For each configured resolver: signed <code>cloudflare.com</code> must return NOERROR + AD + A, deliberately broken <code>dnssec-failed.org</code> must return SERVFAIL, and its CD bypass must return NOERROR + CD + A. The deliberate SERVFAIL is a <strong>PASS</strong>.</p>
+        <p class="desc">Results are separate from DNS policy checks and never change WAN DNS, scheduled monitoring, policy approval, health history or automatic failover.</p>
+        <p id="dnssecSummary" class="desc" role="status" aria-live="polite">No DNSSEC diagnostics have been loaded yet.</p>
+        <div id="dnssecResults" aria-live="polite"></div>
+      </div>
+    </div>
     <div class="card" style="margin-top:16px">
       <div class="card-head"><div><div class="card-title">Configured health checks</div><div class="card-sub">Hostname + record type uniquely identify a rule</div></div></div>
       <div id="checkRows"><div class="empty">Loading health checks…</div></div>
@@ -695,6 +722,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     return routerTimeLabel(event?.routerAt,short)||String(event?.at||'Unknown').replace('T',' ').replace(/Z$/,' UTC');
   }
   const since = v => {const d=Date.parse(v||'');if(!Number.isFinite(d))return 'No completed check';const sec=Math.max(0,Math.floor((Date.now()-d)/1000));return sec<60?sec+' seconds ago':Math.floor(sec/60)+' min ago';};
+  const dnssecState={busy:false,polling:null,requestedAt:0,previousId:'',runId:'',loaded:false};
   const state={tab:'overview',period:'24',snapshot:null,history:[],lastEnd:'',lastFetch:0,polling:false,feedConnected:false,historyPending:'',historyBaseline:'',historyAttempts:0,historyAdvanced:false,manualBusy:false,manualPolling:null,manualPreviousId:'',manualRequestedAt:0,manualRunId:'',config:null,configBusy:false,configFresh:false,configLoading:false,editingBackupId:'',historySelection:0,detailCache:null,updateBusy:false,updateVersion:'',updateBuild:'',updateAvailable:false};
   const hasRealChecks = d => (d?.resolvers||[]).some(r => r.policyPass+r.policyFail>0);
   function isStale(d){if(!d?.lastEnd)return true;const ms=Date.parse(d.lastEnd);return !Number.isFinite(ms)||Date.now()-ms>Math.max(150000,(d.scheduleMinutes||1)*150000);}
@@ -1227,7 +1255,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     }
   }
   function closeInspector(){$('inspectBackdrop').classList.remove('open');$('inspector').classList.remove('open');$('inspector').setAttribute('aria-hidden','true');}
-  function tab(name){closeSettingHelp();state.tab=name;waveform.setVisible(name==='overview');syncWaveSignal(state.snapshot,state.feedConnected);document.querySelectorAll('[data-tab]').forEach(el=>{const active=el.dataset.tab===name;el.classList.toggle('active',active);});document.querySelectorAll('.tab').forEach(el=>el.classList.toggle('active',el.id===name));const m={overview:['Dashboard overview','Your DNS reliability, clearly visible.'],history:['Health history','Observed DNS reliability'],paths:['DNS paths & exceptions','Inspect production routing, and scoped bypasses.'],backups:['Backup & alternate resolvers','Manage ResolvGuard backup DoT endpoints.'],checks:['DNS health checks','Add, edit and remove independent DNS answer validation rules.'],settings:['ResolvGuard settings','Configure monitoring thresholds and timing using TLS authentication.']}[name];$('pageTitle').textContent=m[0];$('pageDesc').textContent=m[1];if(name==='history')renderHistory();if(name==='paths')renderPaths();if(name==='settings'||name==='backups'||name==='checks')loadConfig();}
+  function tab(name){closeSettingHelp();state.tab=name;waveform.setVisible(name==='overview');syncWaveSignal(state.snapshot,state.feedConnected);document.querySelectorAll('[data-tab]').forEach(el=>{const active=el.dataset.tab===name;el.classList.toggle('active',active);});document.querySelectorAll('.tab').forEach(el=>el.classList.toggle('active',el.id===name));const m={overview:['Dashboard overview','Your DNS reliability, clearly visible.'],history:['Health history','Observed DNS reliability'],paths:['DNS paths & exceptions','Inspect production routing, and scoped bypasses.'],backups:['Backup & alternate resolvers','Manage ResolvGuard backup DoT endpoints.'],checks:['DNS health checks','Add, edit and remove independent DNS answer validation rules.'],settings:['ResolvGuard settings','Configure monitoring thresholds and timing using TLS authentication.']}[name];$('pageTitle').textContent=m[0];$('pageDesc').textContent=m[1];if(name==='history')renderHistory();if(name==='paths')renderPaths();if(name==='settings'||name==='backups'||name==='checks')loadConfig();if(name==='checks'&&!dnssecState.busy)loadDNSSECResult();}
   async function load(url){const response=await fetch(url+'?t='+Date.now(),{cache:'no-store',credentials:'same-origin'});if(!response.ok)throw Error('HTTP '+response.status);const d=JSON.parse(await response.text());if(d.schema!==1)throw Error('Unsupported feed schema');return d;}
   async function refresh(){if(state.polling)return;state.polling=true;try{
       const d=await load('/ext/ResolvGuard/status.htm');
@@ -1371,6 +1399,101 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
     }
     state.manualPolling=setInterval(pollManual,1500);
     pollManual();
+  }
+  // DNSSEC has its own authenticated service-event and volatile result feed.
+  // Viewing the tab or polling this feed NEVER starts a router-side probe.
+  const dnssecUrl='/ext/ResolvGuard/dnssec.htm';
+  const dnssecLabels={signed:'Signed domain · NOERROR + AD + A',rejected:'Broken signature · SERVFAIL',bypass:'Checking disabled · NOERROR + CD + A'};
+  async function dnssecFeed(){try{
+    const d=await load(dnssecUrl);
+    return d.kind==='dnssec'?d:null;
+  }catch(e){return null;}}
+  function finishDNSSEC(){
+    dnssecState.busy=false;
+    $('runDNSSEC').disabled=false;
+    $('runDNSSEC').textContent='Run DNSSEC Diagnostics';
+    if(dnssecState.polling!==null){clearInterval(dnssecState.polling);dnssecState.polling=null;}
+  }
+  function renderDNSSEC(d){
+    const rs=Array.isArray(d.resolvers)?d.resolvers:[];
+    const checks=Array.isArray(d.checks)?d.checks:[];
+    if(d.status==='running'){
+      $('dnssecSummary').textContent='DNSSEC diagnostics running against the configured authenticated DoT endpoints…';
+      $('dnssecResults').innerHTML='<span class="manual-inline-busy"></span>Checking signed and deliberately invalid DNSSEC responses…';
+      return;
+    }
+    if(d.status==='error'){
+      $('dnssecSummary').textContent='DNSSEC diagnostics could not complete: '+(d.message||'Router-side error');
+      $('dnssecResults').innerHTML='<p class="manual-status amber">Not completed; automatic failover is unaffected.</p>';
+      finishDNSSEC();return;
+    }
+    if(d.status!=='complete')return;
+    const pass=Number(d.passed||0),fail=Number(d.failed||0),inconclusive=Number(d.inconclusive||0);
+    const valid=rs.length>0&&checks.length===rs.length*3&&pass+fail+inconclusive===checks.length;
+    const when=Number(d.completedEpoch)>0?new Date(Number(d.completedEpoch)*1000).toLocaleString():'Unknown';
+    $('dnssecSummary').textContent=(valid?`${pass} PASS · ${fail} FAIL · ${inconclusive} INCONCLUSIVE`:'Incomplete result feed')+' · Last run: '+when+' · Read only';
+    if(!valid){$('dnssecResults').innerHTML='<p class="manual-status amber">Results are incomplete; no DNSSEC health is assumed.</p>';finishDNSSEC();return;}
+    const allPass=fail===0&&inconclusive===0;
+    let html=`<p class="manual-status ${allPass?'green':'amber'}">${allPass?'All DNSSEC diagnostic probes passed':'Some DNSSEC probes failed or were inconclusive'}</p>`;
+    html+='<div class="manual-grid">'+rs.map(r=>{
+      const probes=checks.filter(c=>c.id===r.id);
+      const ok=probes.length===3&&probes.every(c=>c.result==='PASS');
+      const statuses=probes.map(c=>c.result);
+      const stateLabel=ok?'PASS':statuses.includes('FAIL')?'FAIL':'INCONCLUSIVE';
+      const stateClass=ok?'green':'amber';
+      return `<div class="manual-item"><strong>${esc(r.id)} — <span class="${stateClass}">${stateLabel}</span></strong><small>${esc(r.ip)}:${esc(r.port)} · TLS ${esc(r.tls)}</small>${['signed','rejected','bypass'].map(test=>{
+        const result=probes.find(c=>c.test===test);
+        const status=result?.result||'MISSING';
+        const detail=result?.observed||'UNKNOWN';
+        return `<small><span class="${status==='PASS'?'green':'amber'}">${esc(status)}</span> · ${esc(dnssecLabels[test])} · ${esc(detail)}</small>`;
+      }).join('')}</div>`;
+    }).join('')+'</div>';
+    $('dnssecResults').innerHTML=html;
+    finishDNSSEC();
+  }
+  async function loadDNSSECResult(){
+    if(dnssecState.busy)return;
+    const d=await dnssecFeed();
+    if(d){dnssecState.loaded=true;renderDNSSEC(d);}
+    else if(!dnssecState.loaded){$('dnssecSummary').textContent='Not run on this router since boot. Select Run DNSSEC Diagnostics to start.';}
+  }
+  async function pollDNSSEC(){
+    if(!dnssecState.busy)return;
+    if(Date.now()-dnssecState.requestedAt>480000){
+      $('dnssecSummary').textContent='DNSSEC diagnostic response timeout (eight minutes). Check the router log before retrying.';
+      finishDNSSEC();return;
+    }
+    const d=await dnssecFeed();
+    if(!dnssecState.busy)return;
+    if(d&&d.requestId&&d.requestId!==dnssecState.previousId){
+      dnssecState.runId=d.requestId;
+      renderDNSSEC(d);
+      return;
+    }
+    if(Date.now()-dnssecState.requestedAt>20000&&!dnssecState.runId){
+      $('dnssecSummary').textContent='No new DNSSEC diagnostic was started. Verify the authenticated ASUS service-event hook and WebUI mount.';
+      finishDNSSEC();
+    }
+  }
+  async function runDNSSECDiagnostics(){
+    if(dnssecState.busy)return;
+    dnssecState.busy=true;dnssecState.runId='';
+    $('runDNSSEC').disabled=true;
+    $('runDNSSEC').textContent='Checking…';
+    $('dnssecSummary').textContent='Submitting read-only DNSSEC diagnostics…';
+    $('dnssecResults').innerHTML='<span class="manual-inline-busy"></span>Starting router-side authenticated DoT queries…';
+    const old=await dnssecFeed();
+    dnssecState.previousId=old?.requestId||'';
+    dnssecState.requestedAt=Date.now();
+    try{
+      if(window.parent===window||typeof window.parent.rgRequestDNSSECDiagnostics!=='function'||!window.parent.rgRequestDNSSECDiagnostics())
+        throw Error('Open this dashboard through WAN → ResolvGuard to use the authenticated ASUS service action.');
+    }catch(e){
+      $('dnssecSummary').textContent='Cannot start DNSSEC diagnostics: '+e.message;
+      $('dnssecResults').innerHTML='';finishDNSSEC();return;
+    }
+    dnssecState.polling=setInterval(pollDNSSEC,1500);
+    pollDNSSEC();
   }
   // The authenticated parent page submits configuration requests through
   // Merlin's standard start_apply.htm action and owned service-event hook.
@@ -1851,6 +1974,7 @@ body.rg-embedded .ecg { flex:1 1 0; width:auto; min-width:0; height:35px; }
   });
   resetCheck();loadConfig();
   $('runHealthCheck').addEventListener('click',runManualHealthCheck);
+  $('runDNSSEC').addEventListener('click',runDNSSECDiagnostics);
   $('manualClose').addEventListener('click',()=>{$('manualPanel').hidden=true;});
   $('period').addEventListener('change',e=>{state.period=e.target.value;renderHistory();});
   $('inspectorClose').addEventListener('click',closeInspector);$('inspectBackdrop').addEventListener('click',closeInspector);

@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.4
-readonly SCRIPT_VERSTAG="26112310"
+readonly SCRIPT_VERSTAG="26112311"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -810,11 +810,45 @@ _DNSSECResponseHasA_() {
   ' "$1"
 }
 
-# One-time, read-only, direct authenticated DoT diagnostics. All three queries
-# are per resolver; the deliberate SERVFAIL is a successful negative test.
-# No saved health checks, NVRAM, monitoring counters, or policy marks are written.
+# Shared per-query evaluator for SSH and WebUI read-only DNSSEC diagnostics.
+# A transport/certificate failure is INCONCLUSIVE, not a DNSSEC rejection.
+# Results are returned only in shell-local variables, never in failover state.
+_EvaluateDNSSECProbe_() {
+  local id label file hostname mode response
+  id="$1"; label="$2"; file="$3"
+  RG_DNSSEC_RESULT=INCONCLUSIVE
+  RG_DNSSEC_OBSERVED=TLS_QUERY_FAILED
+  case "$label" in
+    signed) hostname=cloudflare.com; mode=dnssec ;;
+    rejected) hostname=dnssec-failed.org; mode=dnssec ;;
+    bypass) hostname=dnssec-failed.org; mode=dnssec-cd ;;
+    *) return 2 ;;
+  esac
+  if ! _RunAuthenticatedDoTQuery_ "$id" "$hostname" A "$file" "$mode"; then
+    return 0
+  fi
+  response="$(_DNSSECResponseStatus_ "$file")"
+  RG_DNSSEC_RESULT=FAIL
+  RG_DNSSEC_OBSERVED="${response:-UNKNOWN}"
+  case "$label" in
+    signed)
+      if [ "$response" = NOERROR ] && _DNSSECResponseHasFlag_ "$file" ad &&
+         _DNSSECResponseHasA_ "$file"; then RG_DNSSEC_RESULT=PASS; fi ;;
+    rejected)
+      if [ "$response" = SERVFAIL ] && ! _DNSSECResponseHasFlag_ "$file" ad; then
+        RG_DNSSEC_RESULT=PASS
+      fi ;;
+    bypass)
+      if [ "$response" = NOERROR ] && _DNSSECResponseHasFlag_ "$file" cd &&
+         _DNSSECResponseHasA_ "$file"; then RG_DNSSEC_RESULT=PASS; fi ;;
+  esac
+  return 0
+}
+
+# One-time, read-only, direct authenticated DoT diagnostics. The deliberate
+# SERVFAIL is a PASS. Both CLI and WebUI share the same comparison logic.
 _RunDNSSECDiagnostics_() (
-  local selected attempt id ip tls port extra file label response pass fail inconclusive
+  local selected attempt id ip tls port extra file label pass fail inconclusive title
   selected="${1:-all}"
   [ "$selected" = all ] || _IsValidID_ "$selected" || {
     _Fail_ 'Usage: dnssec [all|provider-id]'; return 2;
@@ -859,51 +893,16 @@ _RunDNSSECDiagnostics_() (
     printf '\nResolver: %s (%s:%s; TLS %s)\n' "$id" "$ip" "$port" "$tls"
     for label in signed rejected bypass; do
       file="$RG_INSPECT_DIR/$label.txt"
+      _EvaluateDNSSECProbe_ "$id" "$label" "$file" || return 2
       case "$label" in
-        signed)
-          if _RunAuthenticatedDoTQuery_ "$id" cloudflare.com A "$file" dnssec; then
-            response="$(_DNSSECResponseStatus_ "$file")"
-            if [ "$response" = NOERROR ] && _DNSSECResponseHasFlag_ "$file" ad &&
-               _DNSSECResponseHasA_ "$file"; then
-              _Say_ '  Signed domain (NOERROR + AD + A): PASS'
-              pass=$((pass+1))
-            else
-              _Say_ "  Signed domain (NOERROR + AD + A): FAIL (observed ${response:-unknown})"
-              fail=$((fail+1))
-            fi
-          else
-            _Say_ '  Signed domain: INCONCLUSIVE (authenticated DoT query failed)'
-            inconclusive=$((inconclusive+1))
-          fi ;;
-        rejected)
-          if _RunAuthenticatedDoTQuery_ "$id" dnssec-failed.org A "$file" dnssec; then
-            response="$(_DNSSECResponseStatus_ "$file")"
-            if [ "$response" = SERVFAIL ] && ! _DNSSECResponseHasFlag_ "$file" ad; then
-              _Say_ '  Broken signature (SERVFAIL): PASS'
-              pass=$((pass+1))
-            else
-              _Say_ "  Broken signature (SERVFAIL): FAIL (observed ${response:-unknown})"
-              fail=$((fail+1))
-            fi
-          else
-            _Say_ '  Broken signature: INCONCLUSIVE (authenticated DoT query failed)'
-            inconclusive=$((inconclusive+1))
-          fi ;;
-        bypass)
-          if _RunAuthenticatedDoTQuery_ "$id" dnssec-failed.org A "$file" dnssec-cd; then
-            response="$(_DNSSECResponseStatus_ "$file")"
-            if [ "$response" = NOERROR ] && _DNSSECResponseHasFlag_ "$file" cd &&
-               _DNSSECResponseHasA_ "$file"; then
-              _Say_ '  Checking disabled (NOERROR + CD + A): PASS'
-              pass=$((pass+1))
-            else
-              _Say_ "  Checking disabled (NOERROR + CD + A): FAIL (observed ${response:-unknown})"
-              fail=$((fail+1))
-            fi
-          else
-            _Say_ '  Checking disabled: INCONCLUSIVE (authenticated DoT query failed)'
-            inconclusive=$((inconclusive+1))
-          fi ;;
+        signed) title='Signed domain (NOERROR + AD + A)' ;;
+        rejected) title='Broken signature (SERVFAIL)' ;;
+        bypass) title='Checking disabled (NOERROR + CD + A)' ;;
+      esac
+      case "$RG_DNSSEC_RESULT" in
+        PASS) _Say_ "  $title: PASS"; pass=$((pass+1)) ;;
+        FAIL) _Say_ "  $title: FAIL (observed ${RG_DNSSEC_OBSERVED})"; fail=$((fail+1)) ;;
+        INCONCLUSIVE) _Say_ "  $title: INCONCLUSIVE (authenticated DoT query failed)"; inconclusive=$((inconclusive+1)) ;;
       esac
     done
   done < "$PROVIDERS"
@@ -5309,6 +5308,195 @@ _RGManual_() (
   esac
 )
 # RESOLVGUARD WEBUI MANUAL CHECK END
+# RESOLVGUARD WEBUI DNSSEC DIAGNOSTICS BEGIN
+# Distinct on-demand authenticated service action and RAM-only JSON feed.
+# Does not invoke scheduled policy checks, state changes or failover functions.
+_RGWebDNSSEC_() (
+  umask 077
+  RG_D_DATA="$RUNTIME/webui"
+  RG_D_HOOK=/jffs/scripts/service-event
+  RG_D_LOCK=/tmp/addonwebui.lock
+  message() { printf '%s\n' "ResolvGuard WebUI DNSSEC: $*" >&2; }
+  quote() {
+    printf '%s' "$1" | LC_ALL=C awk '
+      BEGIN{printf "\""}
+      {
+        if(NR>1)printf "\\n"
+        for(i=1;i<=length($0);i++) {
+          c=substr($0,i,1)
+          if(c=="\\")printf "\\\\"
+          else if(c=="\"")printf "\\\""
+          else if(c==sprintf("%c",9))printf "\\t"
+          else if(c==sprintf("%c",13))printf "\\r"
+          else if(c=="<")printf "\\u003c"
+          else if(c==">")printf "\\u003e"
+          else if(c=="&")printf "\\u0026"
+          else printf "%s",c
+        }
+      }
+      END{printf "\""}
+    '
+  }
+  epoch() { date +%s 2>/dev/null || printf '0'; }
+  atomic() {
+    [ -d "$RG_D_DATA" ] && [ ! -L "$RG_D_DATA" ] || return 1
+    [ ! -L "$RG_D_DATA/dnssec.htm" ] || return 1
+    rg_stage="$RG_D_DATA/.dnssec-$$.new"
+    [ ! -e "$rg_stage" ] && [ ! -L "$rg_stage" ] || return 1
+    cat > "$rg_stage" && mv -f "$rg_stage" "$RG_D_DATA/dnssec.htm"
+  }
+  error_result() {
+    rg_done=$(epoch)
+    {
+      printf '{"schema":1,"kind":"dnssec","requestId":'; quote "$RG_D_ID"
+      printf ',"status":"error","startedEpoch":%s,"completedEpoch":%s,"message":' "$RG_D_STARTED" "$rg_done"
+      quote "$1"
+      printf ',"passed":0,"failed":0,"inconclusive":0,"checks":[],"resolvers":[]}\n'
+    } | atomic
+    message "$1"
+    return 1
+  }
+  hook_body() {
+    printf '%s\n' 'case "$1:$2" in start:ResolvGuardDNSSEC) /jffs/addons/ResolvGuard.d/resolvguard.sh webui dnssec-run & ;; esac # RESOLVGUARD DNSSEC'
+  }
+  hook_current() {
+    [ -f "$RG_D_HOOK" ] && [ ! -L "$RG_D_HOOK" ] || return 1
+    [ "$(grep -Fxc "$(hook_body)" "$RG_D_HOOK" || :)" = 1 ] &&
+      [ "$(grep -Fc '# RESOLVGUARD DNSSEC' "$RG_D_HOOK" || :)" = 1 ] &&
+      [ "$(grep -Fc ResolvGuardDNSSEC "$RG_D_HOOK" || :)" = 1 ]
+  }
+  update_hook() {
+    rg_action="$1"
+    [ "$ROOT" = /jffs/addons/ResolvGuard.d ] || { message 'expected installed ResolvGuard path'; return 1; }
+    [ ! -L "$RG_D_HOOK" ] && { [ ! -e "$RG_D_HOOK" ] || [ -f "$RG_D_HOOK" ]; } || {
+      message 'unsafe service-event file'; return 1;
+    }
+    [ -d /jffs/scripts ] && [ ! -L /jffs/scripts ] || return 1
+    exec 9> "$RG_D_LOCK" && flock -x 9 || return 1
+    rg_owned="$(hook_body)"
+    rg_count=0;rg_tag=0;rg_event=0
+    if [ -f "$RG_D_HOOK" ]; then
+      rg_count=$(grep -Fxc "$rg_owned" "$RG_D_HOOK" || :)
+      rg_tag=$(grep -Fc '# RESOLVGUARD DNSSEC' "$RG_D_HOOK" || :)
+      rg_event=$(grep -Fc 'ResolvGuardDNSSEC' "$RG_D_HOOK" || :)
+    fi
+    [ "$rg_count" -le 1 ] && [ "$rg_tag" -eq "$rg_count" ] &&
+      [ "$rg_event" -eq "$rg_count" ] || {
+      message 'unrecognized or duplicate DNSSEC service hook'; return 1;
+    }
+    if [ "$rg_count" -eq 1 ] && [ "$rg_action" = install ]; then return 0; fi
+    if [ "$rg_count" -eq 0 ] && [ "$rg_action" = remove ]; then return 0; fi
+    rg_stage=/jffs/scripts/.service-event-resolvguard-dnssec-$$
+    [ ! -e "$rg_stage" ] && [ ! -L "$rg_stage" ] || return 1
+    if [ -f "$RG_D_HOOK" ]; then
+      awk -v owned="$rg_owned" '$0 != owned {print}' "$RG_D_HOOK" > "$rg_stage" || return 1
+    else
+      printf '#!/bin/sh\n' > "$rg_stage" || return 1
+    fi
+    if [ "$rg_action" = install ]; then printf '\n%s\n' "$rg_owned" >> "$rg_stage" || return 1; fi
+    chmod 755 "$rg_stage" && mv -f "$rg_stage" "$RG_D_HOOK" || { rm -f "$rg_stage"; return 1; }
+  }
+  run() {
+    [ "$ROOT" = /jffs/addons/ResolvGuard.d ] || { message 'not running from installed add-on'; return 1; }
+    [ -d "$RUNTIME" ] && [ ! -L "$RUNTIME" ] || { message 'runtime unavailable'; return 1; }
+    if [ -e "$RG_D_DATA" ] && { [ -L "$RG_D_DATA" ] || [ ! -d "$RG_D_DATA" ]; }; then
+      message 'unsafe WebUI runtime directory'; return 1
+    fi
+    mkdir -p "$RG_D_DATA" && chmod 700 "$RG_D_DATA" || return 1
+    [ ! -L "$RG_D_DATA/dnssec.lock" ] || return 1
+    exec 7> "$RG_D_DATA/dnssec.lock" || return 1
+    if ! flock -n 7; then message 'DNSSEC diagnostics already running'; return 1; fi
+    RG_D_STARTED=$(epoch)
+    RG_D_ID="${RG_D_STARTED}-$$"
+    {
+      printf '{"schema":1,"kind":"dnssec","requestId":';quote "$RG_D_ID"
+      printf ',"status":"running","startedEpoch":%s,"completedEpoch":0,"message":"Authenticated DoT DNSSEC diagnostics running","checks":[],"resolvers":[]}\n' "$RG_D_STARTED"
+    } | atomic || return 1
+    RG_INSPECT_CONFIG_HELD=0
+    RG_INSPECT_DIR=''
+    trap '_CleanupInspectorSession_' EXIT HUP INT TERM
+    _RequireProbeDependencies_ >/dev/null 2>&1 || { error_result 'Authenticated DoT probe dependency unavailable'; return 1; }
+    rg_attempt=0
+    until _AcquireConfigLock_; do
+      rg_attempt=$((rg_attempt+1))
+      [ "$rg_attempt" -lt 6 ] || { error_result 'Configuration busy; DNSSEC diagnostics deferred'; return 1; }
+      sleep 1
+    done
+    RG_INSPECT_CONFIG_HELD=1
+    [ ! -L "$RUNTIME/inspectors" ] || { error_result 'Unsafe inspector directory'; return 1; }
+    mkdir -p "$RUNTIME/inspectors" || { error_result 'Cannot prepare inspector directory'; return 1; }
+    RG_INSPECT_DIR="$RUNTIME/inspectors/$$"
+    [ ! -e "$RG_INSPECT_DIR" ] && [ ! -L "$RG_INSPECT_DIR" ] && mkdir "$RG_INSPECT_DIR" || {
+      error_result 'Cannot reserve DNSSEC diagnostic session'; return 1;
+    }
+    PROVIDERS="$RG_INSPECT_DIR/providers.tsv"
+    _PrepareProviders_ || { error_result 'Could not snapshot configured authenticated DoT endpoints'; return 1; }
+    if ! _ReleaseConfigLock_; then
+      error_result 'Could not release DNSSEC diagnostic admission lock'; return 1
+    fi
+    RG_INSPECT_CONFIG_HELD=0
+    rg_outcomes="$RG_INSPECT_DIR/dnssec-outcomes.tsv"
+    : > "$rg_outcomes" || { error_result 'Unable to write DNSSEC outcomes'; return 1; }
+    rg_pass=0;rg_fail=0;rg_inconclusive=0;rg_count=0
+    while IFS='|' read -r rg_id rg_ip rg_tls rg_port rg_extra; do
+      [ -n "$rg_id" ] || continue
+      rg_count=$((rg_count+1))
+      for rg_test in signed rejected bypass; do
+        _EvaluateDNSSECProbe_ "$rg_id" "$rg_test" "$RG_INSPECT_DIR/$rg_test.txt" || {
+          error_result 'Invalid DNSSEC diagnostic test'; return 1;
+        }
+        case "$RG_DNSSEC_RESULT" in
+          PASS) rg_pass=$((rg_pass+1)) ;;
+          FAIL) rg_fail=$((rg_fail+1)) ;;
+          INCONCLUSIVE) rg_inconclusive=$((rg_inconclusive+1)) ;;
+          *) error_result 'Invalid DNSSEC diagnostic outcome'; return 1 ;;
+        esac
+        printf '%s|%s|%s|%s\n' "$rg_id" "$rg_test" "$RG_DNSSEC_RESULT" "$RG_DNSSEC_OBSERVED" >> "$rg_outcomes" || {
+          error_result 'Unable to save DNSSEC results'; return 1;
+        }
+      done
+    done < "$PROVIDERS"
+    [ "$rg_count" -gt 0 ] || { error_result 'No configured authenticated DoT endpoints'; return 1; }
+    rg_done=$(epoch)
+    {
+      printf '{"schema":1,"kind":"dnssec","requestId":';quote "$RG_D_ID"
+      printf ',"status":"complete","startedEpoch":%s,"completedEpoch":%s' "$RG_D_STARTED" "$rg_done"
+      printf ',"passed":%s,"failed":%s,"inconclusive":%s,"checks":[' "$rg_pass" "$rg_fail" "$rg_inconclusive"
+      rg_sep=''
+      while IFS='|' read -r rg_id rg_test rg_result rg_observed; do
+        printf '%s{"id":' "$rg_sep";quote "$rg_id"
+        printf ',"test":';quote "$rg_test"
+        printf ',"result":';quote "$rg_result"
+        printf ',"observed":';quote "$rg_observed"
+        printf '}'
+        rg_sep=,
+      done < "$rg_outcomes"
+      printf '],"resolvers":['
+      rg_sep=''
+      while IFS='|' read -r rg_id rg_ip rg_tls rg_port rg_extra; do
+        printf '%s{"id":' "$rg_sep";quote "$rg_id"
+        printf ',"ip":';quote "$rg_ip"
+        printf ',"tls":';quote "$rg_tls"
+        printf ',"port":';quote "$rg_port"
+        printf '}'
+        rg_sep=,
+      done < "$PROVIDERS"
+      printf ']}\n'
+    } | atomic || { error_result 'Unable to publish DNSSEC results'; return 1; }
+    return 0
+  }
+  case "${1:-}" in
+    run) run ;;
+    status) [ -f "$RG_D_DATA/dnssec.htm" ] && [ ! -L "$RG_D_DATA/dnssec.htm" ] && cat "$RG_D_DATA/dnssec.htm" || {
+      message 'No DNSSEC diagnostic result yet'; return 1;
+    } ;;
+    hook-install) update_hook install ;;
+    hook-remove) update_hook remove ;;
+    hook-current) hook_current ;;
+    *) message 'Usage: webui [dnssec-run|dnssec-status]'; return 2 ;;
+  esac
+)
+# RESOLVGUARD WEBUI DNSSEC DIAGNOSTICS END
 # RESOLVGUARD WEBUI CONFIG BRIDGE BEGIN
 # Native Merlin service-event is invoked by an authenticated start_apply.htm
 # POST. Only a small allowlisted ASCII data request is accepted;
@@ -6225,7 +6413,7 @@ EOF_UNBOUND
     mkdir -p "$dir" "$RG_DATA" || { unlock_menu; return 1; }
     # Link owned, read-only dashboard feeds (JSON plus bounded history TSV);
     # never expose config/settings or credentials.
-    for name in status.htm history.htm history-records.htm history-failures.htm manual.htm config.htm config-action.htm; do
+    for name in status.htm history.htm history-records.htm history-failures.htm manual.htm dnssec.htm config.htm config-action.htm; do
       if [ -e "$dir/$name" ] && [ ! -L "$dir/$name" ]; then
         err 'refusing to replace non-owned web asset';unlock_menu; return 1
       fi
@@ -6265,7 +6453,7 @@ EOF_UNBOUND
       rewrite_menu remove "$found" || { unlock_menu; return 1; }
       rm -f "$RG_WEB/$found" "$RG_WEB/${found%.asp}.title" || { unlock_menu; return 1; }
     fi
-    for name in status.htm history.htm history-records.htm history-failures.htm manual.htm config.htm config-action.htm; do
+    for name in status.htm history.htm history-records.htm history-failures.htm manual.htm dnssec.htm config.htm config-action.htm; do
       source_file="$RG_DATA/$name"
       case "$name" in
         history-records.htm) source_file="$RG_DATA/history.tsv" ;;
@@ -6287,12 +6475,12 @@ EOF_UNBOUND
   case "${1:-help}" in
     publish) publish ;;
     bootstrap) _BootstrapExistingWebUI_ ;;
-    mount) mount_page && _RGManual_ hook-install && _RGWebConfig_ hook-install ;;
-    unmount) _RGWebConfig_ hook-remove && _RGManual_ hook-remove && unmount_page ;;
+    mount) mount_page && _RGManual_ hook-install && _RGWebConfig_ hook-install && _RGWebDNSSEC_ hook-install ;;
+    unmount) _RGWebDNSSEC_ hook-remove && _RGWebConfig_ hook-remove && _RGManual_ hook-remove && unmount_page ;;
     startup)
       i=0
       while [ "$i" -lt 6 ]; do
-        if [ -d "$RG_WEB" ] && [ -f "$RG_MENU" ] && mount_page && _RGManual_ hook-install && _RGWebConfig_ hook-install; then
+        if [ -d "$RG_WEB" ] && [ -f "$RG_MENU" ] && mount_page && _RGManual_ hook-install && _RGWebConfig_ hook-install && _RGWebDNSSEC_ hook-install; then
           publish || :
           exit 0
         fi
@@ -6305,7 +6493,9 @@ EOF_UNBOUND
       else err 'no completed snapshot; run publish after a scheduled check';exit 1;fi ;;
     manual-run) _RGManual_ run ;;
     manual-status) _RGManual_ status ;;
-    *) say 'Usage: sh resolvguard.sh webui [bootstrap|mount|unmount|publish|startup|status|config-snapshot|manual-run|manual-status]' ;;
+    dnssec-run) _RGWebDNSSEC_ run ;;
+    dnssec-status) _RGWebDNSSEC_ status ;;
+    *) say 'Usage: sh resolvguard.sh webui [bootstrap|mount|unmount|publish|startup|status|config-snapshot|manual-run|manual-status|dnssec-run|dnssec-status]' ;;
   esac
 
 )
