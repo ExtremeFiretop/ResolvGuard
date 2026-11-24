@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.4
-readonly SCRIPT_VERSTAG="26112402"
+readonly SCRIPT_VERSTAG="26112403"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -4812,7 +4812,14 @@ _AllowMonitoringOnlyWithoutLANForwarding_() {
     [ ! -e "$ACTIVE_POOL" ] && [ ! -L "$ACTIVE_POOL" ] &&
     [ ! -e "$ACTIVE_RULELIST" ] && [ ! -L "$ACTIVE_RULELIST" ] &&
     [ ! -e "$PREFERRED_SYNC" ] && [ ! -L "$PREFERRED_SYNC" ] &&
-    [ ! -e "$WAN_LOCK" ] && [ ! -L "$WAN_LOCK" ] || return 1
+    { [ ! -e "$WAN_LOCK" ] && [ ! -L "$WAN_LOCK" ]; } || {
+      # Boot reconciliation now owns WAN_LOCK while validating and clearing
+      # recovery state. Permit only that specific owner, never another writer.
+      [ "${RG_RECONCILE_WAN_LOCK_HELD:-0}" = 1 ] &&
+      [ -d "$WAN_LOCK" ] && [ ! -L "$WAN_LOCK" ] &&
+      [ -f "$WAN_LOCK/owner" ] && [ ! -L "$WAN_LOCK/owner" ] &&
+      [ "$(cat "$WAN_LOCK/owner" 2>/dev/null || :)" = "$$" ]
+    } || return 1
   [ -s "$PREF_RULELIST" ] && [ ! -L "$PREF_RULELIST" ] &&
     [ -s "$PREF_PROVIDERS" ] && [ ! -L "$PREF_PROVIDERS" ] || return 1
   [ "$(_ReadNVRAM_ dnspriv_enable)" = 1 ] &&
@@ -5030,24 +5037,26 @@ _WriteBootReport_() {
     mv "$BOOT_REPORT.new.$$" "$BOOT_REPORT"
 }
 
-_ReconcileBootState_() {
+# Reconciliation may clear an interrupted journal or managed WAN ownership.
+# Serialize the ENTIRE inspection and cleanup with the WAN switching lock,
+# not just an initial best-effort lock check (which leaves a TOCTOU window).
+# This function runs in a subshell so its EXIT trap cannot replace a caller's.
+_ReconcileBootState_() (
   local current preferred tracked expected source target from_pool to_pool part readiness_mode success_output
   _RequireGatewayRole_ || return 1
   success_output="${1:-verbose}"
   [ -r "$PREF_RULELIST" ] || { _Say_ 'BOOT: not enrolled; no changes'; return 1; }
-  if [ -e "$WAN_LOCK" ]; then
-    if _AcquireWANLock_; then
-      _ReleaseWANLock_ >/dev/null 2>&1 || :
-    else
-      _WriteBootReport_ 'SKIPPED - active/unknown DNS operation holds WAN lock' || :
-      _Say_ 'BOOT: WAN operation lock exists; no action'; return 1
-    fi
+  if ! _AcquireWANLock_; then
+    _WriteBootReport_ 'SKIPPED - active/unknown DNS operation holds WAN lock' || :
+    _Say_ 'BOOT: WAN operation lock exists; no action'; return 1
   fi
+  RG_RECONCILE_WAN_LOCK_HELD=1
+  trap '_ReleaseWANLock_ >/dev/null 2>&1 || :' EXIT HUP INT TERM
   # Reconcile a verified external ASUS change first. A temporarily unsettled
   # Stubby file can be retried by the next scheduled check without WAN writes.
   if [ ! -e "$PENDING_TRANSACTION" ] && [ ! -L "$PENDING_TRANSACTION" ] &&
      [ ! -e "$RECOVERY_HOLD" ] && [ ! -L "$RECOVERY_HOLD" ]; then
-    if ! _SyncPreferredWAN_; then
+    if ! _SyncPreferredWANLocked_; then
       _WriteBootReport_ 'WAIT/BLOCKED - external WAN synchronization not verified' || :
       _Say_ 'BOOT: WAN DNS synchronization not verified; no WAN writes.'
       return 1
@@ -5141,7 +5150,8 @@ _ReconcileBootState_() {
   _Say_ "BOOT SAFETY HOLD: $expected; no WAN settings changed."
   _Say_ "Manual restore: sh $ROOT/resolvguard.sh restore"
   return 1
-}
+)
+
 
 # RESOLVGUARD WEBUI MANUAL CHECK BEGIN
 # Manual WebUI checks reuse the policy/authenticated-DoT probe engine but never
