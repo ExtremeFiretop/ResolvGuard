@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.4
-readonly SCRIPT_VERSTAG="26112403"
+readonly SCRIPT_VERSTAG="26112404"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -5052,6 +5052,15 @@ _ReconcileBootState_() (
   fi
   RG_RECONCILE_WAN_LOCK_HELD=1
   trap '_ReleaseWANLock_ >/dev/null 2>&1 || :' EXIT HUP INT TERM
+  # A dangling journal symlink has -e=false despite being an unsafe path.
+  # Never follow, clear, or silently ignore symlinked recovery/ownership state,
+  # including when the live WAN appears to be a valid managed backup.
+  if [ -L "$PENDING_TRANSACTION" ] || [ -L "$RECOVERY_HOLD" ] ||
+     [ -L "$ACTIVE_POOL" ] || [ -L "$ACTIVE_RULELIST" ]; then
+    _WriteBootReport_ 'BLOCKED - unsafe recovery or managed ownership symlink' || :
+    _Say_ 'BOOT SAFETY HOLD: unsafe recovery or managed ownership symlink; evidence retained.'
+    return 1
+  fi
   # Reconcile a verified external ASUS change first. A temporarily unsettled
   # Stubby file can be retried by the next scheduled check without WAN writes.
   if [ ! -e "$PENDING_TRANSACTION" ] && [ ! -L "$PENDING_TRANSACTION" ] &&
