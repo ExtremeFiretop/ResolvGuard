@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.4
-readonly SCRIPT_VERSTAG="26112404"
+readonly SCRIPT_VERSTAG="26112405"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -60,6 +60,10 @@ MAINTENANCE_LOCK="$RUNTIME/rg-maintenance-priority"
 SCHEDULE_MARKER="$STATE_DIR/monitoring-enabled"
 AUTO_FAILOVER_MARKER="$STATE_DIR/automatic-failover-enabled"
 SCHEDULE_JOB=ResolvGuardHealth
+# Explicit opt-in for scheduled *observational* DNSSEC evidence. Never a WAN switch grant.
+DNSSEC_MONITOR_MARKER="$STATE_DIR/dnssec-monitor-enabled"
+DNSSEC_MONITOR_DATA="$RUNTIME/dnssec-monitor.tsv"
+DNSSEC_MONITOR_INTERVAL=900
 HOOK_DIR=/jffs/scripts
 PENDING_TRANSACTION="$STATE_DIR/pending-transaction"
 BOOT_REPORT="$STATE_DIR/boot-status"
@@ -781,8 +785,9 @@ EOF_RG_DIRECT_DOT
   return 0
 }
 
-# DNSSEC diagnostics are intentionally observational. They are not policy
-# health checks, do not enter a scheduler, and cannot contribute to WAN failover.
+# On-demand DNSSEC diagnostics are observational. A separate opt-in scheduled
+# evidence collector below may reuse the evaluator; neither path authorizes a
+# WAN write or alters the existing DNS health/failover thresholds.
 # Inspect the verified dig reply rather than the process exit code alone.
 _DNSSECResponseStatus_() {
   sed -n 's/^;; ->>HEADER<<- opcode: QUERY, status: \([A-Z][A-Z0-9_]*\), id: [0-9][0-9]*.*/\1/p' "$1" | head -n 1
@@ -953,6 +958,261 @@ _RunDNSSECDiagnostics_() (
   if [ "$inconclusive" -gt 0 ] || [ "$pass" -eq 0 ]; then return 2; fi
   return 0
 )
+
+# DNSSEC policy evidence phase 1: optional scheduled MONITORING ONLY.
+# This runs from the *existing* every-minute health-check cron, at most once
+# per 15 minutes, and never invokes switching, NVRAM, Stubby, policy approval,
+# health counters or a second cron entry. Default is OFF for all installations.
+# Evidence is scoped to policy fingerprint + exact WAN DNS list + endpoint
+# identity; a pair of failed observations is only a shadow candidate, NOT a
+# verified switching plan. Real failover will require separate release gates.
+_DNSSECMonitorCleanup_() {
+  if [ "${RG_DSM_CONFIG_HELD:-0}" = 1 ]; then
+    _ReleaseConfigLock_ >/dev/null 2>&1 || :
+  fi
+  if [ "${RG_DSM_RUN_HELD:-0}" = 1 ]; then
+    _ReleaseNamedLock_ "$RUNTIME/dnssec-monitor-lock" >/dev/null 2>&1 || :
+  fi
+  if [ -n "${RG_DSM_WORK:-}" ]; then
+    rm -rf "$RG_DSM_WORK"
+  fi
+}
+
+_DNSSECMonitorPolicyStatus_() {
+  if [ -L "$DNSSEC_MONITOR_MARKER" ]; then
+    _Say_ 'DNSSEC scheduled monitoring: BLOCKED (unsafe marker)'
+    return 2
+  fi
+  if [ -f "$DNSSEC_MONITOR_MARKER" ]; then
+    [ "$(cat "$DNSSEC_MONITOR_MARKER" 2>/dev/null)" = 'monitor-only-v1' ] || {
+      _Say_ 'DNSSEC scheduled monitoring: BLOCKED (invalid marker)'; return 2;
+    }
+    if [ -f "$SCHEDULE_MARKER" ] && [ ! -L "$SCHEDULE_MARKER" ]; then
+      _Say_ "DNSSEC scheduled monitoring: ON (read-only, every $((DNSSEC_MONITOR_INTERVAL / 60)) minutes)"
+    else
+      _Say_ 'DNSSEC scheduled monitoring: PAUSED (ordinary scheduler disabled)'
+    fi
+    _Say_ 'DNSSEC-driven WAN switching: DISABLED (no approval control implemented)'
+    if [ -f "$DNSSEC_MONITOR_DATA" ] && [ ! -L "$DNSSEC_MONITOR_DATA" ]; then
+      cat "$DNSSEC_MONITOR_DATA"
+    fi
+  elif [ -e "$DNSSEC_MONITOR_MARKER" ]; then
+    _Say_ 'DNSSEC scheduled monitoring: BLOCKED (invalid marker type)'
+    return 2
+  else
+    _Say_ 'DNSSEC scheduled monitoring: OFF (default)'
+  fi
+}
+
+_DNSSECMonitorToggle_() {
+  local mode staged
+  mode="$1"
+  [ -d "$STATE_DIR" ] && [ ! -L "$STATE_DIR" ] || {
+    _Fail_ 'Unsafe DNSSEC monitor state directory'; return 1;
+  }
+  if [ -e "$DNSSEC_MONITOR_MARKER" ] || [ -L "$DNSSEC_MONITOR_MARKER" ]; then
+    [ -f "$DNSSEC_MONITOR_MARKER" ] && [ ! -L "$DNSSEC_MONITOR_MARKER" ] &&
+      [ "$(cat "$DNSSEC_MONITOR_MARKER" 2>/dev/null)" = monitor-only-v1 ] || {
+      _Fail_ 'Unsafe or unknown DNSSEC monitor marker; refusing alteration'; return 1;
+    }
+  fi
+  case "$mode" in
+    enable)
+      [ -f "$SCHEDULE_MARKER" ] && [ ! -L "$SCHEDULE_MARKER" ] || {
+        _Fail_ 'Enable ordinary scheduled monitoring first'; return 1;
+      }
+      _RequireProbeDependencies_ || return 1
+      [ -f "$DNSSEC_MONITOR_MARKER" ] && return 0
+      staged="$DNSSEC_MONITOR_MARKER.new.$$"
+      [ ! -e "$staged" ] && [ ! -L "$staged" ] || return 1
+      (umask 077; printf '%s\n' monitor-only-v1 > "$staged") || return 1
+      mv "$staged" "$DNSSEC_MONITOR_MARKER" || { rm -f "$staged"; return 1; }
+      _Say_ 'DNSSEC scheduled MONITORING ONLY enabled; DNSSEC-triggered switching remains disabled.' ;;
+    disable)
+      if [ -f "$DNSSEC_MONITOR_MARKER" ]; then
+        rm -f "$DNSSEC_MONITOR_MARKER" || return 1
+      fi
+      _Say_ 'DNSSEC scheduled monitoring disabled; standard DNS monitoring unchanged.' ;;
+    *) return 2 ;;
+  esac
+}
+
+# Status is conservative: any INCONCLUSIVE probe disqualifies the endpoint
+# from being a verified DNSSEC failure. No candidate can be inferred from one
+# run or from different policy, WAN set, or TLS endpoint identities.
+_DNSSECMonitorCombine_() {
+  awk -F'|' '
+    NF!=3 || ($3!="PASS" && $3!="FAIL" && $3!="INCONCLUSIVE") {bad=1; next}
+    {k=$1; if (k !~ /^[a-zA-Z][a-zA-Z0-9_-]*$/ || seen[k "|" $2]++) bad=1;
+      if ($2!="signed" && $2!="rejected" && $2!="bypass") bad=1;
+      if ($3=="PASS") p[k]++; if ($3=="FAIL") f[k]++; if ($3=="INCONCLUSIVE") u[k]++;
+      ids[k]=1; n[k]++; probe[k "|" $2]=$3}
+    END {
+      if (bad) exit 1
+      for (k in ids) {
+        if (n[k]!=3) exit 1
+        state=(u[k]>0 ? "INCONCLUSIVE" : f[k]>0 ? "FAIL" : p[k]==3 ? "PASS" : "INCONCLUSIVE")
+        print k "|" state "|" probe[k "|signed"] "|" probe[k "|rejected"] "|" probe[k "|bypass"]
+      }
+    }' "$1"
+}
+
+_RunScheduledDNSSECMonitor_() (
+  umask 077
+  local mode now previous_epoch epoch wan_snapshot scope provider_file results combined id ip tls port extra
+  local label file outcome overall state shadow prior_line prior_scope prior_time prior_state
+  local stage last_stage data_file previous_data previous_delta detail
+  mode="${1:-auto}"
+  [ "$mode" = auto ] || [ "$mode" = manual ] || return 2
+  if [ -e "$DNSSEC_MONITOR_MARKER" ] || [ -L "$DNSSEC_MONITOR_MARKER" ]; then
+    [ -f "$DNSSEC_MONITOR_MARKER" ] && [ ! -L "$DNSSEC_MONITOR_MARKER" ] &&
+      [ "$(cat "$DNSSEC_MONITOR_MARKER" 2>/dev/null)" = monitor-only-v1 ] || {
+      _Fail_ 'DNSSEC MONITOR: unsafe or invalid opt-in marker'; return 1;
+    }
+  else
+    return 0
+  fi
+  [ -f "$SCHEDULE_MARKER" ] && [ ! -L "$SCHEDULE_MARKER" ] || return 0
+  [ -d "$RUNTIME" ] && [ ! -L "$RUNTIME" ] || {
+    _Fail_ 'DNSSEC MONITOR: unsafe runtime directory'; return 1;
+  }
+  RG_DSM_RUN_HELD=0; RG_DSM_CONFIG_HELD=0; RG_DSM_WORK=''
+  trap '_DNSSECMonitorCleanup_' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  if ! _AcquireNamedLock_ "$RUNTIME/dnssec-monitor-lock"; then
+    _Say_ 'DNSSEC MONITOR: another observer active; skipped'; return 0
+  fi
+  RG_DSM_RUN_HELD=1
+  for data_path in "$DNSSEC_MONITOR_DATA" "$RUNTIME/dnssec-monitor-last"; do
+    if [ -e "$data_path" ] || [ -L "$data_path" ]; then
+      [ -f "$data_path" ] && [ ! -L "$data_path" ] || {
+        _Fail_ 'DNSSEC MONITOR: unsafe runtime output'; return 1;
+      }
+    fi
+  done
+  [ ! -e "$PENDING_TRANSACTION" ] && [ ! -L "$PENDING_TRANSACTION" ] &&
+    [ ! -e "$RECOVERY_HOLD" ] && [ ! -L "$RECOVERY_HOLD" ] || {
+      _Say_ 'DNSSEC MONITOR: recovery hold/transaction; no observation'; return 0;
+    }
+  _MaintenancePriorityPending_ && {
+    _Say_ 'DNSSEC MONITOR: maintenance priority; skipped'; return 0;
+  }
+  now="$(date -u +%s 2>/dev/null)" || return 1
+  case "$now" in ''|*[!0-9]*) return 1 ;; esac
+  [ ! -L "$DNSSEC_MONITOR_DATA" ] && [ ! -L "$RUNTIME/dnssec-monitor-last" ] || {
+    _Fail_ 'Unsafe DNSSEC monitor output'; return 1;
+  }
+  if [ "$mode" = auto ] && [ -f "$RUNTIME/dnssec-monitor-last" ]; then
+    previous_epoch="$(cat "$RUNTIME/dnssec-monitor-last" 2>/dev/null)" || return 1
+    case "$previous_epoch" in ''|*[!0-9]*) _Fail_ 'Invalid DNSSEC monitor timestamp'; return 1 ;; esac
+    [ "${#previous_epoch}" -le 12 ] || { _Fail_ 'Invalid DNSSEC monitor timestamp length'; return 1; }
+    if [ "$now" -ge "$previous_epoch" ] &&
+       [ $((now - previous_epoch)) -lt "$DNSSEC_MONITOR_INTERVAL" ]; then
+      return 0
+    fi
+  fi
+  _RequireProbeDependencies_ || return 1
+  RG_DSM_WORK="$RUNTIME/dnssec-monitor-$$"
+  [ ! -e "$RG_DSM_WORK" ] && [ ! -L "$RG_DSM_WORK" ] || return 1
+  mkdir "$RG_DSM_WORK" || return 1
+  if ! _AcquireConfigLock_; then
+    _Say_ 'DNSSEC MONITOR: configuration busy; skipped'; return 0
+  fi
+  RG_DSM_CONFIG_HELD=1
+  PROVIDERS="$RG_DSM_WORK/providers.tsv"
+  _PrepareProviders_ || return 1
+  epoch="$(_GetMonitorPolicyEpoch_)" || return 1
+  wan_snapshot="$(_ReadWANRulelist_)" || return 1
+  # Include the full authenticated endpoint inventory in the scope.
+  scope="$( { printf '%s\n' "$epoch" "$wan_snapshot"; cat "$PROVIDERS"; } | _SHA256Digest_ )" || return 1
+  case "$scope" in ''|*[!0-9a-f]*) return 1 ;; esac
+  [ "${#scope}" -eq 64 ] || return 1
+  _ReleaseConfigLock_ || return 1
+  RG_DSM_CONFIG_HELD=0
+  results="$RG_DSM_WORK/probes.tsv"
+  : > "$results" || return 1
+  while IFS='|' read -r id ip tls port extra; do
+    [ -n "$id" ] || continue
+    for label in signed rejected bypass; do
+      file="$RG_DSM_WORK/$id-$label.txt"
+      _EvaluateDNSSECProbe_ "$id" "$label" "$file" || return 1
+      printf '%s|%s|%s\n' "$id" "$label" "$RG_DNSSEC_RESULT" >> "$results" || return 1
+    done
+  done < "$PROVIDERS"
+  combined="$RG_DSM_WORK/combined.tsv"
+  _DNSSECMonitorCombine_ "$results" > "$combined" || return 1
+  [ -s "$combined" ] || return 1
+  # Discard any stale results if configuration, live WAN, or enrollment was
+  # changed during the DNSSEC cycle. Absolutely no WAN operations follow.
+  if ! _AcquireConfigLock_; then
+    _Say_ 'DNSSEC MONITOR: config changed or busy; discarding evidence'; return 0
+  fi
+  RG_DSM_CONFIG_HELD=1
+  [ "$(_GetMonitorPolicyEpoch_)" = "$epoch" ] &&
+    [ "$(_ReadWANRulelist_)" = "$wan_snapshot" ] || {
+    _Say_ 'DNSSEC MONITOR: policy/WAN changed; discarding evidence'; return 0;
+  }
+  _ReleaseConfigLock_ || return 1
+  RG_DSM_CONFIG_HELD=0
+  [ -f "$DNSSEC_MONITOR_MARKER" ] && [ ! -L "$DNSSEC_MONITOR_MARKER" ] &&
+    [ "$(cat "$DNSSEC_MONITOR_MARKER" 2>/dev/null)" = monitor-only-v1 ] || {
+    _Say_ 'DNSSEC MONITOR: opt-in revoked during probing; discarding results'; return 0;
+  }
+  previous_data="$DNSSEC_MONITOR_DATA"
+  prior_scope=''; prior_time=0
+  if [ -f "$previous_data" ] && [ ! -L "$previous_data" ]; then
+    prior_scope="$(sed -n '1s/^#scope=//p' "$previous_data")"
+    prior_time="$(sed -n '2s/^#observed_at=//p' "$previous_data")"
+  fi
+  case "$prior_time" in ''|*[!0-9]*) prior_time=0 ;; esac
+  [ "${#prior_time}" -le 12 ] || prior_time=0
+  previous_delta=$((now - prior_time))
+  data_file="$RG_DSM_WORK/report.tsv"
+  printf '#scope=%s\n#observed_at=%s\n#mode=monitor-only; automatic DNSSEC switching DISABLED\n' "$scope" "$now" > "$data_file" || return 1
+  while IFS='|' read -r id ip tls port extra; do
+    [ -n "$id" ] || continue
+    detail="$(awk -F'|' -v id="$id" '$1==id {print; exit}' "$combined")"
+    state="$(printf '%s\n' "$detail" | awk -F'|' '{print $2}')"
+    [ -n "$state" ] || return 1
+    shadow=NONE
+    if [ "$state" = FAIL ]; then
+      shadow=UNCONFIRMED
+      if [ "$prior_scope" = "$scope" ] && [ "$previous_delta" -ge 60 ] &&
+         [ "$previous_delta" -le 3600 ]; then
+        prior_line="$(awk -F'|' -v id="$id" '$1==id {print $1"|"$2"|"$3"|"$4"|"$5"|"$6; exit}' "$previous_data")"
+        prior_state="$(printf '%s\n' "$prior_line" | awk -F'|' '{print $5}')"
+        if [ "$prior_line" = "$id|$ip|$tls|$port|FAIL|UNCONFIRMED" ] ||
+           [ "$prior_line" = "$id|$ip|$tls|$port|FAIL|CONFIRMED" ]; then
+          [ "$prior_state" = FAIL ] && shadow=CONFIRMED
+        fi
+      fi
+    fi
+    # Columns: id|IP|TLS-name|port|overall|shadow|signed|rejected|bypass.
+    printf '%s|%s|%s|%s|%s|%s|%s\n' "$id" "$ip" "$tls" "$port" "$state" "$shadow" "${detail#*|*|}" >> "$data_file" || return 1
+    _Say_ "DNSSEC MONITOR: $id $state (shadow=$shadow; no WAN switching)"
+  done < "$PROVIDERS"
+  [ ! -L "$DNSSEC_MONITOR_DATA" ] && [ ! -L "$RUNTIME/dnssec-monitor-last" ] || return 1
+  stage="$DNSSEC_MONITOR_DATA.new.$$"; last_stage="$RUNTIME/dnssec-monitor-last.new.$$"
+  [ ! -e "$stage" ] && [ ! -L "$stage" ] &&
+    [ ! -e "$last_stage" ] && [ ! -L "$last_stage" ] || return 1
+  cp "$data_file" "$stage" && printf '%s\n' "$now" > "$last_stage" &&
+    mv "$stage" "$DNSSEC_MONITOR_DATA" && mv "$last_stage" "$RUNTIME/dnssec-monitor-last" || {
+      rm -f "$stage" "$last_stage"; return 1;
+    }
+  _Say_ 'DNSSEC MONITOR: completed (read-only evidence; no DNSSEC-triggered WAN writes)'
+  return 0
+)
+
+_ManageDNSSECMonitor_() {
+  case "${1:-status}" in
+    status) _DNSSECMonitorPolicyStatus_ ;;
+    enable|disable) _DNSSECMonitorToggle_ "$1" ;;
+    run) _RunScheduledDNSSECMonitor_ manual ;;
+    *) _Fail_ 'Usage: dnssec-monitor [status|enable|disable|run]'; return 2 ;;
+  esac
+}
 
 # Only DNS ANSWER SECTION resource records can satisfy health policies.
 # Other sections may contain valid records of the requested type, but they
@@ -6654,6 +6914,11 @@ _RunScheduledCheck_() {
   fi
   RG_WEBUI_RECORD_POLICY_FAILURES=0
   _ReportScheduledSwitchingMode_ || :
+  # Optional DNSSEC evidence has a separate RAM-only cadence and cannot
+  # change ordinary health-check results, counters or failover decisions.
+  if [ -f "$DNSSEC_MONITOR_MARKER" ] || [ -L "$DNSSEC_MONITOR_MARKER" ]; then
+    _RunScheduledDNSSECMonitor_ auto || _Say_ 'DNSSEC MONITOR: failed; ordinary monitoring result unaffected.'
+  fi
   # Preserve UTC for history and give the WebUI the router's actual local
   # clock and UTC offset at completion (independent of the viewing browser).
   _Say_ "SCHEDULE UTC END: $(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || _Say_ 'clock-unavailable') result=$outcome routerTime=$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || _Say_ 'clock-unavailable')"
@@ -8933,11 +9198,12 @@ case "${1:-menu}" in
   check) _RunDNSHealthCheck_ ;;
   probe) _InspectDNS_ "${2:-}" "${3:-BOTH}" "${4:-all}" "${5:-summary}" ;;
   dnssec) _RunDNSSECDiagnostics_ "${2:-all}" ;;
+  dnssec-monitor) _ManageDNSSECMonitor_ "${2:-status}" ;;
   status) _ShowStatus_ ;;
   help|-h|--help)
     cat <<HELP
 ResolvGuard v$SCRIPT_VERSION (WAN DNS-over-TLS monitoring and failover)
-Usage: sh $ROOT/resolvguard.sh [install|menu|quick-setup|dependencies|configure|uninstall|discover|validate|enroll|pools|check|status|restore|probe <hostname-or-URL> [BOTH|TYPE] [provider-id|all] [summary|full]|dnssec [all|provider-id]|schedule [status|enable|disable|logs]|startup|webui [bootstrap|mount|unmount|publish|status]|policy [status|approve|revoke]|amtmupdate [check|status|update]|develop|stable]
+Usage: sh $ROOT/resolvguard.sh [install|menu|quick-setup|dependencies|configure|uninstall|discover|validate|enroll|pools|check|status|restore|probe <hostname-or-URL> [BOTH|TYPE] [provider-id|all] [summary|full]|dnssec [all|provider-id]|dnssec-monitor [status|enable|disable|run]|schedule [status|enable|disable|logs]|startup|webui [bootstrap|mount|unmount|publish|status]|policy [status|approve|revoke]|amtmupdate [check|status|update]|develop|stable]
 
 No arguments: if installation is needed, install and offer Quick Setup once; otherwise open the SSH menu. An incomplete setup remains selectable from the menu. e or exit leaves the current menu.
 install verifies prerequisites (including optional bind-dig installation), initializes missing config, and publishes the main script only after preparation succeeds.
@@ -8949,7 +9215,8 @@ Manual restoration is available through Maintenance & Recovery.
 The preferred WAN snapshot and transaction journal live in ResolvGuard.d/state.
 Probes use short-lived local authenticated DoT resolvers.
 Monitored hostnames are NEVER forwarded through separate DNS routes.
-dnssec performs three read-only DNSSEC checks against each selected authenticated DoT resolver. It does not affect failover, monitoring counters, or saved policy.
+dnssec performs three on-demand read-only DNSSEC checks against each selected authenticated DoT resolver.
+dnssec-monitor is OFF by default; enable opt-in monitoring every 15 minutes using the existing schedule. It records RAM-only authenticated DoT DNSSEC evidence and never authorizes WAN changes. Status, disable, and run are supported.
 probe is a read-only DNS response inspector. Main Menu IN option can save selected successful observations as policy checks with explicit confirmation.
 Install and first run initialize missing config/settings.conf, config/checks.tsv and config/extra-providers.tsv without overwriting existing files.
 Quick Setup checks for Entware bind-dig and offers to install it with permission if missing. A separate onboarding completion record is written only after successful setup (including Monitoring Only or deliberately inactive operation). Run dependencies to check/install dig separately.
