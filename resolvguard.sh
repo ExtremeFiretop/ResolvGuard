@@ -21,7 +21,7 @@ set -u
 
 ## Set version for each Production Release ##
 readonly SCRIPT_VERSION=0.2.4
-readonly SCRIPT_VERSTAG="26112401"
+readonly SCRIPT_VERSTAG="26112402"
 readonly SCRIPT_NAME="ResolvGuard"
 # RESOLVGUARD WEBUI ASSET ResolvGuard.asp
 ## Set to "master" for Production Releases ##
@@ -5854,7 +5854,7 @@ EOF_RG_WEB_CONFIG
            _IsValidRecordType_ "$rg_old_type" &&
            { [ "$rg_old_type" = "$rg_c" ] || ! _IsSupportedHealthRecordType_ "$rg_old_type"; } &&
            _IsValidDNSCheck_ "$rg_b" "$rg_c" "$rg_d" "$rg_e" "$rg_f" &&
-           _ChangeTSVFile_ "$CHECKS" check edit "$rg_b|$rg_c" "$rg_b|$rg_c|$rg_d|$rg_e|$rg_f"; then
+           _ChangeTSVFile_ "$CHECKS" check edit "$rg_old_host|$rg_old_type" "$rg_b|$rg_c|$rg_d|$rg_e|$rg_f"; then
           rg_result_status=success;rg_message='DNS health check updated; policy reapproval may be required'
         fi ;;
       check-delete)
@@ -7051,9 +7051,16 @@ _StageTSVFile_() {
   local file mode kind key value staged
   file="$1"; mode="$2"; kind="$3"; key="$4"; value="$5"; staged="$6"
   awk -F'|' -v op="$mode" -v kind="$kind" -v target="$key" -v replacement="$value" '
-    BEGIN {OFS="|"}
+    BEGIN {
+      OFS="|"
+      # An edit can legitimately change a legacy unsupported health RR type.
+      # Reject a destination-key collision instead of overwriting another rule.
+      split(replacement, rfields, "|")
+      replacement_key=(kind=="check" ? rfields[1] "|" rfields[2] : rfields[1])
+    }
     {
       k=($0 ~ /^#/ || $0=="" ? "" : (kind=="check" ? $1 "|" $2 : $1))
+      if (op=="edit" && k==replacement_key && k!=target) collision++
       if (k==target) {
         found++
         if (op=="edit") print replacement
@@ -7061,7 +7068,7 @@ _StageTSVFile_() {
     }
     END {
       if (op=="add" && found==0) print replacement
-      else if (op=="add" || found!=1) exit 1
+      else if (op=="add" || found!=1 || (op=="edit" && collision!=0)) exit 1
     }
   ' "$file" > "$staged" || { rm -f "$staged"; _Fail_ 'Target missing, already present or duplicated'; return 1; }
 }
